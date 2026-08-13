@@ -134,6 +134,7 @@ void HttpServer::_registerRoutes() {
   http.on("/api/login", HTTP_POST, Web::Handlers::handleLogin);
   http.on("/api/logout", HTTP_POST, Web::Handlers::handleLogout);
   http.on("/api/session", HTTP_GET, Web::Handlers::handleSession);
+  http.on("/api/refresh", HTTP_POST, Web::Handlers::handleRefresh);  // R10B-5
 
   // Status
   http.on("/api/status", HTTP_GET, Web::Handlers::handleStatus);

@@ -1000,15 +1000,48 @@ void MqttClient::_handleOta(const String& json) {
     return;
   }
 
-  // Anti-downgrade check
-  String currentVer = Core::FIRMWARE_VERSION;
-  if (strlen(version) > 0 && strcmp(version, currentVer.c_str()) < 0) {
+  // R10B-4 (audit round 10B): Strict SemVer anti-downgrade check.
+  // Previously used strcmp() which is wrong for versions like "4.9.0" vs "4.10.0"
+  // (string compare says "4.10.0" < "4.9.0" because '1' < '9' lexicographically).
+  // Now parse major.minor.patch and compare numerically.
+  // version REQUIRED (not optional anymore — empty version rejected).
+  if (strlen(version) == 0) {
+    Services::Log.append(Core::LogType::Error, "OTA: version field is required", 0);
+    if (requestId.length() > 0) _publishAck(requestId, false, "OTA: version field is required");
+    return;
+  }
+
+  int newMajor, newMinor, newPatch;
+  int curMajor, curMinor, curPatch;
+  if (sscanf(version, "%d.%d.%d", &newMajor, &newMinor, &newPatch) != 3) {
     Services::Log.append(Core::LogType::Error,
-      "OTA: anti-downgrade — current=" + currentVer + " requested=" + version, 0);
+      String("OTA: invalid version format (must be X.Y.Z): ") + version, 0);
     if (requestId.length() > 0) {
-      _publishAck(requestId, false, ("OTA: downgrade blocked (current=" + currentVer + ")").c_str());
+      _publishAck(requestId, false, "OTA: invalid version format (must be X.Y.Z)");
     }
     return;
+  }
+  if (sscanf(Core::FIRMWARE_VERSION, "%d.%d.%d", &curMajor, &curMinor, &curPatch) != 3) {
+    // Fallback: if current version somehow malformed, allow upgrade (don't block)
+    Serial.println("[OTA] WARNING: current firmware version malformed, allowing OTA");
+  } else {
+    // Compare: newVersion must be STRICTLY GREATER than current (no equal, no lower)
+    bool isDowngrade = false;
+    if (newMajor < curMajor) isDowngrade = true;
+    else if (newMajor == curMajor) {
+      if (newMinor < curMinor) isDowngrade = true;
+      else if (newMinor == curMinor && newPatch <= curPatch) isDowngrade = true;
+    }
+
+    if (isDowngrade) {
+      String msg = "OTA: downgrade blocked (current=" + String(Core::FIRMWARE_VERSION) +
+                   " requested=" + String(version) + ")";
+      Services::Log.append(Core::LogType::Error, msg, 0);
+      if (requestId.length() > 0) {
+        _publishAck(requestId, false, msg.c_str());
+      }
+      return;
+    }
   }
 
   // R10A-2 (audit round 10): Ed25519 public key is MANDATORY.

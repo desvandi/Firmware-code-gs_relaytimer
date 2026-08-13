@@ -210,30 +210,52 @@ namespace Core {
   // ---------- FACTORY RESET ----------
   constexpr unsigned long FACTORY_RESET_TOKEN_TTL_MS = 60000;  // 60s
 
-  // ---------- OTA (P0 #3+#8+#9 — audit round 9) ----------
+  // ---------- OTA (P0 #3+#8+#9 + R10A-2 + R10B-1 — audit rounds 9/10A/10B) ----------
   // MQTT OTA now requires Ed25519 signature verification.
   // PWA must send: {action, url, version, size, sha256, signature, requestId}
   // ESP32: HTTPS download → size check → SHA-256 verify → Ed25519 verify → Update.
   //
-  // Signing keypair generation:
-  //   openssl genpkey -algorithm Ed25519 -out firmware_signing_private.pem
-  //   openssl pkey -in firmware_signing_private.pem -pubout -out firmware_signing_public.pem
-  //   # Sign firmware.bin:
-  //   openssl pkeyutl -sign -inkey firmware_signing_private.pem -rawin -in firmware.bin | xxd -p -c 64 > firmware.bin.sig
+  // ═══════════════════════════════════════════════════════════════════════════
+  // R10B-1 SIGNING CONTRACT (CRITICAL — read this carefully):
+  // ═══════════════════════════════════════════════════════════════════════════
   //
-  // Embed the PUBLIC key below (32 bytes hex, no leading "0x").
-  // Private key stays on signing machine — NEVER in firmware.
+  // signature = ed25519_sign(SHA256(firmware.bin), private_key)
+  //
+  // ESP32 verifies: ed25519_verify(signature, SHA256(firmware.bin), public_key)
+  //
+  // The signature is over the 32-byte SHA-256 HASH, NOT over the full binary.
+  // This is because ESP32 doesn't have enough RAM to buffer 2MB binary for
+  // signature verification — it streams to flash + computes SHA-256 on-the-fly,
+  // then verifies the signature over the computed hash.
+  //
+  // USE THE SIGNING TOOL (don't sign manually with openssl):
+  //   python3 scripts/sign_firmware.py --gen-keys          # one-time keypair gen
+  //   python3 scripts/sign_firmware.py firmware.bin 4.1.0  # sign each release
+  //
+  // The tool outputs:
+  //   firmware.bin.sha256   — 64 hex chars (SHA-256 of binary)
+  //   firmware.bin.sig      — 128 hex chars (Ed25519 signature over SHA-256)
+  //   firmware.bin.ota.json — OTA command payload for PWA/MQTT
+  //
+  // ⚠️  DO NOT USE: openssl pkeyutl -sign -in firmware.bin
+  //   That signs the full binary, NOT the SHA-256 hash → ESP32 will REJECT.
+  //   Previous Config.h instructions were WRONG — this is fixed in R10B-1.
+  //
+  // Embed the PUBLIC key below (32 bytes as 64 hex chars).
+  // Private key stays on signing machine — NEVER in firmware, NEVER in git.
   constexpr size_t OTA_MAX_BINARY_SIZE = 2 * 1024 * 1024;  // 2 MB safety cap
   constexpr uint8_t ED25519_PUBLIC_KEY_LEN = 32;           // raw public key bytes
   constexpr uint8_t ED25519_SIGNATURE_LEN = 64;            // raw signature bytes
   constexpr size_t SHA256_HEX_LEN = 64;                    // hex-encoded SHA-256
   // PRODUCTION: paste your Ed25519 public key (32 bytes as 64 hex chars) here.
-  // Empty = signature verification skipped (NOT for production!).
+  // Generate with: python3 scripts/sign_firmware.py --gen-keys
+  // Empty = OTA hard-fails (refuse to install — R10A-2 fail-closed behavior).
   constexpr const char* OTA_ED25519_PUBLIC_KEY_HEX = "";
 
   // Root CA for HTTPS OTA downloads (GitHub Releases, etc.)
-  // Default: empty → uses WiFiClient (plain HTTP, NOT for production!).
-  // For GitHub: use DigiCert/GlobalSign root CA.
+  // PRODUCTION: paste DigiCert/GlobalSign root CA PEM here (multi-line string).
+  // Empty = OTA hard-fails (refuse HTTPS download — R10A-5 fail-closed behavior).
+  // For GitHub Releases: use DigiCert Global Root CA.
   constexpr const char* OTA_HTTPS_ROOT_CA = "";
 
   // ---------- FILE PATHS ----------
