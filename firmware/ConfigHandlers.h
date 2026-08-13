@@ -1,0 +1,185 @@
+// =============================================================================
+// Web/Handlers/ConfigHandlers.h — /api/config, /api/config/*
+// =============================================================================
+#pragma once
+#ifndef TIMER12_WEB_HANDLERS_CONFIG_H
+#define TIMER12_WEB_HANDLERS_CONFIG_H
+
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include "Common.h"
+#include "ConfigStore.h"
+#include "AuthManager.h"
+#include "LogService.h"
+#include "Json.h"
+#include "Crypto.h"
+#include "Config.h"
+#include "Globals.h"
+
+namespace Web { namespace Handlers {
+
+// GET /api/config → user info (no secrets)
+inline void handleGetConfig() {
+  if (!requireAuth()) return;
+  String data = "{\"user\":\"";
+  data += Core::userConfig.wwwUser;
+  data += "\",\"iterations\":";
+  data += String(Core::userConfig.iterations);
+  data += ",\"deviceName\":\"";
+  data += Core::deviceName;
+  data += "\",\"timezone\":\"";
+  data += Core::timezone;
+  data += "\"}";
+  sendSuccess("", data);
+}
+
+// POST /api/config { user?, pass? }  — legacy v3.1 compatibility
+inline void handleSetConfig() {
+  if (!requireAuth()) return;
+  if (!requireCsrf()) return;
+  if (!requireBody(1024)) return;
+  if (!Web::http.hasArg("plain")) {
+    sendError(400, "Missing body");
+    return;
+  }
+  DynamicJsonDocument doc(1024);
+  DeserializationError err = deserializeJson(doc, Web::http.arg("plain"));
+  if (err) {
+    sendError(400, "Invalid JSON");
+    return;
+  }
+  if (doc.containsKey("user")) {
+    const char* u = doc["user"];
+    if (u) {
+      String newUser = u;
+      newUser.trim();
+      if (newUser.length() < 1 || newUser.length() > Core::MAX_USER_LEN) {
+        sendError(400, "Username must be 1-31 chars");
+        return;
+      }
+      strncpy(Core::userConfig.wwwUser, newUser.c_str(), Core::MAX_USER_LEN);
+      Core::userConfig.wwwUser[Core::MAX_USER_LEN] = '\0';
+    }
+  }
+  if (doc.containsKey("pass")) {
+    const char* p = doc["pass"];
+    if (p) {
+      String newPass = p;
+      if (!Utils::isPasswordStrong(newPass)) {
+        sendError(400, "Password must be 8+ chars with letter+digit");
+        return;
+      }
+      Utils::generateRandomBytes(Core::userConfig.salt, Core::SALT_LEN);
+      Core::userConfig.iterations = Core::PBKDF2_ITERATIONS;
+      uint8_t hash[32];
+      if (!Utils::pbkdf2HmacSha256(newPass.c_str(), newPass.length(),
+                                   Core::userConfig.salt, Core::SALT_LEN,
+                                   Core::userConfig.iterations, hash)) {
+        sendError(500, "Hash failed");
+        return;
+      }
+      Utils::bytesToHex(hash, 32, Core::userConfig.passHashHex);
+      memset(hash, 0, sizeof(hash));
+    }
+  }
+  Storage::config.saveUserConfig();
+  sendSuccess("Config saved. Login ulang diperlukan dengan kredensial baru.");
+}
+
+// POST /api/config/device { deviceName?, timezone? }
+inline void handleSetDeviceConfig() {
+  if (!requireAuth()) return;
+  if (!requireCsrf()) return;
+  if (!requireBody(256)) return;
+  if (!Web::http.hasArg("plain")) {
+    sendError(400, "Missing body");
+    return;
+  }
+  DynamicJsonDocument doc(512);
+  DeserializationError err = deserializeJson(doc, Web::http.arg("plain"));
+  if (err) {
+    sendError(400, "Invalid JSON");
+    return;
+  }
+  if (doc.containsKey("deviceName")) {
+    const char* dn = doc["deviceName"];
+    if (dn && strlen(dn) > 0 && strlen(dn) <= 32) {
+      strncpy(Core::deviceName, dn, 32);
+      Core::deviceName[32] = '\0';
+    } else {
+      sendError(400, "Device name must be 1-32 chars");
+      return;
+    }
+  }
+  if (doc.containsKey("timezone")) {
+    const char* tz = doc["timezone"];
+    if (tz && strlen(tz) < 40) {
+      strncpy(Core::timezone, tz, 39);
+      Core::timezone[39] = '\0';
+    }
+  }
+  Storage::config.saveDeviceConfig();
+  String data = "{\"updated\":true,\"deviceName\":\"";
+  data += Core::deviceName;
+  data += "\",\"timezone\":\"";
+  data += Core::timezone;
+  data += "\"}";
+  sendSuccess("Device config updated", data);
+}
+
+// POST /api/config/password { current, next }
+inline void handleChangePassword() {
+  if (!requireAuth()) return;
+  if (!requireCsrf()) return;
+  if (!requireBody(256)) return;
+  if (!Web::http.hasArg("plain")) {
+    sendError(400, "Missing body");
+    return;
+  }
+  DynamicJsonDocument doc(512);
+  DeserializationError err = deserializeJson(doc, Web::http.arg("plain"));
+  if (err) {
+    sendError(400, "Invalid JSON");
+    return;
+  }
+  const char* current = doc["current"] | "";
+  const char* next = doc["next"] | "";
+  if (!Services::auth.changePassword(String(current), String(next))) {
+    sendError(403, "Current password incorrect or new password too weak");
+    return;
+  }
+  sendSuccess("Password changed", "{\"changed\":true}");
+}
+
+// GET /api/config/export → full backup JSON (downloadable)
+inline void handleExportConfig() {
+  if (!requireAuth()) return;
+  String json = Storage::config.exportAll();
+  Web::http.sendHeader("Content-Disposition",
+                       "attachment; filename=\"timer12-config-backup.json\"");
+  Web::http.sendHeader("X-Frame-Options", "DENY");
+  Web::http.sendHeader("Access-Control-Allow-Origin", "*");
+  Web::http.sendHeader("Access-Control-Allow-Credentials", "true");
+  Web::http.send(200, "application/json; charset=utf-8", json);
+}
+
+// POST /api/config/import  (body: full backup JSON)
+inline void handleImportConfig() {
+  if (!requireAuth()) return;
+  if (!requireCsrf()) return;
+  if (!requireBody(Core::MAX_BODY_SIZE)) return;
+  if (!Web::http.hasArg("plain")) {
+    sendError(400, "Missing body");
+    return;
+  }
+  String body = Web::http.arg("plain");
+  if (!Storage::config.importAll(body)) {
+    sendError(400, "Invalid config (must have 12 channels)");
+    return;
+  }
+  sendSuccess("Configuration imported", "{\"imported\":true}");
+}
+
+}} // namespace Web::Handlers
+
+#endif
