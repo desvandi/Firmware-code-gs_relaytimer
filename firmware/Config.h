@@ -64,26 +64,39 @@ namespace Core {
   constexpr const char* NVS_KEY_DEVICE_PIN = "device_pin";  // 6-digit PIN for PWA pairing
 
   // ---------- MQTT BROKER (remote internet access via CGNAT) ----------
-  // Default: HiveMQ public broker (free, no auth, password in topic for obscurity)
-  // Production: set MQTT_BROKER_USERNAME + MQTT_BROKER_PASSWORD for self-hosted
-  // broker (Mosquitto/EMQX) with TLS + ACL per device.
+  // PRODUCTION: Self-hosted Mosquitto with TLS + ACL + per-device credentials.
+  //   1. Deploy Mosquitto on VPS (DigitalOcean/Hetzner ~Rp 75rb/bln)
+  //   2. Config: allow_anonymous false, password_file, ACL per device, listener 8883
+  //   3. TLS: Let's Encrypt cert for your domain (or self-signed with bundled CA)
+  //   4. Set MQTT_BROKER_HOST, MQTT_BROKER_PORT=8883, MQTT_BROKER_USERNAME, MQTT_BROKER_PASSWORD
+  //   5. Set MQTT_ROOT_CA to your CA certificate (PEM format, as multi-line string literal)
+  //   6. Re-flash firmware, update PWA NEXT_PUBLIC_MQTT_BROKER_URL
   //
-  // To use self-hosted broker:
-  //   1. Deploy Mosquitto on VPS (e.g., DigitalOcean $5/mo)
-  //   2. Configure: allow_anonymous false, password_file, ACL per device
-  //   3. Set MQTT_BROKER_HOST, MQTT_BROKER_PORT (8883 for TLS)
-  //   4. Set MQTT_BROKER_USERNAME + MQTT_BROKER_PASSWORD
-  //   5. Re-flash firmware
-  //   6. Update PWA: MQTT_BROKER_URL in src/lib/mqtt.ts
+  // For development/MVP: leave MQTT_BROKER_USERNAME empty for public broker (no auth).
+  // Topic password still provides basic obscurity but is NOT authentication.
   constexpr const char* MQTT_BROKER_HOST = "broker.hivemq.com";
   constexpr uint16_t MQTT_BROKER_PORT = 1883;
-  constexpr const char* MQTT_BROKER_USERNAME = "";  // Empty = no auth (public broker)
-  constexpr const char* MQTT_BROKER_PASSWORD = "";  // Empty = no auth (public broker)
+  constexpr const char* MQTT_BROKER_USERNAME = "";  // Empty = no auth (public broker). PRODUCTION: set per-device credential.
+  constexpr const char* MQTT_BROKER_PASSWORD = "";  // Empty = no auth. PRODUCTION: set per-device credential.
   constexpr uint16_t MQTT_KEEPALIVE_SEC = 60;
   constexpr uint16_t MQTT_RECONNECT_DELAY_MS = 5000;
   constexpr uint16_t MQTT_STATUS_PUBLISH_INTERVAL_MS = 5000;
   constexpr uint16_t MQTT_BUFFER_SIZE = 4096;
   constexpr uint8_t MQTT_PASSWORD_LEN = 8;  // 8-char alphanumeric topic password
+
+  // TLS root CA for MQTT broker (PEM format, multi-line string).
+  // Default: empty → uses setInsecure() (NOT for production!).
+  // For Let's Encrypt signed broker (recommended): paste ISRG Root X1 PEM here.
+  // For self-signed broker: paste your custom CA PEM here.
+  // Get ISRG Root X1 from: https://letsencrypt.org/certs/isrgrootx1.pem
+  constexpr const char* MQTT_ROOT_CA = "";
+
+  // ---------- CORS (Cross-Origin Resource Sharing) ----------
+  // Controls which web origins can call the ESP32 REST API.
+  // Default: "*" (any origin — for development only).
+  // PRODUCTION: set to your PWA's Vercel URL, e.g., "https://remote-relay.vercel.app".
+  // Multiple origins: comma-separated, first match wins.
+  constexpr const char* ALLOWED_CORS_ORIGINS = "*";
 
   // ---------- GOOGLE APPS SCRIPT (AI Insights via Gemini) ----------
   // Deploy Code.gs as a GAS Web App, then paste the deployment URL here.
@@ -93,6 +106,18 @@ namespace Core {
   constexpr const char* GAS_INSIGHTS_URL = "https://script.google.com/macros/s/AKfycbwAAQYaLZhE7RVktWi_GElKeZS49JYLVXGdlw7bpqDEViAA-pstUtul6yU5T1rH9OPlug/exec";
   constexpr uint32_t GAS_POST_INTERVAL_MS = 3600000;  // 1 hour
   constexpr uint16_t GAS_TIMEOUT_MS = 30000;  // 30s timeout
+
+  // GAS HMAC shared secret (P0 #7 — audit round 9).
+  // ESP32 generates a 32-byte random secret at first boot, stores in NVS,
+  // prints to Serial. User copies to GAS Script Properties as:
+  //   DEVICE_<anonymousId>_SECRET = <hex secret>
+  // ESP32 signs each POST with HMAC-SHA256(secret, canonical_request).
+  // GAS verifies signature before processing.
+  constexpr const char* NVS_KEY_GAS_SECRET = "gas_secret";
+  constexpr uint8_t GAS_SECRET_LEN = 32;       // 256-bit
+  constexpr uint8_t GAS_HMAC_LEN = 32;         // SHA-256 output bytes
+  constexpr uint16_t GAS_MAX_BODY_SIZE = 16384; // 16 KB cap
+  constexpr int32_t GAS_TIMESTAMP_TOLERANCE_SEC = 300;  // ±5 minutes
 
   // ---------- PZEM-004T v3.0 POWER METER (AC 80-260V) ----------
   // Measures: voltage, current, power, energy (kWh), frequency, power factor
@@ -163,21 +188,53 @@ namespace Core {
   constexpr unsigned long RELAY_TICK_MS = 1000;        // recompute relay state every 1s
 
   // ---------- AUTH ----------
+  // P1 #17 (audit round 9): Short-lived access token + long-lived refresh token.
+  // Access token TTL: 15 min (stateless JWT, verified by signature only).
+  // Refresh token TTL: 7 days (stored in NVS, one-time use per login).
+  // On access token expiry, PWA calls POST /api/refresh with refresh token cookie
+  // → ESP32 issues new access token (and rotates refresh token).
   constexpr uint8_t AUTH_FAIL_THRESHOLD_SHORT = 5;
   constexpr uint8_t AUTH_FAIL_THRESHOLD_LONG = 10;
   constexpr unsigned long AUTH_BLOCK_SHORT_MS = 60000;     // 1 min
   constexpr unsigned long AUTH_BLOCK_LONG_MS = 300000;     // 5 min
   constexpr size_t MAX_TRACKED_IPS = 8;
   constexpr uint16_t CSRF_TOKEN_LEN = 32;                  // hex chars (16 bytes random)
-  constexpr unsigned long CSRF_TOKEN_TTL_MS = 3600000;     // 1 hour
-  constexpr uint16_t JWT_TTL_SECONDS = 3600;               // 1 hour
+  constexpr unsigned long CSRF_TOKEN_TTL_MS = 900000;      // 15 min (matches access token)
+  constexpr uint16_t JWT_ACCESS_TTL_SECONDS = 900;         // 15 min (access token)
+  constexpr uint16_t JWT_REFRESH_TTL_SECONDS = 604800;     // 7 days (refresh token)
+  constexpr uint16_t JWT_TTL_SECONDS = JWT_ACCESS_TTL_SECONDS;  // alias for legacy code
   constexpr size_t JWT_MAX_LEN = 512;
+  constexpr size_t REFRESH_TOKEN_LEN = 32;                 // hex chars (16 bytes random)
+  constexpr uint8_t MAX_REFRESH_TOKENS = 4;                // cap per device (LRU)
 
   // ---------- FACTORY RESET ----------
   constexpr unsigned long FACTORY_RESET_TOKEN_TTL_MS = 60000;  // 60s
 
-  // ---------- OTA ----------
+  // ---------- OTA (P0 #3+#8+#9 — audit round 9) ----------
+  // MQTT OTA now requires Ed25519 signature verification.
+  // PWA must send: {action, url, version, size, sha256, signature, requestId}
+  // ESP32: HTTPS download → size check → SHA-256 verify → Ed25519 verify → Update.
+  //
+  // Signing keypair generation:
+  //   openssl genpkey -algorithm Ed25519 -out firmware_signing_private.pem
+  //   openssl pkey -in firmware_signing_private.pem -pubout -out firmware_signing_public.pem
+  //   # Sign firmware.bin:
+  //   openssl pkeyutl -sign -inkey firmware_signing_private.pem -rawin -in firmware.bin | xxd -p -c 64 > firmware.bin.sig
+  //
+  // Embed the PUBLIC key below (32 bytes hex, no leading "0x").
+  // Private key stays on signing machine — NEVER in firmware.
   constexpr size_t OTA_MAX_BINARY_SIZE = 2 * 1024 * 1024;  // 2 MB safety cap
+  constexpr uint8_t ED25519_PUBLIC_KEY_LEN = 32;           // raw public key bytes
+  constexpr uint8_t ED25519_SIGNATURE_LEN = 64;            // raw signature bytes
+  constexpr size_t SHA256_HEX_LEN = 64;                    // hex-encoded SHA-256
+  // PRODUCTION: paste your Ed25519 public key (32 bytes as 64 hex chars) here.
+  // Empty = signature verification skipped (NOT for production!).
+  constexpr const char* OTA_ED25519_PUBLIC_KEY_HEX = "";
+
+  // Root CA for HTTPS OTA downloads (GitHub Releases, etc.)
+  // Default: empty → uses WiFiClient (plain HTTP, NOT for production!).
+  // For GitHub: use DigiCert/GlobalSign root CA.
+  constexpr const char* OTA_HTTPS_ROOT_CA = "";
 
   // ---------- FILE PATHS ----------
   constexpr const char* PATH_CONFIG_JSON = "/config.json";

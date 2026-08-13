@@ -31,12 +31,14 @@ public:
   bool isConnected() const;
   String getMqttPassword() const { return _mqttPassword; }
   String getDevicePin() const { return _devicePin; }
+  String getGasSecretHex() const { return _gasSecretHex; }  // P0 #7: GAS HMAC secret (64 hex chars)
   void openConfigPortal();
 
 private:
   char _apPassword[33] = {0};
   char _mqttPassword[9] = {0};
   char _devicePin[7] = {0};
+  String _gasSecretHex;  // P0 #7: 64 hex chars (32 bytes)
   WifiMode _mode = WifiMode::NONE;
   bool _tryStaMode();
   bool _startApFallback();

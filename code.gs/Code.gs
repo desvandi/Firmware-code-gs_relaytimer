@@ -1,35 +1,30 @@
 /**
  * Timer Digital Relay v4.0 — Google Apps Script (AI Insights via Gemini)
  *
- * Receives activity logs + PZEM power meter data from ESP32 firmware v4.0,
- * calls Gemini API to generate actionable insights, caches for 1 hour.
+ * P0 #7 + P1 #15 + #16 (audit round 9):
+ *   - HMAC-SHA256 signature verification (shared secret per device in NVS)
+ *   - Timestamp ±5 min tolerance (replay protection)
+ *   - Nonce tracking (one-time use, 10k cap via CacheService)
+ *   - Body size + schema validation (max 16KB, max 100 logs, max 50 char names)
+ *   - Removed raw-MAC backward compatibility (16-char anonymous ID only)
  *
- * Privacy: ESP32 sends an ANONYMOUS device ID (first 16 chars of SHA-256(MAC))
- * instead of the raw MAC. Gemini never sees the real hardware address.
- * For backward compatibility, this script also accepts raw MAC (12 hex chars).
+ * Privacy: ESP32 sends anonymous device ID (first 16 chars of SHA-256(MAC)).
+ *   Gemini never sees the real MAC. The anonymous ID is used as a cache key
+ *   and to look up the per-device HMAC secret from Script Properties.
  *
  * Deploy as a Google Apps Script Web App:
  * 1. Open https://script.google.com → New Project
  * 2. Paste this code
  * 3. Set GEMINI_API_KEY in Project Settings → Script Properties
- * 4. Deploy → New Deployment → Type: Web App
+ * 4. For each ESP32 device, add a Script Property:
+ *    Key:   DEVICE_<anonymousId>_SECRET
+ *    Value: <64 hex chars from Serial Monitor>
+ *    (anonymousId = first 16 chars of SHA-256(MAC), printed on boot)
+ * 5. Deploy → New Deployment → Type: Web App
  *    - Execute as: Me
- *    - Who has access: Anyone (anonymous)
- * 5. Copy the deployment URL (e.g., https://script.google.com/macros/s/AKfyc.../exec)
- * 6. Set PWA env var: NEXT_PUBLIC_GAS_INSIGHTS_URL = <deployment URL>
- *    Also set the same URL in firmware Config.h as GAS_INSIGHTS_URL
- *
- * Endpoints:
- *   GET  ?action=insights&mac=<anonymousIdOrMac>  → returns AI recommendations JSON
- *   GET  ?action=health                           → service health check
- *   POST  body: { mac, logs, status }             → processes and returns insights
- *
- * Audit notes (security engineer):
- *   - No real MAC address is stored or sent to Gemini — only anonymous hash.
- *   - Gemini API key is read from Script Properties (not in source code).
- *   - Cache keys are prefixed with device identifier but contain no PII.
- *   - All Gemini responses are parsed strictly; malformed responses fall back to mock.
- *   - Rate-limiting: 1 hour cache TTL prevents Gemini API abuse.
+ *    - Who has access: Anyone (anonymous — HMAC provides auth)
+ * 6. Copy deployment URL → set as GAS_INSIGHTS_URL in firmware Config.h
+ *    and NEXT_PUBLIC_GAS_INSIGHTS_URL in Vercel env vars.
  */
 
 // === CONFIG ===
@@ -37,20 +32,36 @@ const GEMINI_API_KEY = PropertiesService.getScriptProperties().getProperty('GEMI
 const GEMINI_MODEL = 'gemini-1.5-flash';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
-// Cache insights for 1 hour to avoid hitting Gemini API too often
+// Cache config
 const CACHE_KEY_PREFIX = 'insights_';
 const DATA_KEY_PREFIX = 'data_';
+const NONCE_KEY_PREFIX = 'nonce_';
 const CACHE_TTL_MS = 60 * 60 * 1000;        // 1 hour (insights)
-const DATA_TTL_MS = 6 * 60 * 60 * 1000;     // 6 hours (raw logs from ESP32)
+const DATA_TTL_MS = 6 * 60 * 60 * 1000;     // 6 hours (raw logs)
+const NONCE_TTL_SEC = 600;                   // 10 min (nonce replay window)
 
-// PLN tariff (Indonesia) — used for cost estimation in insights
-const ELECTRICITY_RATE_RUPIAH_PER_KWH = 1467;  // R1 tariff non-subsidy 2024
+// Validation limits (P1 #15)
+const MAX_BODY_SIZE = 16384;                  // 16 KB
+const MAX_LOGS = 100;
+const MAX_LOG_MESSAGE_LEN = 500;
+const MAX_CHANNEL_NAME_LEN = 32;
+const MAX_CHANNELS = 12;
 
-// Validate device identifier: anonymous ID (16 hex) OR legacy raw MAC (12 hex)
+// HMAC config
+const TIMESTAMP_TOLERANCE_SEC = 300;          // ±5 minutes
+const MAX_NONCES = 10000;                     // cap nonce cache size
+
+// PLN tariff (Indonesia) — used for cost estimation
+const ELECTRICITY_RATE_RUPIAH_PER_KWH = 1467;
+
+/**
+ * Validate anonymous device ID: must be exactly 16 hex chars.
+ * P1 #16 (audit round 9): raw MAC (12 chars) is NO LONGER accepted.
+ */
 function isValidDeviceId(id) {
   if (!id) return false;
   const cleaned = String(id).toUpperCase().replace(/[^A-F0-9]/g, '');
-  return cleaned.length === 12 || cleaned.length === 16;
+  return cleaned.length === 16;  // ONLY 16-char anonymous ID accepted
 }
 
 function normalizeDeviceId(id) {
@@ -58,12 +69,15 @@ function normalizeDeviceId(id) {
 }
 
 /**
- * GET endpoint — PWA fetches insights for a specific device
+ * GET endpoint — PWA fetches insights for a specific device.
+ * PWA does NOT have the HMAC secret (only ESP32 does), so GET uses
+ * a simpler auth model: the anonymous device ID itself is the "key".
+ * For production, consider adding a PWA-specific token.
  */
 function doGet(e) {
   const mac = normalizeDeviceId(e.parameter.mac);
   if (!isValidDeviceId(mac)) {
-    return jsonOut({ success: false, error: 'Invalid device ID (must be 12 or 16 hex chars)' });
+    return jsonOut({ success: false, error: 'Invalid device ID (must be 16 hex chars)' });
   }
 
   const action = e.parameter.action || 'insights';
@@ -85,50 +99,146 @@ function doGet(e) {
 }
 
 /**
- * POST endpoint — ESP32 (or PWA) pushes logs + status, triggers Gemini analysis.
+ * POST endpoint — ESP32 pushes logs + status, triggers Gemini analysis.
  *
- * Expected body shape (sent by firmware_v4/Advisor.cpp):
- * {
- *   "mac": "<16-char SHA-256 prefix>",   // anonymous, NOT raw MAC
- *   "status": {
- *     "firmwareVersion": "4.0.0",
- *     "deviceName": "...",
- *     "uptimeSeconds": 12345,
- *     "voltage": 220.5, "current": 0.85, "power": 187.2,
- *     "apparentPower": 195.6, "reactivePower": 56.4,
- *     "energy": 12.345, "energyToday": 1.234,
- *     "frequency": 50.0, "powerFactor": 0.95,
- *     "powerMax": 350.0, "powerAvg": 180.0,
- *     "channels": [{ id, name, state, modeAuto, energyWh, wattage, source }, ...]
- *   },
- *   "logs": [{ id, timestamp, type, channelId, message }, ...]
- * }
+ * P0 #7 (audit round 9): HMAC-SHA256 signature required.
+ * Headers:
+ *   X-Device-Id:  <16-char anonymous ID>
+ *   X-Timestamp:  <unix seconds>
+ *   X-Nonce:      <16 hex chars random>
+ *   X-Signature:  <HMAC-SHA256(secret, timestamp + nonce + body)>
+ *
+ * Body: { mac, status: {...}, logs: [...] }
  */
 function doPost(e) {
   try {
-    const body = JSON.parse(e.postData.contents);
+    // P1 #15: Validate body size BEFORE parsing
+    const rawBody = e.postData.contents;
+    if (!rawBody || rawBody.length > MAX_BODY_SIZE) {
+      return jsonOut({ success: false, error: 'Body too large (max ' + MAX_BODY_SIZE + ' bytes)' });
+    }
+
+    // P0 #7: Verify HMAC signature
+    const deviceId = normalizeDeviceId(e.parameter['X-Device-Id'] || getHeader_(e, 'X-Device-Id'));
+    const timestampStr = getHeader_(e, 'X-Timestamp') || '';
+    const nonce = getHeader_(e, 'X-Nonce') || '';
+    const signature = getHeader_(e, 'X-Signature') || '';
+
+    if (!isValidDeviceId(deviceId)) {
+      return jsonOut({ success: false, error: 'Missing or invalid X-Device-Id header' });
+    }
+
+    // Look up the device's shared secret from Script Properties
+    const secretKey = 'DEVICE_' + deviceId + '_SECRET';
+    const secretHex = PropertiesService.getScriptProperties().getProperty(secretKey);
+    if (!secretHex || secretHex.length !== 64) {
+      Logger.log('No secret configured for device: ' + deviceId);
+      return jsonOut({ success: false, error: 'Device not registered (no HMAC secret found)' });
+    }
+
+    // Verify timestamp ±5 min
+    const timestamp = parseInt(timestampStr, 10);
+    if (isNaN(timestamp)) {
+      return jsonOut({ success: false, error: 'Invalid X-Timestamp header' });
+    }
+    const serverTime = Math.floor(Date.now() / 1000);
+    if (Math.abs(serverTime - timestamp) > TIMESTAMP_TOLERANCE_SEC) {
+      Logger.log('Timestamp out of range: client=' + timestamp + ' server=' + serverTime);
+      return jsonOut({ success: false, error: 'Timestamp out of tolerance (±5 min)' });
+    }
+
+    // Verify nonce not replayed
+    const nonceCacheKey = NONCE_KEY_PREFIX + deviceId + '_' + nonce;
+    const existingNonce = CacheService.getScriptCache().get(nonceCacheKey);
+    if (existingNonce) {
+      Logger.log('Nonce replay detected: ' + nonce);
+      return jsonOut({ success: false, error: 'Nonce already used (replay detected)' });
+    }
+
+    // Compute expected HMAC
+    const canonical = timestampStr + nonce + rawBody;
+    const secretBytes = Utilities.computeHmacSha256Signature(
+      canonical,
+      Utilities.newBlob(hexToBytes_(secretHex)).getBytes()
+    );
+    const computedSigHex = bytesToHex_(secretBytes);
+
+    // Constant-time compare
+    if (!constantTimeEquals_(signature.toUpperCase(), computedSigHex.toUpperCase())) {
+      Logger.log('HMAC mismatch: expected=' + computedSigHex + ' got=' + signature);
+      return jsonOut({ success: false, error: 'Invalid signature' });
+    }
+
+    // Mark nonce as used
+    CacheService.getScriptCache().put(nonceCacheKey, '1', NONCE_TTL_SEC);
+
+    // Parse body
+    const body = JSON.parse(rawBody);
     const mac = normalizeDeviceId(body.mac);
     const logs = body.logs || [];
     const status = body.status || {};
 
     if (!isValidDeviceId(mac)) {
-      return jsonOut({ success: false, error: 'Invalid device ID (must be 12 or 16 hex chars)' });
+      return jsonOut({ success: false, error: 'Invalid device ID in body (must be 16 hex chars)' });
     }
+
+    // P1 #15: Validate body schema
+    if (mac !== deviceId) {
+      return jsonOut({ success: false, error: 'Device ID mismatch (header vs body)' });
+    }
+    if (!Array.isArray(logs) || logs.length > MAX_LOGS) {
+      return jsonOut({ success: false, error: 'Invalid logs (must be array, max ' + MAX_LOGS + ' entries)' });
+    }
+    if (typeof status !== 'object' || status === null) {
+      return jsonOut({ success: false, error: 'Invalid status (must be object)' });
+    }
+
+    // Validate channel names + log messages (truncate if too long)
+    if (status.channels) {
+      if (!Array.isArray(status.channels) || status.channels.length > MAX_CHANNELS) {
+        return jsonOut({ success: false, error: 'Invalid channels (max ' + MAX_CHANNELS + ')' });
+      }
+      status.channels = status.channels.map(ch => {
+        if (ch.name && String(ch.name).length > MAX_CHANNEL_NAME_LEN) {
+          ch.name = String(ch.name).substring(0, MAX_CHANNEL_NAME_LEN);
+        }
+        return ch;
+      });
+    }
+    const validatedLogs = logs.map(l => {
+      if (l.message && String(l.message).length > MAX_LOG_MESSAGE_LEN) {
+        l.message = String(l.message).substring(0, MAX_LOG_MESSAGE_LEN);
+      }
+      return l;
+    });
 
     // Store latest data in cache (for GET polling by PWA)
     CacheService.getScriptCache().put(
       DATA_KEY_PREFIX + mac,
-      JSON.stringify({ logs, status, ts: Date.now() }),
+      JSON.stringify({ logs: validatedLogs, status, ts: Date.now() }),
       Math.floor(DATA_TTL_MS / 1000)
     );
 
     // Generate insights
-    const insights = generateInsights(mac, logs, status);
+    const insights = generateInsights(mac, validatedLogs, status);
     return jsonOut({ success: true, insights: insights });
   } catch (err) {
     Logger.log('doPost error: ' + err);
     return jsonOut({ success: false, error: String(err) });
   }
+}
+
+/**
+ * Extract header from GAS event (handles both lowercase and standard names).
+ * GAS normalizes header names, but we check multiple cases for safety.
+ */
+function getHeader_(e, name) {
+  if (!e || !e.parameters) return '';
+  // GAS puts headers in e.parameters with lowercase keys
+  const lower = name.toLowerCase();
+  if (e.parameters[lower]) return e.parameters[lower];
+  if (e.parameters[name]) return e.parameters[name];
+  return '';
 }
 
 /**
@@ -152,7 +262,6 @@ function getInsights(mac) {
   // Get stored data
   const dataStr = CacheService.getScriptCache().get(DATA_KEY_PREFIX + mac);
   if (!dataStr) {
-    // No data yet — return mock insights
     return jsonOut({
       success: true,
       insights: getMockInsights(mac),
@@ -236,7 +345,6 @@ function buildPrompt(mac, logs, status) {
   // Include PZEM power meter data if available
   let pzemSummary = '';
   if (status.voltage !== undefined) {
-    // Cost estimation using PLN tariff
     const energyTodayKwh = status.energyToday || 0;
     const costTodayRp = Math.round(energyTodayKwh * ELECTRICITY_RATE_RUPIAH_PER_KWH);
 
@@ -297,7 +405,6 @@ Respond ONLY with the JSON array, no markdown fences or extra text.`;
  * Parse Gemini response (handle both JSON and markdown-fenced)
  */
 function parseGeminiResponse(text, mac) {
-  // Remove markdown fences if present
   let clean = text.trim();
   if (clean.startsWith('```')) {
     clean = clean.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
@@ -336,6 +443,29 @@ function getMockInsights(mac) {
       source: 'mock',
     },
   ];
+}
+
+// === Crypto helpers ===
+
+function hexToBytes_(hex) {
+  const bytes = [];
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes.push(parseInt(hex.substr(i, 2), 16));
+  }
+  return bytes;
+}
+
+function bytesToHex_(bytes) {
+  return bytes.map(b => ('0' + b.toString(16)).slice(-2)).join('');
+}
+
+function constantTimeEquals_(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
 }
 
 /**

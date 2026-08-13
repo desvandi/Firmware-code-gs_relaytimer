@@ -27,12 +27,42 @@ void HttpServer::_sendSecurityHeaders() {
   http.sendHeader("Content-Security-Policy",
     "default-src 'self'; script-src 'self' 'unsafe-inline'; "
     "style-src 'self' 'unsafe-inline'; img-src 'self' data:;");
-  // CORS for PWA on different origin (Vercel → ESP32 via Cloudflare Tunnel)
-  http.sendHeader("Access-Control-Allow-Origin", "*");
-  http.sendHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  http.sendHeader("Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-CSRF-Token");
-  http.sendHeader("Access-Control-Allow-Credentials", "true");
+
+  // P0 #10 (audit round 9): CORS origin now configurable.
+  // Default: "*" (development). Production: set ALLOWED_CORS_ORIGINS in Config.h
+  // to PWA's Vercel URL.
+  String origin = "*";
+  if (strcmp(Core::ALLOWED_CORS_ORIGINS, "*") != 0) {
+    // Echo back Origin if it's in the allowed list
+    if (http.hasHeader("Origin")) {
+      String reqOrigin = http.header("Origin");
+      String allowed = Core::ALLOWED_CORS_ORIGINS;
+      int start = 0;
+      while (start < (int)allowed.length()) {
+        int comma = allowed.indexOf(',', start);
+        String one = (comma < 0) ? allowed.substring(start) : allowed.substring(start, comma);
+        one.trim();
+        if (one.length() > 0 && reqOrigin == one) {
+          origin = reqOrigin;
+          break;
+        }
+        if (comma < 0) break;
+        start = comma + 1;
+      }
+    }
+    if (origin == "*") origin = "";  // don't send ACAO if origin not allowed
+  }
+
+  if (origin.length() > 0) {
+    http.sendHeader("Access-Control-Allow-Origin", origin);
+    http.sendHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    http.sendHeader("Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-CSRF-Token");
+    http.sendHeader("Access-Control-Allow-Credentials", "true");
+    if (origin != "*") {
+      http.sendHeader("Vary", "Origin");
+    }
+  }
 }
 
 void HttpServer::_sendJson(const String& body, int code) {
@@ -57,22 +87,44 @@ void HttpServer::_sendJsonError(int code, const String& message) {
 }
 
 void HttpServer::_registerRoutes() {
-  // CORS preflight
+  // CORS preflight (P0 #10: configurable origin)
   http.onNotFound([]() {
     if (http.method() == HTTP_OPTIONS) {
-      // Inline security + CORS headers for preflight
       http.sendHeader("X-Frame-Options", "DENY");
       http.sendHeader("X-Content-Type-Options", "nosniff");
-      http.sendHeader("Access-Control-Allow-Origin", "*");
-      http.sendHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-      http.sendHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CSRF-Token");
-      http.sendHeader("Access-Control-Allow-Credentials", "true");
+      // Configurable CORS
+      String origin = "*";
+      if (strcmp(Core::ALLOWED_CORS_ORIGINS, "*") != 0) {
+        if (http.hasHeader("Origin")) {
+          String reqOrigin = http.header("Origin");
+          String allowed = Core::ALLOWED_CORS_ORIGINS;
+          int start = 0;
+          while (start < (int)allowed.length()) {
+            int comma = allowed.indexOf(',', start);
+            String one = (comma < 0) ? allowed.substring(start) : allowed.substring(start, comma);
+            one.trim();
+            if (one.length() > 0 && reqOrigin == one) { origin = reqOrigin; break; }
+            if (comma < 0) break;
+            start = comma + 1;
+          }
+        }
+        if (origin == "*") origin = "";
+      }
+      if (origin.length() > 0) {
+        http.sendHeader("Access-Control-Allow-Origin", origin);
+        http.sendHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+        http.sendHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CSRF-Token");
+        http.sendHeader("Access-Control-Allow-Credentials", "true");
+        if (origin != "*") http.sendHeader("Vary", "Origin");
+      }
       http.send(204);
     } else {
-      // Inline 404 JSON error
       http.sendHeader("X-Frame-Options", "DENY");
-      http.sendHeader("Access-Control-Allow-Origin", "*");
-      http.sendHeader("Access-Control-Allow-Credentials", "true");
+      String origin = (strcmp(Core::ALLOWED_CORS_ORIGINS, "*") == 0) ? "*" : "";
+      if (origin.length() > 0) {
+        http.sendHeader("Access-Control-Allow-Origin", origin);
+        http.sendHeader("Access-Control-Allow-Credentials", "true");
+      }
       http.send(404, "application/json; charset=utf-8",
                "{\"success\":false,\"message\":\"Not Found\",\"data\":null}");
     }

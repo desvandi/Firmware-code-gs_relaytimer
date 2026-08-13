@@ -120,10 +120,33 @@ void WifiManager::_loadCredentials() {
     prefs.putString(Core::NVS_KEY_DEVICE_PIN, _devicePin);
   }
 
+  // P0 #7 (audit round 9): Load or generate GAS HMAC secret (32 bytes).
+  // Used to sign hourly POST to Google Apps Script. User copies the hex
+  // secret to GAS Script Properties as: DEVICE_<anonymousId>_SECRET
+  String gasSecretHex = prefs.getString(Core::NVS_KEY_GAS_SECRET, "");
+  if (gasSecretHex.length() == Core::GAS_SECRET_LEN * 2) {
+    _gasSecretHex = gasSecretHex;
+  } else {
+    // Generate 32 random bytes → 64 hex chars
+    uint8_t secret[Core::GAS_SECRET_LEN];
+    Utils::generateRandomBytes(secret, Core::GAS_SECRET_LEN);
+    char hex[Core::GAS_SECRET_LEN * 2 + 1];
+    Utils::bytesToHex(secret, Core::GAS_SECRET_LEN, hex);
+    _gasSecretHex = String(hex);
+    memset(secret, 0, sizeof(secret));
+    prefs.putString(Core::NVS_KEY_GAS_SECRET, _gasSecretHex);
+    Serial.println("[WiFi] Generated new GAS HMAC secret (first-time setup)");
+  }
+
   prefs.end();
 
   Serial.printf("[WiFi] MQTT Password: %s\n", _mqttPassword);
   Serial.printf("[WiFi] Device PIN: %s\n", _devicePin);
+  Serial.printf("[WiFi] GAS HMAC Secret: %s\n", _gasSecretHex.c_str());
+  Serial.println("[WiFi] Copy GAS secret to GAS Script Properties:");
+  String anonId = Utils::sha256Hex(getMacAddress()).substring(0, 16);
+  Serial.printf("[WiFi]   Key: DEVICE_%s_SECRET\n", anonId.c_str());
+  Serial.printf("[WiFi]   Value: %s\n", _gasSecretHex.c_str());
 }
 
 void WifiManager::_saveCredentials(const String& ssid, const String& password) {

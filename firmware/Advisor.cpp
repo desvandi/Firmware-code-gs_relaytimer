@@ -166,6 +166,46 @@ bool Advisor::_postToGAS() {
   String payload = _buildPayload();
   Serial.printf("[AI] POST payload size: %d bytes\n", payload.length());
 
+  // P0 #7 (audit round 9): Sign the payload with HMAC-SHA256 using the
+  // per-device GAS secret. GAS verifies the signature before processing.
+  // Also send timestamp + nonce for replay protection.
+  String gasSecretHex = TimerNet::wifi.getGasSecretHex();
+  if (gasSecretHex.length() != Core::GAS_SECRET_LEN * 2) {
+    Serial.println("[AI] ERROR: GAS secret not configured — skipping HMAC signing");
+    // Still send the request — GAS will reject it if HMAC is required
+  } else {
+    // Convert hex secret to bytes
+    uint8_t secret[Core::GAS_SECRET_LEN];
+    Utils::hexToBytes(gasSecretHex.c_str(), secret, Core::GAS_SECRET_LEN);
+
+    // Canonical request = timestamp + nonce + payload
+    uint32_t timestamp = (uint32_t)Drivers::rtc.getUnixTime();
+    String nonce = Utils::generateToken(16);  // 16 hex chars random nonce
+    String canonical = String(timestamp) + nonce + payload;
+
+    // Compute HMAC-SHA256
+    uint8_t hmac[32];
+    Utils::hmacSha256(secret, Core::GAS_SECRET_LEN,
+                      (const uint8_t*)canonical.c_str(), canonical.length(),
+                      hmac);
+    char hmacHex[65];
+    Utils::bytesToHex(hmac, 32, hmacHex);
+    memset(secret, 0, sizeof(secret));
+    memset(hmac, 0, sizeof(hmac));
+
+    // Send HMAC headers
+    http.addHeader("X-Timestamp", String(timestamp));
+    http.addHeader("X-Nonce", nonce);
+    http.addHeader("X-Signature", String(hmacHex));
+
+    // Also send anonymous device ID so GAS knows which secret to use
+    String anonId = Utils::sha256Hex(TimerNet::wifi.getMacAddress()).substring(0, 16);
+    http.addHeader("X-Device-Id", anonId);
+
+    Serial.printf("[AI] HMAC signed: ts=%u nonce=%s sig=%.16s...\n",
+                  timestamp, nonce.c_str(), hmacHex);
+  }
+
   // Reset watchdog before blocking HTTP call
   esp_task_wdt_reset();
 
