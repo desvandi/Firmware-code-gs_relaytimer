@@ -49,6 +49,26 @@ bool jwtVerify(const String& token, const String& secret, String& outUsername);
 // Generate random hex token (for CSRF / factory-reset)
 String generateToken(size_t hexChars);
 
+// R10A-2 (audit round 10): Ed25519 signature verification for OTA firmware.
+// Verifies a 64-byte Ed25519 signature over a 32-byte SHA-256 hash
+// (pre-hash mode — signs the hash, not the full binary).
+//
+// PWA signs: signature = ed25519_sign(sha256(firmware), privateKey)
+// ESP32 verifies: ed25519_verify(signature, sha256_hash, publicKey)
+//
+// publicKeyHex: 64 hex chars (32 raw bytes, Ed25519 public key)
+// signatureHex: 128 hex chars (64 raw bytes, Ed25519 signature)
+// hashBytes:    32 bytes (SHA-256 of the firmware binary)
+//
+// Returns true if signature is valid, false otherwise.
+// Hard-fails (returns false) if:
+//   - MBEDTLS_ED25519_C is not compiled in
+//   - public key or signature has wrong length
+//   - mbedtls verification returns non-zero
+bool ed25519VerifyHash(const char* publicKeyHex,
+                       const char* signatureHex,
+                       const uint8_t* hashBytes, size_t hashLen);
+
 } // namespace Utils
 
 #endif

@@ -1,12 +1,14 @@
 /**
  * Timer Digital Relay v4.0 — Google Apps Script (AI Insights via Gemini)
  *
- * P0 #7 + P1 #15 + #16 (audit round 9):
- *   - HMAC-SHA256 signature verification (shared secret per device in NVS)
- *   - Timestamp ±5 min tolerance (replay protection)
- *   - Nonce tracking (one-time use, 10k cap via CacheService)
- *   - Body size + schema validation (max 16KB, max 100 logs, max 50 char names)
- *   - Removed raw-MAC backward compatibility (16-char anonymous ID only)
+ * Round 10A fixes (audit round 10):
+ *   R10A-1: HMAC metadata moved from HTTP headers → URL query parameters.
+ *           GAS Web App event object does NOT expose HTTP request headers;
+ *           previous http.addHeader() approach was silently broken.
+ *           Auth metadata now sent as: ?deviceId=...&timestamp=...&nonce=...&signature=...
+ *   R10A-2: Nonce check wrapped in LockService.getScriptLock() for atomicity.
+ *           Previous check-then-claim had race condition (two concurrent
+ *           requests could both pass the check).
  *
  * Privacy: ESP32 sends anonymous device ID (first 16 chars of SHA-256(MAC)).
  *   Gemini never sees the real MAC. The anonymous ID is used as a cache key
@@ -25,6 +27,12 @@
  *    - Who has access: Anyone (anonymous — HMAC provides auth)
  * 6. Copy deployment URL → set as GAS_INSIGHTS_URL in firmware Config.h
  *    and NEXT_PUBLIC_GAS_INSIGHTS_URL in Vercel env vars.
+ *
+ * ESP32 sends:
+ *   POST <GAS_URL>?deviceId=<16hex>&timestamp=<unixSec>&nonce=<16hex>&signature=<64hex>
+ *   Body: { mac, status: {...}, logs: [...] }
+ *   Canonical = timestamp + "\n" + nonce + "\n" + deviceId + "\n" + body
+ *   signature = HMAC-SHA256(secret, canonical)
  */
 
 // === CONFIG ===
@@ -49,19 +57,17 @@ const MAX_CHANNELS = 12;
 
 // HMAC config
 const TIMESTAMP_TOLERANCE_SEC = 300;          // ±5 minutes
-const MAX_NONCES = 10000;                     // cap nonce cache size
 
 // PLN tariff (Indonesia) — used for cost estimation
 const ELECTRICITY_RATE_RUPIAH_PER_KWH = 1467;
 
 /**
  * Validate anonymous device ID: must be exactly 16 hex chars.
- * P1 #16 (audit round 9): raw MAC (12 chars) is NO LONGER accepted.
  */
 function isValidDeviceId(id) {
   if (!id) return false;
   const cleaned = String(id).toUpperCase().replace(/[^A-F0-9]/g, '');
-  return cleaned.length === 16;  // ONLY 16-char anonymous ID accepted
+  return cleaned.length === 16;
 }
 
 function normalizeDeviceId(id) {
@@ -72,7 +78,6 @@ function normalizeDeviceId(id) {
  * GET endpoint — PWA fetches insights for a specific device.
  * PWA does NOT have the HMAC secret (only ESP32 does), so GET uses
  * a simpler auth model: the anonymous device ID itself is the "key".
- * For production, consider adding a PWA-specific token.
  */
 function doGet(e) {
   const mac = normalizeDeviceId(e.parameter.mac);
@@ -101,31 +106,45 @@ function doGet(e) {
 /**
  * POST endpoint — ESP32 pushes logs + status, triggers Gemini analysis.
  *
- * P0 #7 (audit round 9): HMAC-SHA256 signature required.
- * Headers:
- *   X-Device-Id:  <16-char anonymous ID>
- *   X-Timestamp:  <unix seconds>
- *   X-Nonce:      <16 hex chars random>
- *   X-Signature:  <HMAC-SHA256(secret, timestamp + nonce + body)>
+ * R10A-1 (audit round 10): Auth metadata sent as URL query parameters
+ * (NOT HTTP headers — GAS Web App event object does not expose headers).
  *
+ * URL: POST <GAS_URL>?deviceId=<16hex>&timestamp=<unixSec>&nonce=<16hex>&signature=<64hex>
  * Body: { mac, status: {...}, logs: [...] }
+ *
+ * Canonical request = timestamp + "\n" + nonce + "\n" + deviceId + "\n" + rawBody
+ * signature = HMAC-SHA256(deviceSecret, canonical)
+ *
+ * R10A-2 (audit round 10): Nonce check + HMAC verify wrapped in
+ * LockService.getScriptLock() to prevent race condition on concurrent requests.
  */
 function doPost(e) {
+  const lock = LockService.getScriptLock();
   try {
+    // R10A-2: Acquire lock BEFORE reading nonce — prevents race condition
+    // where two concurrent requests both see nonce as "not used".
+    // 30s timeout is generous; ESP32 HTTP timeout is 8s.
+    if (!lock.tryLock(30000)) {
+      return jsonOut({ success: false, error: 'Server busy — could not acquire lock' });
+    }
+
+    // R10A-1: Read auth metadata from e.parameter (URL query params), NOT headers
+    const deviceId = normalizeDeviceId(e.parameter.deviceId);
+    const timestampStr = e.parameter.timestamp || '';
+    const nonce = e.parameter.nonce || '';
+    const signature = (e.parameter.signature || '').toUpperCase();
+
+    if (!isValidDeviceId(deviceId)) {
+      return jsonOut({ success: false, error: 'Missing or invalid deviceId parameter' });
+    }
+    if (!timestampStr || !nonce || !signature) {
+      return jsonOut({ success: false, error: 'Missing timestamp/nonce/signature parameters' });
+    }
+
     // P1 #15: Validate body size BEFORE parsing
     const rawBody = e.postData.contents;
     if (!rawBody || rawBody.length > MAX_BODY_SIZE) {
       return jsonOut({ success: false, error: 'Body too large (max ' + MAX_BODY_SIZE + ' bytes)' });
-    }
-
-    // P0 #7: Verify HMAC signature
-    const deviceId = normalizeDeviceId(e.parameter['X-Device-Id'] || getHeader_(e, 'X-Device-Id'));
-    const timestampStr = getHeader_(e, 'X-Timestamp') || '';
-    const nonce = getHeader_(e, 'X-Nonce') || '';
-    const signature = getHeader_(e, 'X-Signature') || '';
-
-    if (!isValidDeviceId(deviceId)) {
-      return jsonOut({ success: false, error: 'Missing or invalid X-Device-Id header' });
     }
 
     // Look up the device's shared secret from Script Properties
@@ -139,7 +158,7 @@ function doPost(e) {
     // Verify timestamp ±5 min
     const timestamp = parseInt(timestampStr, 10);
     if (isNaN(timestamp)) {
-      return jsonOut({ success: false, error: 'Invalid X-Timestamp header' });
+      return jsonOut({ success: false, error: 'Invalid timestamp parameter' });
     }
     const serverTime = Math.floor(Date.now() / 1000);
     if (Math.abs(serverTime - timestamp) > TIMESTAMP_TOLERANCE_SEC) {
@@ -147,7 +166,7 @@ function doPost(e) {
       return jsonOut({ success: false, error: 'Timestamp out of tolerance (±5 min)' });
     }
 
-    // Verify nonce not replayed
+    // R10A-2: Nonce check is now atomic (inside lock)
     const nonceCacheKey = NONCE_KEY_PREFIX + deviceId + '_' + nonce;
     const existingNonce = CacheService.getScriptCache().get(nonceCacheKey);
     if (existingNonce) {
@@ -156,21 +175,25 @@ function doPost(e) {
     }
 
     // Compute expected HMAC
-    const canonical = timestampStr + nonce + rawBody;
+    // Canonical = timestamp + "\n" + nonce + "\n" + deviceId + "\n" + rawBody
+    const canonical = timestampStr + '\n' + nonce + '\n' + deviceId + '\n' + rawBody;
     const secretBytes = Utilities.computeHmacSha256Signature(
       canonical,
       Utilities.newBlob(hexToBytes_(secretHex)).getBytes()
     );
-    const computedSigHex = bytesToHex_(secretBytes);
+    const computedSigHex = bytesToHex_(secretBytes).toUpperCase();
 
     // Constant-time compare
-    if (!constantTimeEquals_(signature.toUpperCase(), computedSigHex.toUpperCase())) {
+    if (!constantTimeEquals_(signature, computedSigHex)) {
       Logger.log('HMAC mismatch: expected=' + computedSigHex + ' got=' + signature);
       return jsonOut({ success: false, error: 'Invalid signature' });
     }
 
-    // Mark nonce as used
+    // Mark nonce as used (still inside lock — atomic)
     CacheService.getScriptCache().put(nonceCacheKey, '1', NONCE_TTL_SEC);
+
+    // Release lock — rest of processing (JSON parse, Gemini call) doesn't need lock
+    lock.releaseLock();
 
     // Parse body
     const body = JSON.parse(rawBody);
@@ -182,9 +205,9 @@ function doPost(e) {
       return jsonOut({ success: false, error: 'Invalid device ID in body (must be 16 hex chars)' });
     }
 
-    // P1 #15: Validate body schema
+    // Validate body schema
     if (mac !== deviceId) {
-      return jsonOut({ success: false, error: 'Device ID mismatch (header vs body)' });
+      return jsonOut({ success: false, error: 'Device ID mismatch (param vs body)' });
     }
     if (!Array.isArray(logs) || logs.length > MAX_LOGS) {
       return jsonOut({ success: false, error: 'Invalid logs (must be array, max ' + MAX_LOGS + ' entries)' });
@@ -225,20 +248,12 @@ function doPost(e) {
   } catch (err) {
     Logger.log('doPost error: ' + err);
     return jsonOut({ success: false, error: String(err) });
+  } finally {
+    // Ensure lock is released if still held (e.g., exception before explicit release)
+    if (lock.hasLock()) {
+      lock.releaseLock();
+    }
   }
-}
-
-/**
- * Extract header from GAS event (handles both lowercase and standard names).
- * GAS normalizes header names, but we check multiple cases for safety.
- */
-function getHeader_(e, name) {
-  if (!e || !e.parameters) return '';
-  // GAS puts headers in e.parameters with lowercase keys
-  const lower = name.toLowerCase();
-  if (e.parameters[lower]) return e.parameters[lower];
-  if (e.parameters[name]) return e.parameters[name];
-  return '';
 }
 
 /**

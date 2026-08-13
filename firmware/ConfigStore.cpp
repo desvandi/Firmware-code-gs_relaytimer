@@ -269,15 +269,43 @@ void ConfigStore::clearDirty() {
 void ConfigStore::loadDeviceConfig() {
   // Use Preferences (NVS) for small key-value pairs (name, timezone, jwt secret)
   Preferences prefs;
-  prefs.begin("timer12", true);
+  prefs.begin("timer12", true);  // read-only first
   const char* defaultName = "Timer12-ESP32";
   strncpy(Core::deviceName, prefs.getString("name", defaultName).c_str(), 32);
   Core::deviceName[32] = '\0';
   strncpy(Core::timezone, prefs.getString("tz", Core::DEFAULT_TIMEZONE).c_str(), 39);
   Core::timezone[39] = '\0';
-  strncpy(Core::jwtSecret, prefs.getString("jwt", Core::JWT_SECRET_DEFAULT).c_str(), 64);
-  Core::jwtSecret[64] = '\0';
+
+  // R10A-4 (audit round 10): JWT secret — random per-device, NO compile-time fallback.
+  // First boot: generate 32-byte random secret, store in NVS.
+  // Subsequent boots: load from NVS.
+  // If NVS is wiped/missing: generate NEW random secret (previous tokens invalidated).
+  // NO fallback to JWT_SECRET_DEFAULT — that was a security hole (same secret
+  // across all devices → attacker who knew the constant could forge JWTs).
+  String storedJwt = prefs.getString("jwt", "");
   prefs.end();
+
+  if (storedJwt.length() == 64) {
+    strncpy(Core::jwtSecret, storedJwt.c_str(), 64);
+    Core::jwtSecret[64] = '\0';
+  } else {
+    // Generate 32 random bytes → 64 hex chars
+    uint8_t secretBytes[32];
+    Utils::generateRandomBytes(secretBytes, 32);
+    char hex[65];
+    Utils::bytesToHex(secretBytes, 32, hex);
+    hex[64] = '\0';
+    strncpy(Core::jwtSecret, hex, 64);
+    Core::jwtSecret[64] = '\0';
+    memset(secretBytes, 0, sizeof(secretBytes));
+    // Save to NVS (reopen in write mode)
+    Preferences writePrefs;
+    writePrefs.begin("timer12", false);
+    writePrefs.putString("jwt", Core::jwtSecret);
+    writePrefs.end();
+    Serial.println("[ConfigStore] Generated new random JWT secret (first boot or NVS wiped)");
+    Serial.println("[ConfigStore] Previous JWT tokens are now invalidated.");
+  }
 }
 
 void ConfigStore::saveDeviceConfig() {

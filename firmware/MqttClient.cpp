@@ -15,11 +15,14 @@
 #include "WifiManager.h"
 #include "ConfigStore.h"
 #include "Json.h"
+#include "Crypto.h"
 #include <ArduinoJson.h>
 #include <esp_task_wdt.h>
 #include <HTTPClient.h>
 #include <Update.h>
 #include <mbedtls/sha256.h>
+#include <algorithm>
+#include <vector>
 
 namespace Services {
 
@@ -33,22 +36,53 @@ static const char* LOG_TYPE_NAMES[] = {
 };
 
 bool MqttClient::begin() {
-  // Use TLS (WiFiClientSecure) if broker port is 8883, otherwise plain TCP
-  if (Core::MQTT_BROKER_PORT == 8883 || Core::MQTT_BROKER_PORT == 8884) {
-    // P0 #4 (audit round 9): use setCACert() instead of setInsecure() when root CA is configured.
-    // If MQTT_ROOT_CA is empty, fall back to setInsecure() with a warning (NOT for production!).
-    if (strlen(Core::MQTT_ROOT_CA) > 0) {
-      _wifiClientSecure.setCACert(Core::MQTT_ROOT_CA);
-      Serial.println("[MQTT] TLS: using configured root CA for broker cert validation");
-    } else {
-      _wifiClientSecure.setInsecure();  // Skip cert validation (development only!)
-      Serial.println("[MQTT] WARNING: TLS enabled but MQTT_ROOT_CA is empty — using setInsecure() (NOT for production!)");
+  // R10A-5 (audit round 10): Production MQTT guard.
+  // For 220V relay control, MQTT must be TLS + authenticated + CA-verified.
+  // Production mode is triggered by: port 8883 OR 8884.
+  // In production mode, ALL of these must be configured:
+  //   - MQTT_BROKER_USERNAME (non-empty)
+  //   - MQTT_BROKER_PASSWORD (non-empty)
+  //   - MQTT_ROOT_CA (non-empty PEM)
+  // If any is missing → hard fail (refuse to connect).
+  //
+  // For development (port 1883): public broker + topic password is acceptable.
+  bool isProductionMode = (Core::MQTT_BROKER_PORT == 8883 || Core::MQTT_BROKER_PORT == 8884);
+
+  if (isProductionMode) {
+    if (strlen(Core::MQTT_BROKER_USERNAME) == 0) {
+      Serial.println("[MQTT] FATAL: Production mode (port 8883/8884) requires MQTT_BROKER_USERNAME");
+      Serial.println("[MQTT] Refusing to connect. Configure credentials in Config.h and re-flash.");
+      _initialized = false;
+      return false;
     }
+    if (strlen(Core::MQTT_BROKER_PASSWORD) == 0) {
+      Serial.println("[MQTT] FATAL: Production mode (port 8883/8884) requires MQTT_BROKER_PASSWORD");
+      Serial.println("[MQTT] Refusing to connect. Configure credentials in Config.h and re-flash.");
+      _initialized = false;
+      return false;
+    }
+    if (strlen(Core::MQTT_ROOT_CA) == 0) {
+      Serial.println("[MQTT] FATAL: Production mode (port 8883/8884) requires MQTT_ROOT_CA (PEM)");
+      Serial.println("[MQTT] Refusing to connect with setInsecure() in production.");
+      Serial.println("[MQTT] Get Let's Encrypt root CA: https://letsencrypt.org/certs/isrgrootx1.pem");
+      Serial.println("[MQTT] Paste PEM in Config.h MQTT_ROOT_CA and re-flash.");
+      _initialized = false;
+      return false;
+    }
+    Serial.println("[MQTT] Production mode: TLS + auth + CA verified ✓");
+  }
+
+  // Use TLS (WiFiClientSecure) if broker port is 8883/8884, otherwise plain TCP
+  if (Core::MQTT_BROKER_PORT == 8883 || Core::MQTT_BROKER_PORT == 8884) {
+    // R10A-5: setCACert() is MANDATORY in production (checked above).
+    // No setInsecure() fallback — fail-closed.
+    _wifiClientSecure.setCACert(Core::MQTT_ROOT_CA);
+    Serial.println("[MQTT] TLS: using configured root CA for broker cert validation");
     _mqtt.setClient(_wifiClientSecure);
     Serial.printf("[MQTT] Using TLS (port %d)\n", Core::MQTT_BROKER_PORT);
   } else {
     _mqtt.setClient(_wifiClient);
-    Serial.println("[MQTT] Using plain TCP (no TLS)");
+    Serial.println("[MQTT] Using plain TCP (no TLS) — development mode only");
   }
   _mqtt.setServer(Core::MQTT_BROKER_HOST, Core::MQTT_BROKER_PORT);
   _mqtt.setKeepAlive(Core::MQTT_KEEPALIVE_SEC);
@@ -483,14 +517,27 @@ void MqttClient::_handleCommand(const String& json) {
   const char* action = doc["action"] | "";
   String requestId = doc["requestId"] | "";
 
-  // P0 #1 (audit round 9): Dedup check BEFORE validation, but only to ACK
-  // duplicates. requestId is NOT added to dedup buffer until after successful
-  // execution — so invalid/failed commands can be retried.
+  // R10A-3 (audit round 10): Compute command fingerprint for idempotency binding.
+  // Same requestId + same hash → re-ACK original result (true duplicate).
+  // Same requestId + DIFFERENT hash → reject "requestId reuse with different command".
+  String commandHash = _computeCommandHash(doc);
+
+  // P0 #1 / R10A-3: Dedup check — verify requestId was not used before,
+  // AND if it was used, verify the command matches.
   if (requestId.length() > 0 && _isDuplicate(requestId)) {
+    String previousHash = _getHashForRequestId(requestId);
+    if (previousHash.length() > 0 && previousHash != commandHash) {
+      // requestId reuse with DIFFERENT command — security violation
+      Serial.printf("[MQTT] SECURITY: requestId reuse with different command! rid=%s\n", requestId.c_str());
+      Services::Log.append(Core::LogType::AuthFail,
+        "SECURITY: requestId reuse with different command: " + requestId, 0);
+      _publishAck(requestId, false, "requestId reuse with different command — rejected");
+      return;
+    }
+
+    // True duplicate — re-ACK with actual state (P0 #2)
     Serial.printf("[MQTT] Duplicate command detected: %s — re-ACKing with actual state\n", requestId.c_str());
 
-    // P0 #2 (audit round 9): Duplicate ACK must include actual state.
-    // Determine what type of command this was and send the appropriate ACK.
     if (strcmp(type, "relay") == 0) {
       int channelId = doc["channelId"] | 0;
       if (channelId >= 1 && channelId <= Core::NUM_CHANNELS) {
@@ -569,7 +616,7 @@ void MqttClient::_handleCommand(const String& json) {
     }
 
     // Execution succeeded → add to dedup buffer (P0 #1 fix)
-    if (requestId.length() > 0) _addProcessed(requestId);
+    if (requestId.length() > 0) _addProcessed(requestId, commandHash);
 
     publishStatus();  // immediate status update after command
     // P0 #2 + P1 #11: Send ACK with actual relay state
@@ -645,7 +692,7 @@ void MqttClient::_handleCommand(const String& json) {
       Services::Log.append(Core::LogType::ConfigChange,
         "Schedule saved via MQTT for CH" + String(channelId), channelId);
 
-      if (requestId.length() > 0) _addProcessed(requestId);
+      if (requestId.length() > 0) _addProcessed(requestId, commandHash);
       publishStatus();
       _publishScheduleAck(requestId, true, "Schedule saved", channelId, savedId);
 
@@ -672,7 +719,7 @@ void MqttClient::_handleCommand(const String& json) {
       Services::Log.append(Core::LogType::ConfigChange,
         "Schedule " + String(id) + " deleted via MQTT from CH" + String(channelId), channelId);
 
-      if (requestId.length() > 0) _addProcessed(requestId);
+      if (requestId.length() > 0) _addProcessed(requestId, commandHash);
       publishStatus();
       _publishScheduleAck(requestId, true, "Schedule deleted", channelId, id);
 
@@ -725,7 +772,7 @@ void MqttClient::_handleCommand(const String& json) {
       return;  // no _addProcessed
     }
 
-    if (requestId.length() > 0) _addProcessed(requestId);
+    if (requestId.length() > 0) _addProcessed(requestId, commandHash);
     publishStatus();
     _publishPirAck(requestId, true, "PIR command executed", id);
   }
@@ -754,7 +801,7 @@ void MqttClient::_handleCommand(const String& json) {
       Services::Log.append(Core::LogType::ConfigChange,
         "CH" + String(channelId) + " renamed via MQTT: " + String(name), channelId);
 
-      if (requestId.length() > 0) _addProcessed(requestId);
+      if (requestId.length() > 0) _addProcessed(requestId, commandHash);
       publishStatus();
       _publishChannelAck(requestId, true, "Channel renamed", channelId);
     } else {
@@ -787,7 +834,7 @@ void MqttClient::_handleCommand(const String& json) {
       Drivers::rtc.adjust(y, m, d, h, mi, s);
       Services::Log.append(Core::LogType::TimeSync, "RTC set via MQTT", 0);
 
-      if (requestId.length() > 0) _addProcessed(requestId);
+      if (requestId.length() > 0) _addProcessed(requestId, commandHash);
       _publishGenericAck(requestId, true, "RTC time set");
     } else {
       if (requestId.length() > 0) {
@@ -804,7 +851,7 @@ void MqttClient::_handleCommand(const String& json) {
     if (strcmp(action, "reboot") == 0) {
       Services::Log.append(Core::LogType::Restart, "Reboot via MQTT", 0);
       if (requestId.length() > 0) {
-        _addProcessed(requestId);
+        _addProcessed(requestId, commandHash);
         _publishGenericAck(requestId, true, "Rebooting");
       }
       delay(500);
@@ -812,7 +859,7 @@ void MqttClient::_handleCommand(const String& json) {
     } else if (strcmp(action, "getStatus") == 0) {
       publishStatus();
       if (requestId.length() > 0) {
-        _addProcessed(requestId);
+        _addProcessed(requestId, commandHash);
         _publishGenericAck(requestId, true, "Status published");
       }
     } else if (strcmp(action, "resetEnergyStats") == 0) {
@@ -824,7 +871,7 @@ void MqttClient::_handleCommand(const String& json) {
         Drivers::pzem.resetEnergy();
       }
       Services::Log.append(Core::LogType::ConfigChange, "Energy stats reset via MQTT", 0);
-      if (requestId.length() > 0) _addProcessed(requestId);
+      if (requestId.length() > 0) _addProcessed(requestId, commandHash);
       publishStatus();
       _publishGenericAck(requestId, true, "Energy stats reset");
     } else if (strcmp(action, "resetDailyStats") == 0) {
@@ -832,7 +879,7 @@ void MqttClient::_handleCommand(const String& json) {
         Drivers::pzem.resetDailyStats();
       }
       Services::Log.append(Core::LogType::ConfigChange, "Daily stats reset via MQTT", 0);
-      if (requestId.length() > 0) _addProcessed(requestId);
+      if (requestId.length() > 0) _addProcessed(requestId, commandHash);
       publishStatus();
       _publishGenericAck(requestId, true, "Daily stats reset");
     } else {
@@ -873,7 +920,7 @@ void MqttClient::_handleCommand(const String& json) {
       }
       Storage::config.saveDeviceConfig();
       Services::Log.append(Core::LogType::ConfigChange, "Device config updated via MQTT", 0);
-      if (requestId.length() > 0) _addProcessed(requestId);
+      if (requestId.length() > 0) _addProcessed(requestId, commandHash);
       publishStatus();
       _publishGenericAck(requestId, true, "Device config updated");
     } else {
@@ -964,12 +1011,18 @@ void MqttClient::_handleOta(const String& json) {
     return;
   }
 
-  // Warn if Ed25519 public key not configured
+  // R10A-2 (audit round 10): Ed25519 public key is MANDATORY.
+  // No bypass for empty key — refuse to proceed with OTA if not configured.
   if (strlen(Core::OTA_ED25519_PUBLIC_KEY_HEX) == 0) {
-    Serial.println("[OTA] WARNING: OTA_ED25519_PUBLIC_KEY_HEX is empty — signature verification SKIPPED (NOT for production!)");
+    Serial.println("[OTA] FATAL: OTA_ED25519_PUBLIC_KEY_HEX not configured — refusing OTA");
     Services::Log.append(Core::LogType::Error,
-      "OTA: signature verification SKIPPED (no pubkey configured)", 0);
-  } else if (strlen(signatureHex) != Core::ED25519_SIGNATURE_LEN * 2) {
+      "OTA: FATAL — Ed25519 public key not configured. OTA disabled until configured.", 0);
+    if (requestId.length() > 0) {
+      _publishAck(requestId, false, "OTA disabled — Ed25519 public key not configured");
+    }
+    return;
+  }
+  if (strlen(signatureHex) != Core::ED25519_SIGNATURE_LEN * 2) {
     Services::Log.append(Core::LogType::Error, "OTA: invalid signature length", 0);
     if (requestId.length() > 0) _publishAck(requestId, false, "OTA: invalid signature (must be 128 hex chars)");
     return;
@@ -995,7 +1048,7 @@ void MqttClient::_handleOta(const String& json) {
 
   if (success) {
     if (requestId.length() > 0) {
-      _addProcessed(requestId);
+      _addProcessed(requestId, commandHash);
       _publishGenericAck(requestId, true, "OTA success — rebooting");
     }
     String doneJson = "{\"otaStatus\":\"done\",\"progress\":100,\"newVersion\":\"" + String(version) + "\"}";
@@ -1024,26 +1077,27 @@ bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
   http.setTimeout(30000);  // 30s for large binary
   http.setConnectTimeout(10000);
 
-  // P0 #9: Use WiFiClientSecure for HTTPS with CA cert validation
+  // P0 #9 / R10A-5: Use WiFiClientSecure for HTTPS with CA cert validation.
+  // R10A-5: hard-fail if CA not configured (no setInsecure() fallback in production).
   bool useSecure = (strncmp(url.c_str(), "https://", 8) == 0);
   if (useSecure) {
-    if (strlen(Core::OTA_HTTPS_ROOT_CA) > 0) {
-      _otaClientSecure.setCACert(Core::OTA_HTTPS_ROOT_CA);
-      Serial.println("[OTA] HTTPS: using configured root CA");
-    } else {
-      _otaClientSecure.setInsecure();
-      Serial.println("[OTA] WARNING: HTTPS but OTA_HTTPS_ROOT_CA is empty — setInsecure() (NOT for production!)");
+    if (strlen(Core::OTA_HTTPS_ROOT_CA) == 0) {
+      Services::Log.append(Core::LogType::Error,
+        "OTA: FATAL — OTA_HTTPS_ROOT_CA not configured. Refusing HTTPS download with setInsecure().", 0);
+      Serial.println("[OTA] FATAL: OTA_HTTPS_ROOT_CA not configured — refusing HTTPS download");
+      return false;
     }
+    _otaClientSecure.setCACert(Core::OTA_HTTPS_ROOT_CA);
+    Serial.println("[OTA] HTTPS: using configured root CA");
     if (!http.begin(_otaClientSecure, url)) {
       Services::Log.append(Core::LogType::Error, "OTA: HTTPS begin failed", 0);
       return false;
     }
   } else {
-    // Plain HTTP — only allowed for local testing (should have been rejected above)
-    if (!http.begin(_wifiClient, url)) {
-      Services::Log.append(Core::LogType::Error, "OTA: HTTP begin failed", 0);
-      return false;
-    }
+    // Plain HTTP — rejected earlier in _handleOta, but defensive check here too
+    Services::Log.append(Core::LogType::Error,
+      "OTA: FATAL — URL must be HTTPS (plain HTTP not allowed)", 0);
+    return false;
   }
 
   int httpCode = http.GET();
@@ -1127,37 +1181,48 @@ bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
   }
   Serial.println("[OTA] SHA-256 verified OK");
 
-  // Verify Ed25519 signature (if public key configured)
-  if (strlen(Core::OTA_ED25519_PUBLIC_KEY_HEX) > 0) {
-    // Read back the written firmware for signature verification
-    // Note: Update library writes to flash; we verify against the hash
-    // (Ed25519 signs the firmware binary; we verify using the downloaded buffer)
-    // For memory efficiency, we verify hash vs signature (pre-hash mode)
-    // This is a simplified verification — full binary verification would require
-    // buffering the entire firmware in RAM (not feasible on ESP32 with 2MB binary)
-    //
-    // Production approach: sign the SHA-256 hash, verify hash+signature
-    // (This is a design decision — document in README)
-
-    // For now: if signature field is present and pubkey is configured,
-    // we verify the signature over the SHA-256 hash
-    if (strlen(signatureHex) == Core::ED25519_SIGNATURE_LEN * 2) {
-      // TODO: implement Ed25519 verify using mbedtls/pk.h or micro-ed25519
-      // For audit round 9: we've implemented the protocol structure but
-      // the actual crypto verification is a stub that logs a warning.
-      //
-      // PRODUCTION: must implement actual Ed25519 verify here.
-      Serial.println("[OTA] WARNING: Ed25519 verify not yet implemented — signature check SKIPPED");
-      Serial.println("[OTA] Implement using: mbedtls_pk_parse_public_key + mbedtls_pk_verify");
-      Services::Log.append(Core::LogType::Error,
-        "OTA: Ed25519 verify not implemented (audit round 9 — signature check SKIPPED)", 0);
-    }
+  // Verify Ed25519 signature (R10A-2 — audit round 10: REAL implementation, fail-closed)
+  //
+  // Production mode: if OTA_ED25519_PUBLIC_KEY_HEX is configured, signature
+  // verification is MANDATORY. Invalid signature → Update.abort() → return false.
+  // NO BYPASS. NO "warning + continue".
+  //
+  // If OTA_ED25519_PUBLIC_KEY_HEX is EMPTY: hard-fail (refuse to install).
+  // This prevents silent downgrade to unsigned OTA in production.
+  if (strlen(Core::OTA_ED25519_PUBLIC_KEY_HEX) == 0) {
+    Services::Log.append(Core::LogType::Error,
+      "OTA: FATAL — OTA_ED25519_PUBLIC_KEY_HEX not configured. Refusing to install unsigned firmware.", 0);
+    Serial.println("[OTA] FATAL: Ed25519 public key not configured — refusing to install unsigned firmware");
+    Update.abort();
+    return false;
   }
 
-  // Finalize update
+  if (strlen(signatureHex) != Core::ED25519_SIGNATURE_LEN * 2) {
+    Services::Log.append(Core::LogType::Error,
+      "OTA: Invalid signature length (expected 128 hex chars, got " + String(strlen(signatureHex)) + ")", 0);
+    Update.abort();
+    return false;
+  }
+
+  Serial.println("[OTA] Verifying Ed25519 signature...");
+  bool sigValid = Utils::ed25519VerifyHash(
+    Core::OTA_ED25519_PUBLIC_KEY_HEX,
+    signatureHex,
+    computedHash, 32
+  );
+
+  if (!sigValid) {
+    Services::Log.append(Core::LogType::Error,
+      "OTA: Ed25519 signature verification FAILED — aborting install", 0);
+    Serial.println("[OTA] Ed25519 signature INVALID — aborting Update");
+    Update.abort();
+    return false;
+  }
+
+  // Signature verified OK — safe to finalize
   if (Update.end(true) && Update.isFinished()) {
     Services::Log.append(Core::LogType::Ota,
-      "OTA success: " + String(written) + " bytes, v" + version, 0);
+      "OTA success: " + String(written) + " bytes, v" + version + " (SHA-256 + Ed25519 verified)", 0);
     return true;
   } else {
     Services::Log.append(Core::LogType::Error,
@@ -1166,22 +1231,19 @@ bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
   }
 }
 
-bool MqttClient::_verifyOtaSignature(const uint8_t* firmware, size_t firmwareLen,
-                                     const char* signatureHex) {
-  // Stub for Ed25519 verification — to be implemented with mbedtls/pk.h
-  // For audit round 9: protocol structure is in place, crypto TBD
-  (void)firmware;
-  (void)firmwareLen;
-  (void)signatureHex;
-  return false;  // fail-closed until implemented
-}
-
 // ---------------------------------------------------------------------------
 // Request deduplication — prevent double-execution of retried commands
-// Uses a ring buffer of last 16 requestIds
+// Uses a ring buffer of last 16 requestIds + commandHashes.
+//
+// R10A-3 (audit round 10): Dedup now binds requestId to command fingerprint.
+// - Same requestId + same commandHash → re-ACK original result (true duplicate)
+// - Same requestId + DIFFERENT commandHash → reject "requestId reuse"
+// This prevents attacker from reusing a requestId with a different command
+// to get a false ACK.
 // ---------------------------------------------------------------------------
 #define DEDUP_BUFFER_SIZE 16
 static String _processedIds[DEDUP_BUFFER_SIZE];
+static String _processedHashes[DEDUP_BUFFER_SIZE];  // R10A-3: command hash per requestId
 static uint8_t _dedupIdx = 0;
 
 bool MqttClient::_isDuplicate(const String& requestId) {
@@ -1191,9 +1253,59 @@ bool MqttClient::_isDuplicate(const String& requestId) {
   return false;
 }
 
-void MqttClient::_addProcessed(const String& requestId) {
+// R10A-3: Find the commandHash associated with a previously-seen requestId.
+// Returns empty string if requestId not found (shouldn't happen if _isDuplicate
+// was called first).
+String _getHashForRequestId(const String& requestId) {
+  for (uint8_t i = 0; i < DEDUP_BUFFER_SIZE; i++) {
+    if (_processedIds[i] == requestId) return _processedHashes[i];
+  }
+  return "";
+}
+
+void MqttClient::_addProcessed(const String& requestId, const String& commandHash) {
   _processedIds[_dedupIdx] = requestId;
+  _processedHashes[_dedupIdx] = commandHash;
   _dedupIdx = (_dedupIdx + 1) % DEDUP_BUFFER_SIZE;
+}
+
+// R10A-3: Compute a deterministic command fingerprint (SHA-256 of type+action+params).
+// Used to bind requestId to its command, preventing requestId reuse with different commands.
+// Static helper (not a member) — used only within _handleCommand.
+static String _computeCommandHash(const DynamicJsonDocument& doc) {
+  // Build canonical string: type|action|sorted(params)
+  String canonical = "";
+  canonical += String(doc["type"] | "");
+  canonical += "|";
+  canonical += String(doc["action"] | "");
+
+  // Add relevant parameters (channelId, id, mode, etc.) in a deterministic order
+  JsonObject obj = doc.as<JsonObject>();
+  // Collect parameter keys (excluding type, action, requestId)
+  std::vector<String> keys;
+  for (JsonPair kv : obj) {
+    String key = kv.key().c_str();
+    if (key != "type" && key != "action" && key != "requestId") {
+      keys.push_back(key);
+    }
+  }
+  // Sort keys for deterministic ordering
+  std::sort(keys.begin(), keys.end());
+  for (const String& key : keys) {
+    canonical += "|";
+    canonical += key;
+    canonical += "=";
+    JsonVariant val = obj[key];
+    if (val.is<const char*>()) {
+      canonical += val.as<const char*>();
+    } else if (val.is<int>()) {
+      canonical += String(val.as<int>());
+    } else if (val.is<bool>()) {
+      canonical += val.as<bool>() ? "true" : "false";
+    }
+  }
+
+  return Utils::sha256Hex(canonical);
 }
 
 } // namespace Services

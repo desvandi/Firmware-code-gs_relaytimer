@@ -92,11 +92,9 @@ private:
 
   void _buildTopics();
   bool _isDuplicate(const String& requestId);
-  void _addProcessed(const String& requestId);
+  void _addProcessed(const String& requestId, const String& commandHash = "");
 
-  // OTA helpers (audit round 9: Ed25519 signature verification)
-  bool _verifyOtaSignature(const uint8_t* firmware, size_t firmwareLen,
-                           const char* signatureHex);
+  // OTA helpers (R10A-2: Ed25519 signature verification via Utils::ed25519VerifyHash)
   bool _downloadAndVerifyOta(const String& url, size_t expectedSize,
                              const char* expectedSha256,
                              const char* expectedSignatureHex,

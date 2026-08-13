@@ -282,4 +282,78 @@ String generateToken(size_t hexChars) {
   return s;
 }
 
+// R10A-2 (audit round 10): Ed25519 signature verification for OTA firmware.
+// Uses mbedtls's Ed25519 implementation (bundled with ESP32 Arduino core).
+//
+// Construction: signs the 32-byte SHA-256 hash of the firmware binary
+// (NOT the full binary — ESP32 doesn't have enough RAM to buffer 2MB).
+// The PWA signing tool must use the same convention: sign SHA-256(firmware).
+//
+// This is "pure Ed25519 over a hash" — not standard Ed25519ph (which uses
+// a different domain separator), but cryptographically sound as long as
+// both sides agree. The signature proves: "holder of private key signs
+// this 32-byte hash", and SHA-256 is collision-resistant.
+bool ed25519VerifyHash(const char* publicKeyHex,
+                       const char* signatureHex,
+                       const uint8_t* hashBytes, size_t hashLen) {
+#if defined(MBEDTLS_ED25519_C)
+  // Parse public key (32 bytes from 64 hex chars)
+  if (strlen(publicKeyHex) != 64) {
+    Serial.println("[Ed25519] Invalid public key length (must be 64 hex chars)");
+    return false;
+  }
+  uint8_t publicKey[32];
+  if (!hexToBytes(publicKeyHex, publicKey, 32)) {
+    Serial.println("[Ed25519] Failed to parse public key hex");
+    return false;
+  }
+
+  // Parse signature (64 bytes from 128 hex chars)
+  if (strlen(signatureHex) != 128) {
+    Serial.println("[Ed25519] Invalid signature length (must be 128 hex chars)");
+    return false;
+  }
+  uint8_t signature[64];
+  if (!hexToBytes(signatureHex, signature, 64)) {
+    Serial.println("[Ed25519] Failed to parse signature hex");
+    return false;
+  }
+
+  if (hashLen != 32) {
+    Serial.println("[Ed25519] Hash must be 32 bytes (SHA-256)");
+    return false;
+  }
+
+  // Use mbedtls's Ed25519 verify (pure mode — signs the message directly)
+  // We pass the 32-byte SHA-256 hash as the "message".
+  // mbedtls_ed25519_verify returns 0 on success, non-zero on failure.
+  extern "C" {
+    #include <mbedtls/ed25519.h>
+  }
+
+  int ret = mbedtls_ed25519_verify(
+    signature, 64,           // signature + length
+    hashBytes, hashLen,      // message + length (here: the SHA-256 hash)
+    publicKey, 32            // public key + length
+  );
+
+  // Clear sensitive data
+  memset(publicKey, 0, sizeof(publicKey));
+
+  if (ret != 0) {
+    Serial.printf("[Ed25519] Verification FAILED (mbedtls error: -0x%04X)\n", -ret);
+    return false;
+  }
+
+  Serial.println("[Ed25519] Signature verified OK");
+  return true;
+#else
+  Serial.println("[Ed25519] FATAL: MBEDTLS_ED25519_C not compiled in!");
+  Serial.println("[Ed25519] Enable in ESP32 Arduino core mbedtls config:");
+  Serial.println("[Ed25519]   #define MBEDTLS_ED25519_C");
+  Serial.println("[Ed25519]   #define MBEDTLS_SHA512_C  (Ed25519 uses SHA-512 internally)");
+  return false;  // fail-closed
+#endif
+}
+
 } // namespace Utils
