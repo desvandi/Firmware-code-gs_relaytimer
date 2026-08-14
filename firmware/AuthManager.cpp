@@ -297,8 +297,15 @@ bool AuthManager::refreshTokens(const String& refreshToken,
   outRefreshToken = _generateRefreshToken();
   _storeRefreshToken(outRefreshToken);
 
+  // audit-fixes-v2 (auditor #5 P1-5): regenerate CSRF token on refresh.
+  //   Previously `outCsrf = getCsrfToken()` returned the EXISTING token without
+  //   checking expiry. If the CSRF token had expired (15min TTL = same as access
+  //   token), getCsrfToken() returned an empty string. The PWA received empty
+  //   CSRF, the next mutation failed with 403. Now: always generate a fresh
+  //   CSRF token on successful refresh, matching the 15min access token TTL.
+  generateCsrfToken();
   outCsrf = getCsrfToken();
-  Services::Log.append(Core::LogType::Login, "Tokens refreshed (rotated)", 0);
+  Services::Log.append(Core::LogType::Login, "Tokens refreshed (rotated + CSRF regenerated)", 0);
   return true;
 }
 

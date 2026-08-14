@@ -6,6 +6,7 @@
 #include "StatusHandlers.h"
 #include "RelayHandlers.h"
 #include "ScheduleHandlers.h"
+#include "ChannelHandlers.h"  // audit-fixes-v2 (P1-1): /api/channel endpoint
 #include "PirHandlers.h"
 #include "TimeHandlers.h"
 #include "LogHandlers.h"
@@ -143,6 +144,11 @@ void HttpServer::_registerRoutes() {
 
   // Relay
   http.on("/api/relay", HTTP_POST, Web::Handlers::handleRelay);
+
+  // Channel rename (audit-fixes-v2 P1-1: was missing — PWA called /api/channel
+  //   in LAN REST mode but firmware returned 404. MQTT mode worked via
+  //   type="channel" command.)
+  http.on("/api/channel", HTTP_POST, Web::Handlers::handleChannelRename);
 
   // Schedule
   http.on("/api/schedule", HTTP_POST, Web::Handlers::handleScheduleUpsert);
