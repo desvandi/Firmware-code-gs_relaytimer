@@ -858,16 +858,16 @@ void MqttClient::_handleCommand(const String& json) {
   // Step 3: Compute command fingerprint (AFTER validation passes).
   String commandHash = _computeCommandHash(doc);
 
-  // Step 4: R10G-1 — Transaction Journal lookup (NVS-persisted, survives reboot).
-  // CYCLE-7: isProcessed() now returns true for BOTH PENDING (intent stored, not
-  //   yet executed/committed) and COMMITTED (fully executed + ACK stored) entries.
-  //
-  // Duplicate handling:
-  //   - Hash mismatch → security rejection (requestId reuse with different command).
-  //   - Hash match + COMMITTED → replay stored ACK (true duplicate, already done).
-  //   - Hash match + PENDING → command was in-flight when crash happened. Return
-  //     "in-progress" ACK so PWA knows to wait. Do NOT re-execute (intent-first
-  //     pattern: PENDING blocks re-execution; physical state may already be changed).
+  // ===========================================================================
+  // CYCLE-8A (AUDIT-7-001): Transaction Recovery State Machine
+  // ===========================================================================
+  //   Duplicate handling now reconciles with actual GPIO state:
+  //     - Hash mismatch → security rejection (requestId reuse with different command).
+  //     - COMMITTED → replay stored ACK (true duplicate, durable success).
+  //     - COMMITTED_UNKNOWN → replay ACK with disclaimer (GPIO matches, but no durable proof).
+  //     - FAILED → clear entry, allow retry (execute didn't happen or failed).
+  //     - PENDING/EXECUTING → reconcile first (read GPIO, compare to desiredState).
+  // ===========================================================================
   if (Services::journal.isProcessed(requestId)) {
     String previousHash = Services::journal.getCommandHash(requestId);
     if (previousHash.length() > 0 && previousHash != commandHash) {
@@ -878,40 +878,123 @@ void MqttClient::_handleCommand(const String& json) {
       return;
     }
 
-    if (Services::journal.isCommitted(requestId)) {
+    Services::TransactionState state = Services::journal.getTransactionState(requestId);
+
+    if (state == Services::TransactionState::COMMITTED) {
       // True duplicate — replay ORIGINAL ACK via journal.
       Serial.printf("[MQTT] Duplicate (COMMITTED): %s — replaying original ACK\n", requestId.c_str());
       String originalAckJson = Services::journal.getAckJson(requestId);
       if (originalAckJson.length() > 0) {
         Services::journal.queueAck(requestId, originalAckJson);
-        Serial.printf("[MQTT ACK] %s: queued original ACK for delivery (%d bytes)\n",
-                      requestId.c_str(), originalAckJson.length());
       } else {
         _publishAck(requestId, true, "Duplicate command (already executed)");
       }
-    } else {
-      // PENDING — command was in-flight during crash. Don't re-execute.
-      Serial.printf("[MQTT] Duplicate (PENDING): %s — command was in-flight, returning in-progress ACK\n",
+      return;
+    }
+
+    if (state == Services::TransactionState::COMMITTED_UNKNOWN) {
+      // Reconciled at boot — GPIO matches desired, but no durable proof.
+      Serial.printf("[MQTT] Duplicate (COMMITTED_UNKNOWN): %s — replaying ACK with disclaimer\n",
+                    requestId.c_str());
+      String originalAckJson = Services::journal.getAckJson(requestId);
+      if (originalAckJson.length() > 0) {
+        Services::journal.queueAck(requestId, originalAckJson);
+      } else {
+        _publishAck(requestId, true,
+          "Command may have executed (reconciled from PENDING after crash — GPIO matches desired state, physical contact state unknown)");
+      }
+      return;
+    }
+
+    if (state == Services::TransactionState::FAILED) {
+      // Reconciled at boot — GPIO doesn't match desired. Execute didn't happen.
+      // Clear the FAILED entry and allow retry with same requestId.
+      Serial.printf("[MQTT] Duplicate (FAILED): %s — execute didn't happen, allowing retry\n",
                     requestId.c_str());
       Services::Log.append(Core::LogType::Error,
-        "PENDING transaction re-encountered (crash during execute): " + requestId, 0);
-      _publishAck(requestId, true, "Command already received (in-progress). Wait and retry if needed.");
+        "FAILED transaction retried (GPIO didn't match desired at boot): " + requestId, 0);
+      Services::journal.clearEntry(requestId);
+      // Fall through to normal execution below.
+    } else {
+      // PENDING or EXECUTING — command was in-flight during crash.
+      // CYCLE-8A: Reconcile NOW (not just at boot) in case state changed since boot.
+      Serial.printf("[MQTT] Duplicate (%s): %s — reconciling with current GPIO state\n",
+                    state == Services::TransactionState::EXECUTING ? "EXECUTING" : "PENDING",
+                    requestId.c_str());
+      Services::TransactionState reconciled = Services::journal.reconcileEntry(requestId);
+
+      if (reconciled == Services::TransactionState::COMMITTED_UNKNOWN) {
+        String originalAckJson = Services::journal.getAckJson(requestId);
+        if (originalAckJson.length() > 0) {
+          Services::journal.queueAck(requestId, originalAckJson);
+        } else {
+          _publishAck(requestId, true,
+            "Command may have executed (reconciled — GPIO matches desired, physical state unknown)");
+        }
+        return;
+      }
+      if (reconciled == Services::TransactionState::FAILED) {
+        // GPIO doesn't match — execute didn't happen. Allow retry.
+        Serial.printf("[MQTT] Reconciled as FAILED: %s — allowing retry\n", requestId.c_str());
+        Services::journal.clearEntry(requestId);
+        // Fall through to normal execution below.
+      } else {
+        // Still PENDING/EXECUTING after reconcile (shouldn't happen for relay commands).
+        // Return in-progress ACK to be safe.
+        _publishAck(requestId, true,
+          "Command already received (in-progress). Wait and retry if needed.");
+        return;
+      }
     }
-    return;
   }
 
-  // CYCLE-7 (fixes F-001): Store durable INTENT record BEFORE execute.
-  // If storeIntent fails (NVS write error, journal full), do NOT execute.
-  // This closes the execute→store gap: PWA retry will see PENDING entry and
-  // know not to re-execute (returns in-progress ACK on duplicate).
-  if (!Services::journal.storeIntent(requestId, commandHash)) {
-    Serial.printf("[MQTT] FATAL: storeIntent failed for rid=%s — refusing to execute (durability not guaranteed)\n",
-                  requestId.c_str());
-    Services::Log.append(Core::LogType::Error,
-      "storeIntent FAILED — command rejected (durability not guaranteed): " + requestId, 0);
-    _publishAck(requestId, false,
-      "DURABILITY_FAILURE: cannot store transaction intent — please retry");
-    return;
+  // CYCLE-8A: Store durable INTENT record with expanded metadata.
+  // For relay commands, record channelId + desiredState + previousKnownState.
+  // For non-relay commands, channelId=0 (N/A).
+  // This allows boot reconciliation to compare GPIO state with desiredState.
+  {
+    uint8_t intentChannelId = 0;
+    bool intentDesiredState = false;
+    bool intentPreviousKnown = false;
+
+    if (strcmp(type, "relay") == 0) {
+      int ch = doc["channelId"] | 0;
+      if (ch >= 1 && ch <= Core::NUM_CHANNELS) {
+        intentChannelId = (uint8_t)ch;
+        uint8_t idx = ch - 1;
+        intentPreviousKnown = Core::relayState[idx];
+        // desiredState depends on action:
+        //   "on"  → true
+        //   "off" → false
+        //   "set_mode" with manualState → manualState value
+        const char* actionStr = doc["action"] | "";
+        if (strcmp(actionStr, "on") == 0) {
+          intentDesiredState = true;
+        } else if (strcmp(actionStr, "off") == 0) {
+          intentDesiredState = false;
+        } else if (strcmp(actionStr, "set_mode") == 0) {
+          const char* mode = doc["mode"] | "";
+          if (strcmp(mode, "manual") == 0) {
+            intentDesiredState = doc["manualState"] | false;
+          } else {
+            // set_mode auto — doesn't directly change relay state, use current
+            intentDesiredState = Core::relayState[idx];
+          }
+        }
+      }
+    }
+
+    if (!Services::journal.storeIntent(requestId, commandHash,
+                                        intentChannelId, intentDesiredState,
+                                        intentPreviousKnown)) {
+      Serial.printf("[MQTT] FATAL: storeIntent failed for rid=%s — refusing to execute\n",
+                    requestId.c_str());
+      Services::Log.append(Core::LogType::Error,
+        "storeIntent FAILED — command rejected: " + requestId, 0);
+      _publishAck(requestId, false,
+        "DURABILITY_FAILURE: cannot store transaction intent — please retry");
+      return;
+    }
   }
 
 
@@ -922,7 +1005,9 @@ void MqttClient::_handleCommand(const String& json) {
     int channelId = doc["channelId"] | 0;
     if (channelId < 1 || channelId > Core::NUM_CHANNELS) {
       if (requestId.length() > 0) _publishAck(requestId, false, "Invalid channelId");
-      return;  // P0 #1: no _addProcessed — retry can succeed
+      // CYCLE-8A: clear the intent we just stored (command invalid, allow retry)
+      Services::journal.clearEntry(requestId);
+      return;
     }
     uint8_t idx = channelId - 1;
 
@@ -934,7 +1019,18 @@ void MqttClient::_handleCommand(const String& json) {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, "Invalid relay action (use on/off/set_mode)");
       }
-      return;  // no _addProcessed
+      Services::journal.clearEntry(requestId);
+      return;
+    }
+
+    // CYCLE-8A: Mark EXECUTING right before the GPIO write.
+    // This narrows the crash window: if crash happens between storeIntent and
+    // markExecuting, we know execute was NEVER called.
+    if (!Services::journal.markExecuting(requestId)) {
+      Serial.printf("[MQTT] markExecuting failed for rid=%s — aborting\n", requestId.c_str());
+      _publishAck(requestId, false, "Internal error: cannot mark transaction as executing");
+      Services::journal.clearEntry(requestId);
+      return;
     }
 
     // SET_STATE only — no TOGGLE for idempotency
@@ -954,15 +1050,29 @@ void MqttClient::_handleCommand(const String& json) {
         if (requestId.length() > 0) {
           _publishAck(requestId, false, "Invalid mode (use auto/manual)");
         }
-        return;  // no _addProcessed
+        Services::journal.clearEntry(requestId);
+        return;
       }
     }
 
-    // Execution succeeded → add to dedup buffer (P0 #1 fix)
+    // CYCLE-8A: After execute, verify GPIO matches desired (honest reporting).
+    // If GPIO doesn't match, the relay.execute() may have failed silently.
+    bool actualGpio = Drivers::relay.readLogicalState(idx);
+    bool desired = Core::relayState[idx];  // what we THINK the relay should be
+    const char* ackMessage;
+    if (actualGpio == desired) {
+      ackMessage = "Relay command executed";
+    } else {
+      // GPIO mismatch after execute — relay driver may have failed.
+      // Still commit (state is set in RAM) but report the discrepancy.
+      ackMessage = "Relay command sent (WARNING: GPIO readback mismatch — physical state may differ)";
+      Services::Log.append(Core::LogType::Error,
+        "GPIO readback mismatch after relay execute: ch=" + String(channelId) +
+        " expected=" + (desired ? "ON" : "OFF") + " actual=" + (actualGpio ? "ON" : "OFF"), channelId);
+    }
 
-    publishStatus();  // immediate status update after command
-    // P0 #2 + P1 #11: Send ACK with actual relay state
-    _publishRelayAck(requestId, true, "Relay command executed", channelId, commandHash);
+    publishStatus();
+    _publishRelayAck(requestId, true, ackMessage, channelId, commandHash);
   }
 
   // ===========================================================================

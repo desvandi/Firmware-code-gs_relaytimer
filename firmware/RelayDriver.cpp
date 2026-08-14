@@ -32,6 +32,24 @@ bool RelayDriver::getState(uint8_t idx) const {
   return _state[idx];
 }
 
+// CYCLE-8A (AUDIT-7-001): Read actual GPIO pin register (not in-RAM cache).
+//   After crash + reboot, _state[] is reset to false. We need to read the actual
+//   GPIO output level to reconcile with journal PENDING entries.
+//
+//   For active-LOW relay modules:
+//     GPIO = LOW  → relay ON  → logical state = true
+//     GPIO = HIGH → relay OFF → logical state = false
+//
+//   Note: digitalRead() on an OUTPUT pin returns the last written value from
+//   the GPIO output register. This tells us what the ESP32 commanded, NOT what
+//   the physical relay contact actually did (welded/stuck relays are undetectable).
+bool RelayDriver::readLogicalState(uint8_t idx) const {
+  if (idx >= Core::NUM_CHANNELS) return false;
+  int raw = digitalRead(Core::RELAY_PINS[idx]);
+  // RELAY_ON = LOW (active-LOW module). If raw == RELAY_ON, relay is commanded ON.
+  return (raw == Core::RELAY_ON);
+}
+
 void RelayDriver::allOff() {
   for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
     setChannel(i, false);

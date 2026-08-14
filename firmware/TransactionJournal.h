@@ -1,54 +1,76 @@
 // =============================================================================
 // Services/TransactionJournal.h — Durable transaction journal for MQTT commands
 // =============================================================================
-// R10G/R10H/R10I/R10J/R10K (audit rounds 10G-10K): NVS-persisted transaction journal.
+// CYCLE-8A (AUDIT-7-001): Transaction Recovery State Machine
 //
-// CYCLE-7 (auditor #7): INTENT-FIRST JOURNALING (fixes F-001 + F-002 P0).
+// PROBLEM (auditor AUDIT-7-001):
+//   Cycle 7's intent-first journaling closed the execute→store gap BUT did not
+//   achieve true atomicity between NVS commit and physical GPIO state.
 //
-// PROBLEM (auditor finding F-001/F-002):
-//   Previous flow: validate → execute → store transaction → publish ACK.
-//   Crash window between execute and store → journal miss on retry → re-execute.
-//   Also: storeTransaction() return value was ignored by ACK publishers.
+//   Three crash scenarios that Cycle 7 did NOT handle:
+//     A) PENDING stored, relay NEVER executed (crash between storeIntent and execute)
+//        → After boot: PENDING, GPIO = OFF (unchanged)
+//        → PWA retries → isProcessed()=true → DUPLICATE rejected → COMMAND LOST
+//     B) PENDING stored, relay EXECUTED, crash before commit
+//        → After boot: PENDING, GPIO = ON (changed)
+//        → No durable proof physical action happened
+//     C) relay executed, commitTransaction FAILED
+//        → DURABILITY_FAILURE reported to PWA
+//        → PWA retries → PENDING blocks as DUPLICATE
+//        → State ambiguity: client thinks "failed", hardware is "succeeded"
 //
-// NEW ARCHITECTURE (intent-first):
-//   validate → storeIntent(requestId, commandHash) → execute → commitTransaction(requestId, ackJson) → publish ACK.
+// CYCLE-8A SOLUTION: Recoverable state machine + boot reconciliation
 //
-//   storeIntent() writes a durable PENDING entry (commit=0) BEFORE execute.
-//   isProcessed() returns true for BOTH PENDING and COMMITTED entries.
-//   commitTransaction() flips commit=0 → commit=1 (durable ACK record).
+//   Transaction states:
+//     NEW          — command received, not yet persisted (transient, not in journal)
+//     PENDING      — intent stored to NVS, execute NOT yet called
+//     EXECUTING    — execute called, commit NOT yet done (GPIO may or may not have changed)
+//     COMMITTED    — execute + commit succeeded (durable success)
+//     COMMITTED_UNKNOWN — reconcile found GPIO matches desired (likely succeeded, unprovable)
+//     FAILED       — reconcile found GPIO doesn't match desired (execute didn't happen or failed)
 //
-//   Crash scenarios (all safe for idempotent commands):
-//     - Crash before storeIntent: no entry → PWA retry → re-execute (idempotent, safe).
-//     - Crash after storeIntent, before execute: PENDING entry → PWA retry →
-//         isProcessed()=true, hash matches → return "in-progress" ACK.
-//         No re-execution. Entry will be garbage-collected on LRU eviction.
-//     - Crash after execute, before commitTransaction: PENDING entry →
-//         same as above. Physical state already changed (idempotent). Safe.
-//     - Crash after commitTransaction, before publish: COMMITTED entry →
-//         PWA retry → isProcessed()=true → replay stored ACK.
-//     - Crash after publish: PWA received ACK, journal has COMMITTED entry. Done.
+//   Boot reconciliation (new):
+//     On boot, scan all PENDING and EXECUTING entries.
+//     For each relay command (channelId > 0):
+//       - Read actual GPIO output state via RelayDriver::readLogicalState()
+//       - If GPIO == desiredState → mark COMMITTED_UNKNOWN (likely succeeded)
+//       - If GPIO != desiredState → mark FAILED (execute didn't happen)
+//     For non-relay commands (channelId == 0): leave as-is, log warning.
 //
-//   ACK publishers MUST check commitTransaction() return value. If commit fails:
-//   - Do NOT publish success ACK (would falsely claim durable success).
-//   - Publish failure ACK with DURABILITY_FAILURE message.
-//   - PWA can retry; idempotent commands will re-execute safely.
+//   On retry (during normal operation):
+//     - COMMITTED or COMMITTED_UNKNOWN → replay stored ACK (true duplicate)
+//     - FAILED → clear entry, allow retry with same requestId
+//     - PENDING or EXECUTING → reconcile first, then decide
 //
-// DURABILITY BOUNDARY (honest documentation, fixes F-004):
-//   "exactly-once within retention window" (64 entries, LRU eviction).
-//   NOT "permanent, never re-execute". After eviction, requestId can be re-used.
-//   For long-term protection: use unique requestId per command (PWA already does).
+//   ACK messages (honest):
+//     - "Command executed" (COMMITTED — execute + commit both succeeded)
+//     - "Command may have executed (reconciled from PENDING, GPIO matches)" (COMMITTED_UNKNOWN)
+//     - "Command did not execute (reconciled from PENDING, GPIO doesn't match)" (FAILED)
+//     - "Durability failure — retry recommended" (commitTransaction returned false)
 //
-// STORAGE LAYOUT (R10J/R10K, unchanged):
+//   PHYSICAL STATE UNCERTAINTY (documented limitation, addressed in Cycle 8B):
+//     - GPIO output state ≠ physical relay contact state.
+//     - A welded relay could have GPIO=ON but contact=OFF (or vice versa).
+//     - Without contact feedback hardware, we CANNOT verify physical state.
+//     - readLogicalState() tells us what we COMMANDED, not what the relay DID.
+//     - For 220V safety: ACK messages include "physicalState: unknown" disclaimer.
+//
+// STORAGE LAYOUT (version 2 — incompatible with version 1, cleared on upgrade):
 //   tj_entry_N: blob [magic(2) + ver(1) + reserved(1) + CRC32(4) + payload]
-//   tj_commit_N: single byte (0=PENDING, 1=COMMITTED)
+//   tj_commit_N: single byte (0=uncommitted, 1=committed)
+//   tj_state_N: single byte (transactionState enum) — CYCLE-8A NEW
 //   tj_count:   journal size (metadata only)
 //   tj_widx:    next write slot index
 //
-//   Two-phase commit (per slot):
-//     Phase 0: clear commit (write 0) — invalidates old entry
-//     Phase 1: write blob (commit still 0) — durable data
-//     Phase 1b: persist writeIdx — cursor advance
-//     Phase 2: set commit=1 — atomic commit point (single byte write)
+//   Blob payload (version 2):
+//     [requestId: 1+64]
+//     [commandHash: 1+64]
+//     [channelId: 1]              ← CYCLE-8A NEW (0 = N/A for non-relay commands)
+//     [desiredState: 1]           ← CYCLE-8A NEW (0=OFF, 1=ON, 255=N/A)
+//     [previousKnownState: 1]     ← CYCLE-8A NEW (what we thought relay was before)
+//     [attempt: 1]                 ← CYCLE-8A NEW (retry counter, 0-indexed)
+//     [timestamp: 4]                ← CYCLE-8A NEW (unix seconds, uint32)
+//     [ackJson: 2+1024]
 // =============================================================================
 #pragma once
 #ifndef TIMER12_SERVICES_TRANSACTION_JOURNAL_H
@@ -59,45 +81,88 @@
 
 namespace Services {
 
+// CYCLE-8A: Transaction state machine.
+//   Stored in NVS key tj_state_N (1 byte per slot).
+enum class TransactionState : uint8_t {
+  PENDING            = 0,  // Intent stored, execute NOT yet called
+  EXECUTING          = 1,  // Execute called, commit NOT yet done
+  COMMITTED          = 2,  // Execute + commit succeeded
+  COMMITTED_UNKNOWN  = 3,  // Reconciled: GPIO matches desired (likely succeeded)
+  FAILED             = 4,  // Reconciled: GPIO doesn't match (execute didn't happen or failed)
+};
+
 class TransactionJournal {
 public:
   void begin();
 
   // =====================================================================
-  // CYCLE-7: Intent-first API (replaces blind storeTransaction for new code)
+  // CYCLE-8A: Intent-first API with expanded metadata
   // =====================================================================
 
-  // Store durable INTENT record BEFORE execute. Entry is PENDING (commit=0).
+  // Store durable INTENT record BEFORE execute. Entry is PENDING (commit=0, state=PENDING).
+  // channelId: 1-12 for relay commands, 0 for non-relay commands (schedule/config/etc.)
+  // desiredState: true=ON, false=OFF, only meaningful for relay commands (channelId > 0)
+  // previousKnownState: what we believe the relay state was BEFORE this command
   // Returns true if intent successfully persisted to NVS.
-  // Caller MUST check return value — if false, do NOT execute.
-  // On duplicate requestId (already PENDING or COMMITTED):
-  //   - Returns false (caller should treat as duplicate and let _handleCommand
-  //     handle via isProcessed() path).
-  bool storeIntent(const String& requestId, const String& commandHash);
+  bool storeIntent(const String& requestId, const String& commandHash,
+                   uint8_t channelId = 0, bool desiredState = false,
+                   bool previousKnownState = false);
 
-  // Commit a PENDING transaction after execute + ACK JSON ready.
-  // Flips commit=0 → commit=1 and stores ackJson.
+  // Mark a PENDING entry as EXECUTING (called right before relay.execute()).
+  // This is a separate NVS write to narrow the crash window — if crash happens
+  // between storeIntent and markExecuting, we know execute was NEVER called.
+  // Returns true if state transition succeeded.
+  bool markExecuting(const String& requestId);
+
+  // Commit a transaction after execute + ACK JSON ready.
+  // Flips commit=0 → commit=1, sets state=COMMITTED, stores ackJson.
   // Returns true if commit succeeded.
-  // If commit fails: caller MUST NOT publish success ACK.
   bool commitTransaction(const String& requestId, const String& ackJson);
 
   // =====================================================================
-  // Lookup helpers (check BOTH PENDING and COMMITTED entries)
+  // Lookup helpers
   // =====================================================================
 
-  // Returns true if requestId is in journal (PENDING or COMMITTED).
+  // Returns true if requestId is in journal (any state except FAILED).
+  // FAILED entries are NOT considered "processed" — they allow retry.
   bool isProcessed(const String& requestId);
 
-  // Returns true if requestId is COMMITTED (has ackJson ready to replay).
+  // Returns true if requestId is COMMITTED or COMMITTED_UNKNOWN.
   bool isCommitted(const String& requestId);
 
-  // Returns commandHash for requestId (PENDING or COMMITTED).
-  // Empty string if not found.
+  // Returns the transaction state for a requestId.
+  // Returns PENDING if not found (conservative default).
+  TransactionState getTransactionState(const String& requestId);
+
+  // Returns commandHash for requestId.
   String getCommandHash(const String& requestId);
 
-  // Returns ackJson for requestId (only meaningful if COMMITTED).
-  // Empty string if not found or still PENDING.
+  // Returns ackJson for requestId (only if COMMITTED or COMMITTED_UNKNOWN).
   String getAckJson(const String& requestId);
+
+  // Returns channelId for requestId (0 if not a relay command or not found).
+  uint8_t getChannelId(const String& requestId);
+
+  // Returns desiredState for requestId (only meaningful for relay commands).
+  bool getDesiredState(const String& requestId);
+
+  // =====================================================================
+  // CYCLE-8A: Reconciliation — called on boot and on retry of PENDING/EXECUTING
+  // =====================================================================
+
+  // Reconcile ALL PENDING and EXECUTING entries with current GPIO state.
+  // Called once on boot after journal.loadFromNVS().
+  // For each relay command:
+  //   - Read GPIO output state via RelayDriver::readLogicalState()
+  //   - If GPIO == desiredState → mark COMMITTED_UNKNOWN
+  //   - If GPIO != desiredState → mark FAILED
+  // For non-relay commands (channelId == 0): leave as-is, log warning.
+  // Returns number of entries reconciled.
+  uint8_t reconcilePendingEntries();
+
+  // Reconcile a SINGLE entry (used on retry during normal operation).
+  // Returns the new state after reconciliation.
+  TransactionState reconcileEntry(const String& requestId);
 
   // =====================================================================
   // Legacy API (kept for backward compat — internally calls commitTransaction)
@@ -106,15 +171,18 @@ public:
                         const String& ackJson);
 
   // =====================================================================
-  // ACK delivery queue (unchanged from R10G-2)
+  // ACK delivery queue
   // =====================================================================
   void queueAck(const String& requestId, const String& ackJson);
   uint8_t processPendingAcks();
   uint8_t getPendingAckCount() const { return _pendingAckCount; }
   uint8_t getJournalSize() const { return _journalSize; }
 
-  // Remove a queued ACK (called when immediate publish succeeds — fixes F-006).
+  // Remove a queued ACK (called when immediate publish succeeds).
   void dequeueAck(const String& requestId);
+
+  // Clear a FAILED entry (allows retry with same requestId).
+  void clearEntry(const String& requestId);
 
 private:
   static const uint8_t JOURNAL_SIZE = 64;
@@ -122,28 +190,40 @@ private:
   static const uint8_t MAX_ACK_RETRIES = 10;
   static const unsigned long ACK_RETRY_INTERVAL_MS = 2000;
 
-  // R10I-1: Blob layout (unchanged):
+  // Blob layout (version 2):
   //   [0..1]  magic = 0x54, 0x4A ("TJ")
-  //   [2]     version = 1
-  //   [3]     reserved (always 0 — commit flag is in separate NVS key)
+  //   [2]     version = 2 (CYCLE-8A: was 1)
+  //   [3]     reserved (always 0)
   //   [4..7]  CRC32 of payload (bytes 8..end)
   //   [8]     requestId length (max 64)
   //   [9..]   requestId data
   //   [..]    commandHash length (max 64)
   //   [..]    commandHash data
+  //   [..]    channelId (1 byte, 0=N/A)
+  //   [..]    desiredState (1 byte, 0/1/255)
+  //   [..]    previousKnownState (1 byte, 0/1)
+  //   [..]    attempt (1 byte)
+  //   [..]    timestamp (4 bytes, uint32 LE, unix seconds)
   //   [..]    ackJson length (2 bytes LE, max 1024)
   //   [..]    ackJson data
   static const uint16_t BLOB_MAGIC1 = 0x54;  // 'T'
   static const uint16_t BLOB_MAGIC2 = 0x4A;  // 'J'
-  static const uint8_t BLOB_VERSION = 1;
-  static const uint8_t BLOB_HEADER_SIZE = 8;  // magic(2) + ver(1) + reserved(1) + CRC(4)
+  static const uint8_t BLOB_VERSION = 2;       // CYCLE-8A: was 1
+  static const uint8_t BLOB_HEADER_SIZE = 8;
   static const uint16_t BLOB_SIZE = 1200;
 
   String _journalIds[JOURNAL_SIZE];
   String _journalHashes[JOURNAL_SIZE];
   String _journalAcks[JOURNAL_SIZE];
-  bool _journalValid[JOURNAL_SIZE];   // entry exists (PENDING or COMMITTED)
-  bool _journalCommitted[JOURNAL_SIZE]; // entry is COMMITTED (commit=1)
+  bool _journalValid[JOURNAL_SIZE];
+  bool _journalCommitted[JOURNAL_SIZE];
+  // CYCLE-8A: expanded metadata per slot
+  TransactionState _journalState[JOURNAL_SIZE];
+  uint8_t _journalChannelId[JOURNAL_SIZE];
+  bool _journalDesiredState[JOURNAL_SIZE];
+  bool _journalPreviousKnownState[JOURNAL_SIZE];
+  uint8_t _journalAttempt[JOURNAL_SIZE];
+  uint32_t _journalTimestamp[JOURNAL_SIZE];
   uint8_t _journalSize = 0;
   uint8_t _journalWriteIdx = 0;
 
@@ -158,30 +238,25 @@ private:
 
   void _loadFromNVS();
 
-  // R10J/R10K: Two-phase commit (clear → write blob → writeIdx → commit=1).
-  // commitToCommitted=false: write with commit=0 (PENDING intent).
-  // commitToCommitted=true:  also set commit=1 (full commit).
-  // For new entries: call with commitToCommitted=false for PENDING,
-  //   then commitTransaction() flips commit=1 via _commitSlotNVS().
-  // For updates to existing entries: caller specifies behavior.
+  // Write entry blob + persist writeIdx + optionally commit.
   bool _saveEntryToNVSAtomic(uint8_t idx, bool commitToCommitted);
 
-  // CYCLE-7: Flip commit flag from 0 → 1 for an existing PENDING entry.
-  // Does NOT advance writeIdx (entry already exists in journal).
-  // Returns true if commit succeeded.
+  // Flip commit flag 0 → 1 + update ackJson for existing entry.
   bool _commitSlotNVS(uint8_t idx, const String& ackJson);
 
-  // R10I-4: Clear slot (write commit=0) before new entry
+  // CYCLE-8A: Update transaction state for an entry (separate NVS key).
+  bool _setTransactionStateNVS(uint8_t idx, TransactionState state);
+
   void _clearSlotNVS(uint8_t idx);
 
-  // R10I-1: Deserialize + verify magic + version + CRC
   bool _deserializeEntry(const uint8_t* blob, size_t len, uint8_t idx);
 
-  // R10I-1: Compute CRC32 of payload
   uint32_t _computeCRC(const uint8_t* data, size_t len);
 
-  // Find slot index for requestId (PENDING or COMMITTED). -1 if not found.
   int _findInJournal(const String& requestId);
+
+  // CYCLE-8A: Helper to convert state enum to string (for logging).
+  static const char* _stateToString(TransactionState s);
 };
 
 extern TransactionJournal journal;
