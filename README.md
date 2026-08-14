@@ -20,8 +20,9 @@ This repo holds the **device-side code** for the Timer Digital Relay v4.0 system
 | Item | Value |
 |------|-------|
 | Audited branch | `engineering-cycle-8c-rev26-final-predicate` |
-| Audited commit (Phase 1 closure) | `c506c80` — P1-1 (strict serializer) + P1-2 (host test harness, 102/102 PASS) |
-| Parent commit (Phase 1 initial) | `2e4de87` — Phase 1 JournalRecord implementation |
+| Audited commit (Phase 1 documentation closure) | `9fd7473` — Closure-C/D/E/F + Phase 2/3 scope contracts |
+| Phase 1 implementation baseline (parent of audited commit) | `c506c80` — P1-1 (strict serializer) + P1-2 (host test harness, 102/102 PASS) |
+| Phase 1 initial implementation (grandparent) | `2e4de87` — Phase 1 JournalRecord implementation |
 | Normative design contract | [`docs/CYCLE-8C-REV26-FINAL-PREDICATE.md`](docs/CYCLE-8C-REV26-FINAL-PREDICATE.md) |
 | Foundational record contract | [`docs/CYCLE-8C-REV14-MUTATION-CONSOLIDATION.md`](docs/CYCLE-8C-REV14-MUTATION-CONSOLIDATION.md) (consolidated by Rev26) |
 | Phase 2 scope contract | [`docs/PHASE-2-SCOPE.md`](docs/PHASE-2-SCOPE.md) — **not yet authorized to start** |
@@ -87,7 +88,7 @@ This repo holds the **device-side code** for the Timer Digital Relay v4.0 system
 
 1. [Repository Layout](#repository-layout)
 2. [Architecture Overview](#architecture-overview)
-3. [Security Architecture (Rounds 9–10K)](#security-architecture-rounds-910k)
+3. [Security Architecture (Cycle 8C — Rev26 normative)](#security-architecture-cycle-8c--rev26-normative)
 4. [Production Deployment Guide](#production-deployment-guide)
    - [Step 1: Generate Ed25519 Signing Keys](#step-1-generate-ed25519-signing-keys)
    - [Step 2: Deploy Mosquitto MQTT Broker](#step-2-deploy-mosquitto-mqtt-broker)
@@ -957,7 +958,9 @@ All 12 tests must PASS on actual ESP32 hardware before 220V production deploymen
 | Cycle 8C-Rev14 | Mutation enforcement + full consolidation (SOLE normative document for JournalRecord byte layout, CRC contract, canonical equivalence, generation ordering, recovery decision table, ACK lifecycle, eviction matrix) | **Foundation contract for Phase 1 implementation** |
 | Cycle 8C-Rev15 → Rev25 | ACK transition, auth regression, auth evidence lifetime, authz boundary, verification boundary, auth evidence normalization | Iterative design refinement |
 | Cycle 8C-Rev26 | Final eviction predicate (I2a–I2e + auth gate), DEPLOYMENT_AUTH_CONFIGURED vs AUTH_EVIDENCE_AUTHENTICATED separation, complete drive-out predicate | **CURRENT NORMATIVE DESIGN — Phase 1 implementation target** |
-| Phase 1 (commit `c506c80`) | JournalRecord implementation: serialize/deserialize, CRC-32/ISO-HDLC, canonicalEqual, classifyGeneration + host test harness (102/102 PASS) | **NOT YET APPROVED** — auditor re-review pending Closure-C/D/E/F |
+| Phase 1 — initial implementation (`2e4de87`) | JournalRecord implementation: serialize/deserialize, CRC-32/ISO-HDLC, canonicalEqual, classifyGeneration | Phase 1 code baseline |
+| Phase 1 — closure (`c506c80`) | P1-1 (strict serializer — reject over-limit input) + P1-2 (host test harness, 102/102 PASS) | Phase 1 implementation baseline |
+| Phase 1 — documentation closure (`9fd7473`) | Closure-C/D/E/F + Phase 2/3 scope contracts (this commit) | **CURRENTLY UNDER AUDITOR RE-REVIEW** |
 | Phase 2 | TransactionJournal Rev26 rewrite + command integration + recovery semantics | **NOT AUTHORIZED** — see [`docs/PHASE-2-SCOPE.md`](docs/PHASE-2-SCOPE.md) |
 | Phase 3 | 16-channel migration (I/O expander architecture TBD) | **NOT AUTHORIZED** |
 | 220V production | Hardware acceptance: 12 power-loss tests + Ed25519 runtime verification | **NOT AUTHORIZED** |
@@ -967,9 +970,10 @@ All 12 tests must PASS on actual ESP32 hardware before 220V production deploymen
 ## Known Limitations (as of Rev26 Phase 1 audit — 2026-08-14)
 
 > **Closure-E (auditor Rev26 Phase-1 review).** These are limitations of the
-> audited firmware as of commit `c506c80` on branch
-> `engineering-cycle-8c-rev26-final-predicate`. They are stated explicitly
-> (not disguised as features) per auditor requirement.
+> audited firmware as of commit `9fd7473` on branch
+> `engineering-cycle-8c-rev26-final-predicate` (Phase 1 implementation
+> baseline `c506c80` — initial implementation `2e4de87`). They are stated
+> explicitly (not disguised as features) per auditor requirement.
 
 1. **Browser credential exposure (P1 — accepted tradeoff, NOT a secret from
    the browser user):** `NEXT_PUBLIC_MQTT_PASSWORD` is exposed to the PWA

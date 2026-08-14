@@ -6,7 +6,7 @@ Engineering may NOT begin Phase 2 implementation until:
 2. Auditor explicitly authorizes "Phase 2 may begin" against this scope document.
 
 **Parent contract:** [`CYCLE-8C-REV26-FINAL-PREDICATE.md`](CYCLE-8C-REV26-FINAL-PREDICATE.md)
-**Foundation:** Phase 1 — `JournalRecord` (commit `c506c80`, host test 102/102 PASS)
+**Foundation:** Phase 1 — `JournalRecord` (audited commit `9fd7473`; Phase 1 implementation baseline `c506c80`, host test 102/102 PASS)
 **Auditor mandate:** This document was created in response to the auditor's
 2026-08-14 disposition requiring a formal Phase-2 scope contract BEFORE
 implementation begins.

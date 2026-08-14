@@ -1,5 +1,25 @@
 # CYCLE-8C: Durable Transaction Journal v3 / Corruption-Safe State Machine
 
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  HISTORICAL DOCUMENT — DESIGN CONTEXT ONLY             ║ -->
+<!-- ║  This document is part of the pre-Rev26 Cycle 8C design     ║ -->
+<!-- ║  series. It describes the OLD corruption-safe journal      ║ -->
+<!-- ║  model that was iteratively refined through Rev1 → Rev13   ║ -->
+<!-- ║  and superseded by the dual-copy + generation ordering      ║ -->
+<!-- ║  architecture in Rev14+.                                    ║ -->
+<!-- ║                                                              ║ -->
+<!-- ║  The CURRENT normative design is:                            ║ -->
+<!-- ║    docs/CYCLE-8C-REV26-FINAL-PREDICATE.md                    ║ -->
+<!-- ║                                                              ║ -->
+<!-- ║  References to `tj_entry_N` / `tj_commit_N` in this         ║ -->
+<!-- ║  document refer to the pre-Rev26 two-phase commit NVS       ║ -->
+<!-- ║  key naming, NOT to the Rev26 dual-copy architecture        ║ -->
+<!-- ║  (`tj_slot_<idx>_a` / `tj_slot_<idx>_b` — see                ║ -->
+<!-- ║  docs/PHASE-2-SCOPE.md §7 Q1).                               ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
 ## Problem Statement (C8BR1-001, C8BR1-002)
 
 Cycle 8B-Rev1 achieved monotonic state transitions but had two P0 failures

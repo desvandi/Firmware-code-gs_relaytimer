@@ -1,5 +1,24 @@
 # CYCLE-8C-Rev1: Transaction Journal v4 — Design Specification
 
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  HISTORICAL DOCUMENT — DESIGN CONTEXT ONLY             ║ -->
+<!-- ║  This is Rev1 of the Cycle 8C design series. It was the    ║ -->
+<!-- ║  first draft and has been iteratively refined through      ║ -->
+<!-- ║  Rev2 (dual-copy) → Rev13 → Rev14 (consolidation) →        ║ -->
+<!-- ║  Rev26 (final predicate).                                   ║ -->
+<!-- ║                                                              ║ -->
+<!-- ║  The CURRENT normative design is:                            ║ -->
+<!-- ║    docs/CYCLE-8C-REV26-FINAL-PREDICATE.md                    ║ -->
+<!-- ║                                                              ║ -->
+<!-- ║  References to `tj_entry_N` / `tj_commit_N` in this         ║ -->
+<!-- ║  document refer to the pre-Rev26 two-phase commit NVS       ║ -->
+<!-- ║  key naming, NOT to the Rev26 dual-copy architecture        ║ -->
+<!-- ║  (`tj_slot_<idx>_a` / `tj_slot_<idx>_b` — see                ║ -->
+<!-- ║  docs/PHASE-2-SCOPE.md §7 Q1).                               ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
 **Purpose**: Menunggu audit auditor sebelum implementasi
 **Auditor instruction**: "Saya ingin engineer terlebih dahulu membuat: 1) Formal invariant table, 2) Crash matrix T0-Tn, 3) Redesign single-source-of-truth journal record"
