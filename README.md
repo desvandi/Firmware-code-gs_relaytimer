@@ -776,6 +776,101 @@ All 12 tests must PASS on actual ESP32 hardware before 220V production deploymen
 
 5. **Development default**: Repository ships with insecure defaults (HiveMQ public, port 1883, no auth, CORS `*`). This is for development only. **Use PRODUCTION_BUILD flag for real deployment.**
 
+6. **No Flash Encryption / Secure Boot**: NVS data (JWT secret, refresh tokens, MQTT password, GAS secret) is stored as plaintext in flash. An attacker with physical access (UART, flash dump) can extract these secrets. **For high-security deployments, enable ESP32 Flash Encryption + Secure Boot** (see [Physical Security Hardening](#physical-security-hardening-flash-encryption--secure-boot) below).
+
+7. **Ed25519 PSA Crypto not in default framework**: The default prebuilt `arduino-esp32` framework does NOT include Ed25519 curve support. The code is guarded with `#if defined(MBEDTLS_ED25519_SUPPORTED)` and falls back to fail-closed (OTA rejected) when not compiled in. To enable Ed25519 OTA verification, rebuild the ESP32 framework with `CONFIG_MBEDTLS_ECP_DP_ED25519_ENABLED=y` in sdkconfig and add `-DMBEDTLS_ED25519_SUPPORTED` to `build_flags` in `platformio.ini`.
+
+---
+
+## Physical Security Hardening (Flash Encryption + Secure Boot)
+
+> **audit-fixes (auditor #3 P3)**: For deployments where physical access to the device is a threat (e.g., shared spaces, public installations), enable ESP32 hardware security features. These are NOT code changes — they are one-time provisioning steps via `esptool.py`.
+
+### Why this matters
+
+Without Flash Encryption:
+- Anyone with physical access can dump the ESP32 flash via UART or SPI
+- All NVS data is plaintext: JWT secret, refresh tokens, MQTT password, GAS HMAC secret, WiFi credentials
+- An attacker who extracts the JWT secret can forge valid JWTs and bypass authentication entirely
+- Encrypting individual fields (e.g., refresh tokens) without Flash Encryption is **security theater** — the encryption key itself would also be in plaintext NVS
+
+With Flash Encryption + Secure Boot:
+- All flash contents are encrypted at rest (AES-256-XTS)
+- Secure Boot verifies firmware signature on every boot (rejects unsigned/damaged firmware)
+- NVS data is automatically encrypted/decrypted by the ESP32 hardware — no code changes needed
+- Physical extraction yields only ciphertext
+
+### Step-by-step (one-time provisioning)
+
+```bash
+# 1. Install esptool (if not already installed)
+pip install esptool
+
+# 2. Burn Secure Boot key + digest
+#    Generate a 256-bit Secure Boot key
+python -m espsecure generate_signing_key --version 2 --scheme ecdsa256 secure_boot_signing_key.pem
+
+#    Burn the key digest into eFuse
+espsecure.py burn_key_digest --keyfile secure_boot_signing_key.pem --version 2
+
+# 3. Burn Flash Encryption key into eFuse
+#    Generate a 256-bit Flash Encryption key
+python -m espsecure generate_flash_encryption_key flash_encryption_key.bin
+
+#    Burn it into eFuse BLOCK_KEY0
+espefuse.py burn_key BLOCK_KEY0 flash_encryption_key.bin FLASH_CRYPT_DEC
+
+# 4. Enable Flash Encryption in eFuse (DISABLE_SOFT_FLASH_CRYPT_CNT = 1)
+#    This permanently enables flash encryption. The next boot will encrypt all
+#    flash contents in-place. DO NOT power off during this process.
+espefuse.py burn_efuse DISABLE_SOFT_FLASH_CRYPT_CNT
+
+# 5. Enable Secure Boot V2 in eFuse
+espefuse.py burn_efuse SECURE_BOOT_EN
+
+# 6. Re-flash the firmware (now encrypted) using esptool.py with --encrypt flag
+esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 921600 \
+    write_flash --encrypt 0x10000 firmware.bin
+```
+
+### ⚠️ CRITICAL WARNINGS
+
+- **Irreversible**: Once eFuses are burned, Flash Encryption and Secure Boot CANNOT be disabled. A device with a corrupted Secure Boot key becomes permanently unusable.
+- **Test on a dev board first**: Do not provision a production device without first verifying the full flow on a disposable ESP32.
+- **Backup keys**: Store `secure_boot_signing_key.pem` and `flash_encryption_key.bin` in a secure location. Lost keys = unusable device.
+- **OTA changes**: After enabling Secure Boot V2, ALL future OTA updates must be signed with the Secure Boot key. The Ed25519 OTA signing in this firmware is separate from Secure Boot — you need BOTH:
+  1. Ed25519 signature (firmware-level, prevents unauthorized OTA via MQTT)
+  2. Secure Boot V2 signature (hardware-level, verifies firmware integrity on boot)
+- **ESP32 vs ESP32-C3/S2/S3**: The exact eFuse names and commands differ slightly between ESP32 variants. Consult the Espressif documentation for your specific chip.
+
+### What this does NOT protect against
+
+- **Online attacks**: Flash Encryption does not protect against network-based attacks. TLS, JWT, CSRF, and rate limiting remain the primary defense.
+- **Side-channel attacks**: Power analysis, glitching, and EM attacks are out of scope.
+- **Decapping**: A determined attacker with lab equipment can still extract keys from the silicon die. For mission-critical deployments, use a secure element (ATECC608A) for key storage.
+
+### Recommendation
+
+For most IoT deployments (220V relay control in a private home), Flash Encryption + Secure Boot is **recommended but not mandatory**. The realistic threat model is network-based attack, not physical extraction. Enable these features if:
+- The device is in a publicly accessible location
+- The device controls high-value assets
+- Compliance requirements mandate hardware security
+
+---
+
+## Future Work (Architectural Enhancements)
+
+> **audit-fixes (auditor #3)**: These items were identified as valuable but are out of scope for the current audit-fix round. They require architectural changes or new infrastructure and should be planned as separate engineering efforts.
+
+| # | Enhancement | Component | Why deferred |
+|---|-------------|-----------|-------------|
+| 1 | **Distributed rate limiting** (Upstash Redis / Vercel KV) | PWA | Requires new infrastructure + dependency. Current in-memory limiter works for LAN mode (firmware-side). Vercel serverless limitation is documented. |
+| 2 | **Server-side MQTT proxy** (replace NEXT_PUBLIC_MQTT_PASSWORD) | PWA | Fundamental architecture change. PWA would connect to a Next.js API route that proxies WebSocket to the broker. Eliminates browser credential exposure but adds latency and a new single point of failure. Per-device broker ACL (already documented) is the interim mitigation. |
+| 3 | **Encrypt refresh tokens in NVS** | Firmware | Security theater without Flash Encryption. If attacker can dump flash, they can also extract the JWT secret (also plaintext in NVS) and forge JWTs directly. Flash Encryption (above) is the correct solution — it protects ALL NVS data, not just refresh tokens. |
+| 4 | **MAC address whitelist for REST API** | Firmware | JWT + CSRF + rate limiting already provide adequate auth. MAC whitelist is defense-in-depth but operationally fragile (legitimate users with new devices get locked out). IP whitelist (LAN subnet) is more practical but also fragile. |
+| 5 | **Centralized audit logging** | All | Operational concern, not security. Firmware already has local audit log (`/audit.log`, rotated at 8KB). Centralized logging requires a log collector (Loki, ELK, CloudWatch) — out of scope. |
+| 6 | **Secure element (ATECC608A) for key storage** | Firmware | Hardware change. ATECC608A would store the Ed25519 private key and JWT secret in tamper-resistant hardware. Eliminates flash extraction risk. Requires PCB redesign. |
+
 ---
 
 ## Troubleshooting
