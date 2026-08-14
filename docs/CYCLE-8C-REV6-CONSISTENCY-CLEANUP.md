@@ -1,3 +1,15 @@
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  This document has been superseded by Rev10+Rev12.         ║ -->
+<!-- ║  Refer to:                                                 ║ -->
+<!-- ║    - CYCLE-8C-REV10-FINAL-CLOSURE.md                       ║ -->
+<!-- ║    - CYCLE-8C-REV12-FINAL-CONSISTENCY.md                   ║ -->
+<!-- ║  for the authoritative current design.                     ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
 # CYCLE-8C-Rev6: Transaction Journal v4 — Consistency Cleanup
 
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
