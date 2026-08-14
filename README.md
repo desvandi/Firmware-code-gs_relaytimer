@@ -270,22 +270,73 @@ mosquitto_passwd -c /etc/mosquitto/passwd device-A4CF12345678
 mosquitto_passwd /etc/mosquitto/passwd device-A4CF12345679
 ```
 
-#### 2f. Configure ACL (Per-Device Topic Restrictions)
+#### 2f. Configure ACL (Per-Device Topic Restrictions) — MANDATORY for production
+
+> **audit-fixes (P0-5)**: The previous ACL example used `topic readwrite timer12/#`
+> for the PWA user, which grants read+write access to ALL devices on the broker.
+> For a system controlling 220V mains, this is unacceptable — a single
+> browser-exposed credential (see PWA's `NEXT_PUBLIC_MQTT_PASSWORD`) would let
+> any web visitor control every relay on every device.
+>
+> **Production ACL MUST be per-device.** Create one broker user per (PWA, device)
+> pair, scoped to exactly that device's topics. The pattern below is the
+> minimum acceptable configuration for production.
 
 Create `/etc/mosquitto/acl`:
 
 ```
-# Device A4CF12345678 — can only access its own topics
+# ─── Device A4CF12345678 ───
+# The device itself: can publish its own status/log/ack/online + read commands
 user device-A4CF12345678
-topic readwrite timer12/A4CF12345678/#
+topic read   timer12/A4CF12345678/command
+topic read   timer12/A4CF12345678/ota
+topic write  timer12/A4CF12345678/status
+topic write  timer12/A4CF12345678/log
+topic write  timer12/A4CF12345678/ack
+topic write  timer12/A4CF12345678/online
 
-# Device A4CF12345679
+# ─── PWA user for device A4CF12345678 ───
+# Browser-exposed credential — MUST be scoped to ONE device only.
+# Create a separate PWA user per device. Do NOT use a shared `pwa-user`
+# with `topic readwrite timer12/#`.
+user pwa-A4CF12345678
+topic write  timer12/A4CF12345678/command
+topic write  timer12/A4CF12345678/ota
+topic read   timer12/A4CF12345678/status
+topic read   timer12/A4CF12345678/log
+topic read   timer12/A4CF12345678/ack
+topic read   timer12/A4CF12345678/online
+
+# ─── Device A4CF12345679 (repeat pattern) ───
 user device-A4CF12345679
-topic readwrite timer12/A4CF12345679/#
+topic read   timer12/A4CF12345679/command
+topic read   timer12/A4CF12345679/ota
+topic write  timer12/A4CF12345679/status
+topic write  timer12/A4CF12345679/log
+topic write  timer12/A4CF12345679/ack
+topic write  timer12/A4CF12345679/online
 
-# PWA can subscribe to any device (if you trust the PWA)
-# For stricter security, create a separate PWA user with read-only access
+user pwa-A4CF12345679
+topic write  timer12/A4CF12345679/command
+topic write  timer12/A4CF12345679/ota
+topic read   timer12/A4CF12345679/status
+topic read   timer12/A4CF12345679/log
+topic read   timer12/A4CF12345679/ack
+topic read   timer12/A4CF12345679/online
 ```
+
+> **Why per-device PWA users?** The PWA's `NEXT_PUBLIC_MQTT_PASSWORD` is
+> browser-exposed (it's inlined into the client bundle by Next.js). Any web
+> visitor can extract it. If a single PWA credential had `timer12/#` access,
+> that visitor could control every relay on every device on your broker.
+> Per-device scoping limits the blast radius to one device per leaked
+> credential. For multi-device deployments, the PWA should either:
+>   1. Prompt the user to enter a per-device broker credential at login (each
+>      device ships with its own `pwa-<MAC>` user), OR
+>   2. Sit behind an auth gateway that issues short-lived broker credentials
+>      after authenticating the user (recommended for >10 devices).
+>
+> See the PWA README's "Security Architecture" section for the full threat model.
 
 #### 2g. Restart Mosquitto
 

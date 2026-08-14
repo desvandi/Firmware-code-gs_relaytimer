@@ -333,6 +333,22 @@ bool ed25519VerifyHash(const char* publicKeyHex,
     return false;
   }
 
+  // audit-fixes: PSA Crypto API for Ed25519 requires a custom-built ESP32
+  //   framework with CONFIG_MBEDTLS_ECP_DP_ED25519_ENABLED=y in sdkconfig.
+  //   The default prebuilt arduino-esp32 framework does NOT include Ed25519
+  //   curve support, so the PSA functions are declared but their symbols
+  //   are missing → linker fails.
+  //
+  //   Rather than block the entire build, we guard the PSA path. When
+  //   MBEDTLS_ED25519_SUPPORTED is NOT defined (default), OTA Ed25519
+  //   verification always returns false → OTA is effectively disabled.
+  //   This matches the existing fail-closed behavior (empty
+  //   OTA_ED25519_PUBLIC_KEY_HEX also disables OTA).
+  //
+  //   To ENABLE Ed25519 verification, define MBEDTLS_ED25519_SUPPORTED in
+  //   build_flags after rebuilding the ESP32 framework with Ed25519 support.
+  //   See firmware README "Known Limitations #3".
+  #if defined(MBEDTLS_ED25519_SUPPORTED)
   // R10D-1: Use PSA Crypto API with CORRECT identifiers per PSA/Mbed TLS spec.
   #include <psa/crypto.h>
 
@@ -390,6 +406,19 @@ bool ed25519VerifyHash(const char* publicKeyHex,
 
   Serial.println("[Ed25519] Signature verified OK (PSA Crypto, PureEdDSA)");
   return true;
+  #else
+  // audit-fixes: Ed25519 not compiled into this framework build.
+  //   OTA via MQTT is disabled because signature verification cannot succeed.
+  //   This matches the fail-closed contract: OTA requires Ed25519 signature
+  //   verification, and an unverifiable signature = no OTA.
+  Serial.println("[Ed25519] NOT AVAILABLE — PSA Crypto Ed25519 support not compiled in.");
+  Serial.println("[Ed25519] Define MBEDTLS_ED25519_SUPPORTED in build_flags after");
+  Serial.println("[Ed25519]   rebuilding ESP32 framework with CONFIG_MBEDTLS_ECP_DP_ED25519_ENABLED=y");
+  Serial.println("[Ed25519] OTA via MQTT will be REJECTED (fail-closed).");
+  memset(publicKey, 0, sizeof(publicKey));
+  memset(signature, 0, sizeof(signature));
+  return false;
+  #endif
 }
 
 } // namespace Utils

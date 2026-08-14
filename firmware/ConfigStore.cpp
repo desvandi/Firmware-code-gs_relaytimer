@@ -37,10 +37,21 @@ void ConfigStore::initDefaultUserConfig() {
   }
   Utils::bytesToHex(hash, 32, Core::userConfig.passHashHex);
   Services::Log.append(Core::LogType::ConfigChange, "Default user config created", 0);
+#ifdef PRODUCTION_BUILD
+  // audit-fixes: do NOT print the default password to Serial in production.
+  //   The owner reads it from a printed provisioning sheet or via authenticated
+  //   /api/config endpoint. Printing to Serial leaks it to anyone with USB access.
+  Serial.println(F("========================================"));
+  Serial.println(F("DEFAULT PASSWORD: [REDACTED in PRODUCTION_BUILD]"));
+  Serial.println(F("(Read from NVS via authenticated API or provisioning sheet)"));
+  Serial.println(F("========================================"));
+#else
   Serial.println(F("========================================"));
   Serial.println(F("DEFAULT PASSWORD (catat dan amankan!):"));
   Serial.println(defaultPass);
   Serial.println(F("========================================"));
+#endif
+  memset(defaultPass, 0, sizeof(defaultPass));
 }
 
 void ConfigStore::loadUserConfig() {

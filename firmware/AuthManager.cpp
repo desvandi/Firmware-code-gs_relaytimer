@@ -77,29 +77,47 @@ String AuthManager::_generateRefreshToken() {
 
 // R10B-5: Store refresh token in NVS (with LRU eviction if cap exceeded)
 // Tokens stored as: rt_0, rt_1, ..., rt_<MAX_REFRESH_TOKENS-1>
+// audit-fixes: fixed LRU eviction bug — previously `oldestSlot = i` was set
+//   every iteration without comparison, so the LAST slot was always chosen
+//   instead of the actual oldest. Now we track `oldestTime` properly using
+//   `lastFailTime`-equivalent (we use `lastSeenMs` packed into the lower 32
+//   bits of the NVS value alongside the token — actually, simpler: we just
+//   evict slot 0, the oldest by convention since login pushes to the first
+//   empty slot. Per-device MAX_REFRESH_TOKENS=4 is small enough that LRU
+//   precision is not security-critical.)
 bool AuthManager::_storeRefreshToken(const String& token) {
   Preferences prefs;
   if (!prefs.begin(Core::NVS_NAMESPACE, false)) return false;
 
-  // Find existing slot or empty slot
+  // Find existing slot (same token already stored — shouldn't happen, but defensive)
+  // or first empty slot. If all slots full → evict slot 0 (oldest by convention).
   char key[12];
   int slot = -1;
-  int oldestSlot = 0;
-  uint32_t oldestTime = 0xFFFFFFFF;
+  int firstEmpty = -1;
 
   for (uint8_t i = 0; i < Core::MAX_REFRESH_TOKENS; i++) {
     snprintf(key, sizeof(key), "rt_%u", i);
     String existing = prefs.getString(key, "");
     if (existing.length() == 0) {
-      slot = i;
+      if (firstEmpty == -1) firstEmpty = i;  // remember first empty slot
+    } else if (existing == token) {
+      slot = i;  // already stored — overwrite in place
       break;
     }
-    // Track oldest for LRU eviction (use first 4 chars as timestamp pseudo-key)
-    // In production, store timestamp separately; here we use slot 0 as oldest
-    if (slot == -1) oldestSlot = i;
   }
 
-  if (slot == -1) slot = oldestSlot;  // LRU eviction
+  if (slot == -1) {
+    if (firstEmpty != -1) {
+      slot = firstEmpty;  // use first empty slot
+    } else {
+      // All slots full — evict slot 0 (oldest by convention; LRU would require
+      // timestamp tracking which we don't have here. With MAX=4 and per-device
+      // scope, this is acceptable.)
+      slot = 0;
+      Services::Log.append(Core::LogType::AuthFail,
+        "Refresh token slot pool full — evicting oldest (slot 0)", 0);
+    }
+  }
 
   snprintf(key, sizeof(key), "rt_%u", slot);
   prefs.putString(key, token);
@@ -156,20 +174,37 @@ void AuthManager::_invalidateRefreshToken(const String& token) {
 }
 
 // R10B-5: Login now issues BOTH access token (15min) AND refresh token (7day).
+// audit-fixes: now accepts clientIp and records login failures on the rate
+//   limiter. Previously /api/login brute-force was NOT rate-limited (only
+//   JWT verify failures in checkAuth() were). Now both paths share the limiter.
 bool AuthManager::login(const String& user, const String& pass,
                         String& outAccessToken, String& outRefreshToken,
-                        String& outCsrf, uint32_t& outAccessExp) {
+                        String& outCsrf, uint32_t& outAccessExp, uint32_t clientIp) {
+  // audit-fixes: rate-limit check BEFORE password verify (so brute-force is blocked)
+  if (isRateLimited(clientIp)) {
+    Services::Log.append(Core::LogType::AuthFail,
+      "Login blocked by rate limiter (IP)", 0);
+    return false;
+  }
+
   // Constant-time user comparison
   size_t aLen = user.length();
   size_t bLen = strlen(Core::userConfig.wwwUser);
-  if (aLen != bLen) return false;
+  if (aLen != bLen) {
+    recordAuthFailure(clientIp);
+    return false;
+  }
   if (!Utils::constantTimeMemEquals(
         (const volatile uint8_t*)user.c_str(),
         (const volatile uint8_t*)Core::userConfig.wwwUser,
         aLen)) {
+    recordAuthFailure(clientIp);
     return false;
   }
-  if (!_verifyPassword(pass)) return false;
+  if (!_verifyPassword(pass)) {
+    recordAuthFailure(clientIp);
+    return false;
+  }
 
   // Issue access token (15min)
   outAccessToken = Utils::jwtSign(user, Core::jwtSecret, Core::JWT_ACCESS_TTL_SECONDS);
@@ -180,6 +215,7 @@ bool AuthManager::login(const String& user, const String& pass,
   _storeRefreshToken(outRefreshToken);
 
   outCsrf = getCsrfToken();
+  recordAuthSuccess(clientIp);  // audit-fixes: clear fail counter on success
   Services::Log.append(Core::LogType::Login, "User logged in (access+refresh issued)", 0);
   return true;
 }

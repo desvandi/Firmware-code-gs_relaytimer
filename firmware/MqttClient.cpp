@@ -7,20 +7,30 @@
 #include "LogService.h"
 #include "RelayEngine.h"
 #include "Scheduler.h"
-#include "AuthManager.h"
 #include "RtcDriver.h"
 #include "RelayDriver.h"
 #include "PirDriver.h"
 #include "PzemDriver.h"
+#include "AuthManager.h"
+#include "TransactionJournal.h"
 #include "WifiManager.h"
-#include "ConfigStore.h"
-#include "Json.h"
 #include "Crypto.h"
-#include "TransactionJournal.h"  // R10G-1/R10G-2: NVS journal + ACK retry
+#include "Json.h"
 #include <ArduinoJson.h>
-#include <esp_task_wdt.h>
+#include <PubSubClient.h>
+#include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Update.h>
+#include <esp_task_wdt.h>
+
+// audit-fixes: forward declaration for static helper (was defined AFTER use).
+//   C++ requires declaration before use. The static function _computeCommandHash
+//   was defined at the bottom of the file but called from _handleCommand() and
+//   _handleOta() above. Must be placed AFTER ArduinoJson.h include so that
+//   DynamicJsonDocument is visible in the signature.
+static String _computeCommandHash(const DynamicJsonDocument& doc);
+#include "ConfigStore.h"
 #include <mbedtls/sha256.h>
 #include <algorithm>
 #include <vector>
@@ -393,24 +403,23 @@ void MqttClient::publishLog(Core::LogType type, const String& message, int8_t ch
 // =============================================================================
 // R10E-1 (audit round 10E): ATOMIC ACK transaction pattern.
 //
-// BUG FIXED: Previous design (R10D-2) had ordering bug:
-//   _addProcessed(requestId, commandHash);  // ← _lastAckJson still empty here!
-//   _publishRelayAck(...);                   // ← sets _lastAckJson AFTER store
-// This caused _lastAckJson to capture the PREVIOUS command's ACK, not current.
+// audit-fixes: the previous in-memory dedup ring buffer has been REMOVED.
+// All dedup is now authoritative via the NVS-backed TransactionJournal.
 //
-// NEW DESIGN: Each ACK publisher accepts `commandHash` parameter and performs
-// atomic transaction in this exact order:
-//   1. Construct ACK JSON
-//   2. Publish to MQTT
-//   3. Store {requestId, commandHash, ackJson} in dedup buffer
-// No separate _addProcessed() calls from _handleCommand anymore.
+// ACK publishers (below) accept a `commandHash` parameter. For SUCCESS ACKs
+// with non-empty commandHash, the publisher:
+//   1. Constructs the ACK JSON.
+//   2. Stores {requestId, commandHash, ackJson} in the NVS journal (durable,
+//      survives reboot, 64-entry ring with CRC32 + two-phase commit).
+//   3. Publishes the ACK to MQTT (best-effort immediate delivery).
+//   4. If publish fails, journal.processPendingAcks() retries every 2s.
 //
-// For FAILURE ACKs (success=false): pass commandHash="" → NOT stored in dedup
-// (failed commands can be retried with same requestId).
+// For FAILURE ACKs (success=false): pass commandHash="" → NOT stored in
+// journal (failed commands can be retried with same requestId).
 // =============================================================================
 
 // Generic ACK — used for failures and generic successes.
-// If commandHash is non-empty AND success=true → store in dedup buffer.
+// If commandHash is non-empty AND success=true → store in NVS journal.
 void MqttClient::_publishAck(const String& requestId, bool success, const char* message,
                               const String& dataJson, const String& commandHash) {
   if (!_mqtt.connected()) return;
@@ -1384,6 +1393,78 @@ void MqttClient::_handleOta(const String& json) {
     return;
   }
 
+  // audit-fixes: OTA URL host allowlist.
+  //   HTTPS alone is insufficient — an attacker who can inject an MQTT OTA
+  //   command could point the ESP32 at any trusted HTTPS host (e.g., a
+  //   GitHub fork they control). This allowlist constrains downloads to a
+  //   known set of update hosts configured in Config.h (OTA_ALLOWED_HOSTS).
+  //
+  //   If OTA_ALLOWED_HOSTS is empty, the allowlist is DISABLED (backward-
+  //   compatible with dev builds). PRODUCTION_BUILD should always set it.
+  //
+  //   Note: `url` is a const char* here (parsed from JSON), not a String.
+  //   We wrap it in a local String for the substring operations below.
+  String urlString(url);
+  if (strlen(Core::OTA_ALLOWED_HOSTS) > 0) {
+    // Extract host from URL: skip "https://" then read until '/', ':', '?', '#', or end
+    // audit-fixes: include '#' in stop chars so fragments (https://host#frag)
+    //   don't get parsed as part of the host.
+    const char* hostStart = urlString.c_str() + 8;
+    const char* hostEnd = hostStart;
+    while (*hostEnd != '\0' && *hostEnd != '/' && *hostEnd != ':' && *hostEnd != '?' && *hostEnd != '#') {
+      hostEnd++;
+    }
+    String host = urlString.substring(hostStart - urlString.c_str(), hostEnd - urlString.c_str());
+    host.toLowerCase();
+
+    // Check against comma-separated allowlist (suffix match)
+    String allowed = Core::OTA_ALLOWED_HOSTS;
+    allowed.toLowerCase();
+    bool hostAllowed = false;
+    int start = 0;
+    while (start < (int)allowed.length()) {
+      int comma = allowed.indexOf(',', start);
+      String one = (comma < 0) ? allowed.substring(start) : allowed.substring(start, comma);
+      one.trim();
+      if (one.length() > 0) {
+        // Suffix match: host == one OR host.endsWith("." + one)
+        if (host == one || (host.length() > one.length() + 1 &&
+                             host.charAt(host.length() - one.length() - 1) == '.' &&
+                             host.endsWith(one))) {
+          hostAllowed = true;
+          break;
+        }
+      }
+      if (comma < 0) break;
+      start = comma + 1;
+    }
+
+    if (!hostAllowed) {
+      Services::Log.append(Core::LogType::Error,
+        "OTA: host '" + host + "' not in allowlist", 0);
+      if (requestId.length() > 0) {
+        _publishAck(requestId, false,
+          "OTA: download host not in allowlist (check Config.h OTA_ALLOWED_HOSTS)");
+      }
+      return;
+    }
+  }
+
+#ifdef PRODUCTION_BUILD
+  // audit-fixes: in production, OTA_ALLOWED_HOSTS MUST be set.
+  //   This is a fail-closed check — if PRODUCTION_BUILD is defined but the
+  //   allowlist is empty, refuse OTA entirely.
+  if (strlen(Core::OTA_ALLOWED_HOSTS) == 0) {
+    Services::Log.append(Core::LogType::Error,
+      "OTA: PRODUCTION_BUILD requires OTA_ALLOWED_HOSTS to be set in Config.h", 0);
+    if (requestId.length() > 0) {
+      _publishAck(requestId, false,
+        "OTA: production build requires OTA_ALLOWED_HOSTS config");
+    }
+    return;
+  }
+#endif
+
   Services::Log.append(Core::LogType::Ota,
     String("OTA update requested: v") + version + " (" + String(expectedSize) + " bytes)", 0);
 
@@ -1580,112 +1661,21 @@ bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
 }
 
 // ---------------------------------------------------------------------------
-// Request deduplication — prevent double-execution of retried commands
-// Uses a ring buffer of last 64 requestIds + commandHashes + ACK results + timestamps.
+// audit-fixes: REMOVED legacy in-memory dedup ring buffer.
 //
-// R10A-3 / R10C-4 / R10D-2 / R10E-3 (audit round 10E):
-//   - Buffer size: 64 (increased from 16 in R10C-4)
-//   - Stores: requestId, commandHash, ackResultJson, timestamp
-//   - R10E-3: TTL-based expiry (15 minutes). Entries older than TTL are
-//     treated as "not found" — allows replay after TTL expires (acceptable
-//     for non-critical commands; broker ACL prevents attacker from publishing).
-//   - On duplicate:
-//     - Same requestId + same commandHash + within TTL → replay original ACK
-//     - Same requestId + DIFFERENT commandHash → reject "requestId reuse"
-//     - Same requestId + expired TTL → treat as new command (execute)
+// Previously there were TWO dedup mechanisms:
+//   1. In-memory ring buffer (_processedIds[64] etc., 15min TTL) — REMOVED.
+//   2. NVS-persisted TransactionJournal (64 entries, CRC32, 2-phase commit) — KEPT.
 //
-// R10D-2 FIX: Stores original ACK JSON for verbatim replay (not reconstructed).
-// R10E-1 FIX: Atomic publish+store (no ordering bug).
+// The in-memory buffer was declared and partially implemented but NEVER called
+// from the command path — only the NVS journal is consulted (see
+// Services::journal.isProcessed() in _handleCommand). Keeping dead dedup code
+// around was an architecture-debt trap: a future engineer might "fix" a dedup
+// bug by wiring up the dead code, unintentionally creating two sources of truth.
+//
+// All dedup is now authoritative via TransactionJournal. See TransactionJournal.{h,cpp}
+// for the NVS-backed 64-entry ring with CRC32 + magic + two-phase commit.
 // ---------------------------------------------------------------------------
-#define DEDUP_BUFFER_SIZE 64
-#define DEDUP_TTL_MS (15UL * 60UL * 1000UL)  // 15 minutes
-
-static String _processedIds[DEDUP_BUFFER_SIZE];
-static String _processedHashes[DEDUP_BUFFER_SIZE];
-static String _processedAckResults[DEDUP_BUFFER_SIZE];
-static unsigned long _processedTimestamps[DEDUP_BUFFER_SIZE];  // R10E-3: millis() when stored
-static uint8_t _dedupIdx = 0;
-
-// R10E-3 / R10F-2: Check if requestId is duplicate AND still within TTL.
-//
-// R10F-2 FIX: When an expired entry is found, CLEAR it immediately.
-// Previous bug: expired entry stayed in buffer, causing _isDuplicate() to
-// find the OLD expired entry first (returning false) even if a NEWER valid
-// entry with same requestId existed in another slot. This led to double
-// execution of commands after TTL expiry.
-//
-// Now: expired entries are cleaned up on discovery. The loop CONTINUES
-// searching for a valid (non-expired) entry with same requestId.
-bool MqttClient::_isDuplicate(const String& requestId) {
-  unsigned long now = millis();
-  for (uint8_t i = 0; i < DEDUP_BUFFER_SIZE; i++) {
-    if (_processedIds[i] == requestId) {
-      // R10F-2: Check TTL — if expired, CLEAN UP this slot and continue searching
-      if (now - _processedTimestamps[i] > DEDUP_TTL_MS) {
-        // Expired — clear this slot so it can't shadow newer entries
-        _processedIds[i] = "";
-        _processedHashes[i] = "";
-        _processedAckResults[i] = "";
-        _processedTimestamps[i] = 0;
-        // Continue searching — there might be a newer valid entry with same requestId
-        continue;
-      }
-      return true;  // found valid (non-expired) duplicate
-    }
-  }
-  return false;  // no valid duplicate found
-}
-
-// R10F-2: Helper that finds the FIRST VALID (non-expired) entry for a requestId.
-// Also cleans up expired entries encountered during search.
-// Returns index of valid entry, or -1 if not found / all expired.
-static int _findValidDedupEntry(const String& requestId) {
-  unsigned long now = millis();
-  for (uint8_t i = 0; i < DEDUP_BUFFER_SIZE; i++) {
-    if (_processedIds[i] == requestId) {
-      if (now - _processedTimestamps[i] > DEDUP_TTL_MS) {
-        // Expired — clean up
-        _processedIds[i] = "";
-        _processedHashes[i] = "";
-        _processedAckResults[i] = "";
-        _processedTimestamps[i] = 0;
-        continue;  // keep searching for valid entry
-      }
-      return i;  // found valid entry
-    }
-  }
-  return -1;  // no valid entry
-}
-
-// R10A-3: Find the commandHash for a valid (non-expired) requestId.
-// R10F-2: Now uses _findValidDedupEntry to skip expired entries.
-String _getHashForRequestId(const String& requestId) {
-  int idx = _findValidDedupEntry(requestId);
-  if (idx >= 0) return _processedHashes[idx];
-  return "";
-}
-
-// R10D-2: Get the ORIGINAL ACK result JSON for a valid (non-expired) requestId.
-// R10F-2: Now uses _findValidDedupEntry to skip expired entries.
-String _getAckResultForRequestId(const String& requestId) {
-  int idx = _findValidDedupEntry(requestId);
-  if (idx >= 0) return _processedAckResults[idx];
-  return "";
-}
-
-// R10E-1: _addProcessed is now ONLY called from ACK publishers (atomic).
-// Stores {requestId, commandHash, ackResultJson, timestamp} for duplicate replay.
-// ackResultJson is the EXACT JSON that was published to PWA — on duplicate,
-// we replay this verbatim instead of reconstructing from command params.
-// R10E-3: Also stores timestamp for TTL-based expiry.
-void MqttClient::_addProcessed(const String& requestId, const String& commandHash,
-                                const String& ackResultJson) {
-  _processedIds[_dedupIdx] = requestId;
-  _processedHashes[_dedupIdx] = commandHash;
-  _processedAckResults[_dedupIdx] = ackResultJson;
-  _processedTimestamps[_dedupIdx] = millis();  // R10E-3: for TTL check
-  _dedupIdx = (_dedupIdx + 1) % DEDUP_BUFFER_SIZE;
-}
 
 // R10A-3 / R10C-1 (audit round 10C): Compute a deterministic command fingerprint.
 //
