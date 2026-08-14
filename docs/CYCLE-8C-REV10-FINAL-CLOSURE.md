@@ -1,6 +1,17 @@
 <!-- SUPERSEDED BANNER -->
 <!-- ╔══════════════════════════════════════════════════════════╗ -->
 <!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  This document has been superseded by Rev14.               ║ -->
+<!-- ║  Refer to:                                                ║ -->
+<!-- ║    - CYCLE-8C-REV14-MUTATION-CONSOLIDATION.md              ║ -->
+<!-- ║  for the authoritative current design.                     ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
 <!-- ║  This document has been superseded by Rev13.               ║ -->
 <!-- ║  Refer to:                                                ║ -->
 <!-- ║    - CYCLE-8C-REV13-PRECEDENCE-CLOSURE.md                  ║ -->
