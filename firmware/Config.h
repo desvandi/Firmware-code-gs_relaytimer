@@ -53,7 +53,12 @@ namespace Core {
   // After save: ESP32 reboots to STA mode and joins the configured WiFi.
   // If STA connection fails after 3 retries: Config Portal reopens automatically.
   constexpr const char* WIFI_CONFIG_PORTAL_SSID = "Timer12-Setup";
-  constexpr const char* WIFI_CONFIG_PORTAL_PASSWORD = "";  // empty = open AP (easy onboarding)
+  // audit-fixes (auditor #2 P0): WIFI_CONFIG_PORTAL_PASSWORD is intentionally
+  //   ignored. The Config Portal now uses the same random CSPRNG-generated
+  //   AP password as the fallback AP (see WifiManager::generateApPassword()).
+  //   Owner reads the password from Serial (dev) or provisioning sheet (prod).
+  //   Kept in Config.h for backward source compatibility but NO LONGER USED.
+  constexpr const char* WIFI_CONFIG_PORTAL_PASSWORD = "";  // DEPRECATED — ignored at runtime
   constexpr uint32_t WIFI_STA_TIMEOUT_MS = 15000;
   constexpr uint8_t WIFI_STA_MAX_RETRIES = 3;
   // NVS keys
