@@ -1,3 +1,15 @@
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  This document has been superseded by Rev15 for 4 specific fixes.  ║ -->
+<!-- ║  Refer to:                                                ║ -->
+<!-- ║    - CYCLE-8C-REV15-ACK-TRANSITION.md                      ║ -->
+<!-- ║  for the authoritative supplement.                          ║ -->
+<!-- ║  Rev14 remains base for topics not changed by Rev15.        ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
 # CYCLE-8C-Rev14: Transaction Journal v4 — Mutation Enforcement & Full Consolidation
 
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
