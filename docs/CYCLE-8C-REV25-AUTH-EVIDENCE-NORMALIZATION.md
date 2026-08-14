@@ -1,3 +1,15 @@
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  Superseded by Rev26 for: enum≠evidence, I2 authority, complete predicate.  ║ -->
+<!-- ║  Refer to:                                                ║ -->
+<!-- ║    - CYCLE-8C-REV26-FINAL-PREDICATE.md                     ║ -->
+<!-- ║  for the authoritative supplement.                          ║ -->
+<!-- ║  Rev25 remains authoritative for MQTT5 removal and terminology split.  ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
 # CYCLE-8C-Rev25: Transaction Journal v4 — Auth Evidence Normalization
 
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
