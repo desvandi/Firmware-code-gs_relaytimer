@@ -39,10 +39,16 @@ inline void handleGetLogs() {
     if (limit > 500) limit = 500;
   }
   String json = Services::Log.getActivityLogJson(limit, filterType, filterChannel);
+  // audit-fixes: was `Access-Control-Allow-Origin: *` hardcoded — now uses
+  //   shared helper so production builds enforce configured origin list.
+  String origin = getAllowedOrigin();
   Web::http.sendHeader("X-Frame-Options", "DENY");
   Web::http.sendHeader("Cache-Control", "no-store");
-  Web::http.sendHeader("Access-Control-Allow-Origin", "*");
-  Web::http.sendHeader("Access-Control-Allow-Credentials", "true");
+  if (origin.length() > 0) {
+    Web::http.sendHeader("Access-Control-Allow-Origin", origin);
+    Web::http.sendHeader("Access-Control-Allow-Credentials", "true");
+    if (origin != "*") Web::http.sendHeader("Vary", "Origin");
+  }
   // Already contains success+data envelope
   Web::http.send(200, "application/json; charset=utf-8", json);
 }

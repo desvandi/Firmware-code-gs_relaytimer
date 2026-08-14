@@ -151,7 +151,7 @@ void setup() {
   // R10B-6: OTA boot health check — must run EARLY (before any subsystem that
   // could crash). Increments boot_attempts in NVS. If attempts > MAX (3),
   // triggers rollback to previous firmware partition.
-  Services::otaManager.begin();
+  Services::ota.begin();
   esp_task_wdt_reset();
 
   // ---------- SERVICES (LOG) ----------
@@ -210,7 +210,7 @@ void setup() {
   // All critical subsystems (LittleFS, WiFi, RTC, Relay, MQTT, WebServer)
   // have initialized successfully. If this is first boot after OTA, the
   // firmware is now marked VALID — rollback will not trigger on next boot.
-  Services::otaManager.markBootHealthy();
+  Services::ota.markBootHealthy();
   esp_task_wdt_reset();
 }
 

@@ -14,6 +14,11 @@ namespace TimerNet {
 WifiManager wifi;
 
 // Config Portal HTML (mobile-friendly, dark theme matching PWA)
+// audit-fixes: REMOVED MQTT password + device PIN from the HTML.
+//   Displaying these on an open AP page made them trivially extractable by
+//   anyone within WiFi range during the brief config-portal window. The
+//   legitimate owner has physical access and can read them from the Serial
+//   Monitor (in dev mode) or from a printed provisioning sheet (in production).
 static const char CONFIG_PORTAL_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html>
 <html><head>
@@ -42,20 +47,33 @@ static const char CONFIG_PORTAL_HTML[] PROGMEM = R"HTML(
     <button type="submit">Save & Connect</button>
   </form>
   <div class="info">
-    MAC: __MAC__<br>
-    MQTT Password: __MQTTPASS__<br>
-    Device PIN: __PIN__<br>
-    Save these — needed to connect PWA dashboard.
+    Device MAC: __MAC__<br>
+    After connecting, see Serial Monitor (dev) or provisioning sheet (prod) for MQTT credentials.
   </div>
 </div>
 </body></html>
 )HTML";
 
 void WifiManager::generateApPassword() {
-  uint64_t mac = ESP.getEfuseMac();
-  snprintf(_apPassword, sizeof(_apPassword), "AP-%04X%04X",
-           (uint16_t)(mac >> 16), (uint16_t)mac);
-  if (strlen(_apPassword) < 8) strcpy(_apPassword, "Timer12-Secure");
+  // audit-fixes: AP password was previously MAC-derived (`AP-<mac-hex>`),
+  //   making it predictable from WiFi beacon frames. Now generates a random
+  //   12-char alphanumeric password (CSPRNG). Stored in NVS so survives reboot.
+  Preferences prefs;
+  prefs.begin(Core::NVS_NAMESPACE, false);
+  String stored = prefs.getString("ap_pass", "");
+  if (stored.length() >= 8) {
+    strncpy(_apPassword, stored.c_str(), sizeof(_apPassword) - 1);
+    _apPassword[sizeof(_apPassword) - 1] = '\0';
+  } else {
+    // Generate random 12-char alphanumeric password (CSPRNG via esp_random)
+    static const char charset[] = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";  // no I,O,0,1
+    for (uint8_t i = 0; i < 12; i++) {
+      _apPassword[i] = charset[esp_random() % (sizeof(charset) - 1)];
+    }
+    _apPassword[12] = '\0';
+    prefs.putString("ap_pass", _apPassword);
+  }
+  prefs.end();
   strncpy(Core::apPassword, _apPassword, 32);
   Core::apPassword[32] = '\0';
 }
@@ -140,6 +158,18 @@ void WifiManager::_loadCredentials() {
 
   prefs.end();
 
+#ifdef PRODUCTION_BUILD
+  // audit-fixes: do NOT print secrets to Serial in production.
+  //   Anyone with USB access during boot could read them. In production,
+  //   the legitimate owner already has a printed provisioning sheet (or
+  //   reads NVS via authenticated API). Log only that secrets exist.
+  Serial.println("[WiFi] MQTT password: [REDACTED in PRODUCTION_BUILD]");
+  Serial.println("[WiFi] Device PIN:     [REDACTED in PRODUCTION_BUILD]");
+  Serial.println("[WiFi] GAS HMAC secret: [REDACTED in PRODUCTION_BUILD]");
+  String anonId = Utils::sha256Hex(getMacAddress()).substring(0, 16);
+  Serial.printf("[WiFi] GAS Script Property key: DEVICE_%s_SECRET\n", anonId.c_str());
+  Serial.println("[WiFi] (Get secret value from NVS via authenticated /api/config or provisioning sheet)");
+#else
   Serial.printf("[WiFi] MQTT Password: %s\n", _mqttPassword);
   Serial.printf("[WiFi] Device PIN: %s\n", _devicePin);
   Serial.printf("[WiFi] GAS HMAC Secret: %s\n", _gasSecretHex.c_str());
@@ -147,6 +177,7 @@ void WifiManager::_loadCredentials() {
   String anonId = Utils::sha256Hex(getMacAddress()).substring(0, 16);
   Serial.printf("[WiFi]   Key: DEVICE_%s_SECRET\n", anonId.c_str());
   Serial.printf("[WiFi]   Value: %s\n", _gasSecretHex.c_str());
+#endif
 }
 
 void WifiManager::_saveCredentials(const String& ssid, const String& password) {
@@ -226,8 +257,8 @@ void WifiManager::_runConfigPortal() {
   configServer.on("/", [this, &configServer]() {
     String html = FPSTR(CONFIG_PORTAL_HTML);
     html.replace("__MAC__", getMacAddress());
-    html.replace("__MQTTPASS__", String(_mqttPassword));
-    html.replace("__PIN__", String(_devicePin));
+    // audit-fixes: MQTT password + PIN no longer exposed in config portal HTML.
+    //   The owner reads them from Serial (dev) or provisioning sheet (prod).
     configServer.send(200, "text/html", html);
   });
 
@@ -254,8 +285,14 @@ void WifiManager::_runConfigPortal() {
 
   Serial.println("[WiFi] Config Portal running. Waiting for user input...");
   Serial.println(F("========================================"));
+#ifdef PRODUCTION_BUILD
+  // audit-fixes: do NOT print credentials to Serial in production.
+  Serial.println(F("MQTT Password: [REDACTED in PRODUCTION_BUILD]"));
+  Serial.println(F("Device PIN:    [REDACTED in PRODUCTION_BUILD]"));
+#else
   Serial.printf("MQTT Password: %s\n", _mqttPassword);
   Serial.printf("Device PIN: %s\n", _devicePin);
+#endif
   Serial.println(F("========================================"));
 
   // Run config portal until device restarts (user saves creds)
@@ -289,7 +326,12 @@ bool WifiManager::_startApFallback() {
 
   Serial.printf("[WiFi] Fallback AP: SSID=%s, IP=%s\n",
                 Core::AP_SSID, WiFi.softAPIP().toString().c_str());
+#ifdef PRODUCTION_BUILD
+  // audit-fixes: do NOT print AP password to Serial in production.
+  Serial.println("[WiFi] AP Password: [REDACTED in PRODUCTION_BUILD]");
+#else
   Serial.printf("[WiFi] AP Password: %s\n", _apPassword);
+#endif
   Serial.println("[WiFi] Connect to AP, open http://192.168.4.1 to reconfigure");
   Services::Log.append(Core::LogType::Error,
     "AP fallback — WiFi creds may be wrong", 0);

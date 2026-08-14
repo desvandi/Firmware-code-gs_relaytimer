@@ -41,16 +41,18 @@ extern "C" {
 
 namespace Services {
 
-OtaManager otaManager;
+// R10B-6 + audit-fixes: global is named `ota` to match all callers.
+OtaManager ota;
 
 static const char* NVS_KEY_BOOT_ATTEMPTS = "boot_attempts";
 static const char* NVS_KEY_LAST_OTA_VERSION = "last_ota_ver";
 static const uint8_t MAX_BOOT_ATTEMPTS = 3;
 static const uint32_t HEALTH_CHECK_TIMEOUT_MS = 60000;  // 60s to prove health
 
-// Existing OtaManager members (kept for backward compat with REST OTA handler)
-bool _updating = false;
-size_t _totalReceived = 0;
+// NOTE: LATEST_VERSION is a hardcoded placeholder. The /api/ota/check endpoint
+// returns this. It currently equals FIRMWARE_VERSION, so checkUpdateAvailable()
+// always returns false. PWA does not rely on this for security — MQTT OTA path
+// uses Ed25519 signature verification. See README "Known Limitations".
 static const char LATEST_VERSION[] = "4.0.0";
 
 void OtaManager::begin() {
@@ -177,7 +179,7 @@ bool OtaManager::isFirstBootAfterOta() const {
 }
 
 // ============================================================================
-// Legacy REST OTA upload handler support (unchanged — used by OtaHandlers.h)
+// Legacy REST OTA upload handler support (used by OtaHandlers.h)
 // ============================================================================
 String OtaManager::getLatestVersion() const {
   return String(LATEST_VERSION);
@@ -189,5 +191,74 @@ bool OtaManager::checkUpdateAvailable() const {
 
 bool OtaManager::isUpdating() const { return _updating; }
 size_t OtaManager::getProgress() const { return _totalReceived; }
+
+// audit-fixes: REST OTA upload handler. Called per-chunk by ESP32 WebServer.
+// NOTE: REST OTA is only available on LAN/Cloudflare Tunnel mode and is
+// protected by requireAuth() in handleOtaResponse. The upload handler itself
+// cannot call requireAuth() (ESP32 WebServer calls it before auth check),
+// but if the response handler (which DOES check auth) is not called, the
+// upload is aborted at Update.end(). See README for security notes.
+void OtaManager::handleUpload(WebServer& server, const String& filename,
+                              size_t totalSize, uint8_t* data, size_t dataSize,
+                              bool final) {
+  (void)server;  // unused — kept for API compatibility
+  (void)filename;
+
+  if (!_updating) {
+    // First chunk — begin update
+    if (!Update.begin(totalSize)) {
+      Serial.println("[OTA] Update.begin() failed — insufficient space?");
+      Services::Log.append(Core::LogType::Error,
+        "OTA upload failed: Update.begin() returned false (insufficient space?)", 0);
+      return;
+    }
+    _updating = true;
+    _totalReceived = 0;
+    Serial.printf("[OTA] Upload start: %u bytes expected\n", (unsigned)totalSize);
+  }
+
+  if (data && dataSize > 0) {
+    size_t written = Update.write(data, dataSize);
+    if (written != dataSize) {
+      Serial.printf("[OTA] Update.write() short write: %u of %u\n",
+                    (unsigned)written, (unsigned)dataSize);
+      Update.abort();
+      _updating = false;
+      _totalReceived = 0;
+      Services::Log.append(Core::LogType::Error,
+        "OTA upload failed: short write", 0);
+      return;
+    }
+    _totalReceived += dataSize;
+  }
+
+  if (final) {
+    if (!Update.end(true)) {
+      Serial.println("[OTA] Update.end() failed — aborting");
+      Services::Log.append(Core::LogType::Error,
+        "OTA upload failed: Update.end() returned false", 0);
+      Update.abort();
+      _updating = false;
+      _totalReceived = 0;
+      return;
+    }
+    if (!Update.isFinished()) {
+      Serial.println("[OTA] Update not finished after end() — aborting");
+      Services::Log.append(Core::LogType::Error,
+        "OTA upload failed: not finished", 0);
+      _updating = false;
+      _totalReceived = 0;
+      return;
+    }
+    Serial.printf("[OTA] Upload complete: %u bytes written. Rebooting.\n",
+                  (unsigned)_totalReceived);
+    Services::Log.append(Core::LogType::Ota,
+      "Firmware uploaded via REST — rebooting (" + String(_totalReceived) + " bytes)", 0);
+    _updating = false;
+    _totalReceived = 0;
+    delay(500);
+    ESP.restart();
+  }
+}
 
 } // namespace Services

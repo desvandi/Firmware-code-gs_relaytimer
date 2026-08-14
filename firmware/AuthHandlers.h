@@ -5,6 +5,15 @@
 // - Login issues access JWT (15min, httpOnly cookie) + refresh token (7day, httpOnly cookie)
 // - POST /api/refresh: validates refresh cookie, rotates it, issues new pair
 // - Logout: revokes refresh token in NVS + clears both cookies
+//
+// audit-fixes:
+//   - Refresh token is NO LONGER returned in the JSON response body. It is set
+//     ONLY as an HttpOnly + Secure + SameSite=Strict cookie. Returning it in
+//     JSON defeated the purpose of HttpOnly (any XSS could steal the
+//     long-lived 7-day session token). Response now returns only the short-lived
+//     access token + csrfToken + expiresAt for client state tracking.
+//   - All auth cookies now carry the `Secure` flag when PRODUCTION_BUILD is
+//     defined (forces HTTPS-only transport in production).
 // =============================================================================
 #pragma once
 #ifndef TIMER12_WEB_HANDLERS_AUTH_H
@@ -20,6 +29,15 @@
 
 namespace Web { namespace Handlers {
 
+// audit-fixes: cookie suffix applied to all auth cookies.
+// In production (PRODUCTION_BUILD defined), cookies are HTTPS-only via `; Secure`.
+// In development, omit Secure so cookies work over plain HTTP (e.g., localhost).
+#ifdef PRODUCTION_BUILD
+static const char* COOKIE_SECURE_SUFFIX = "; Secure";
+#else
+static const char* COOKIE_SECURE_SUFFIX = "";
+#endif
+
 // Helper: extract refresh token from Cookie header
 inline String extractRefreshTokenFromCookie() {
   if (!Web::http.hasHeader("Cookie")) return "";
@@ -33,8 +51,8 @@ inline String extractRefreshTokenFromCookie() {
 }
 
 // POST /api/login { username, password }
-// → { token, refreshToken, csrfToken, expiresAt, username }
-// R10B-5: now also issues refresh token (7day, httpOnly cookie)
+// → { token, csrfToken, expiresAt, username }
+// audit-fixes: refreshToken NO LONGER returned in JSON. Only HttpOnly cookie.
 inline void handleLogin() {
   if (!requireBody(Core::MAX_BODY_SIZE)) return;
   if (!Web::http.hasArg("plain")) {
@@ -51,42 +69,51 @@ inline void handleLogin() {
   const char* pass = doc["password"] | "";
   String accessToken, refreshToken, csrf;
   uint32_t exp;
+  // audit-fixes: also rate-limit /api/login password brute-force.
+  // login() now records failures to the same rate limiter used by checkAuth().
+  // IPAddress has implicit conversion to uint32_t, but we make it explicit
+  // for clarity (matches the pattern in AuthManager::checkAuth).
+  IPAddress clientIp = Web::http.client().remoteIP();
+  uint32_t ip = clientIp;
   if (!Services::auth.login(String(user), String(pass),
-                             accessToken, refreshToken, csrf, exp)) {
+                             accessToken, refreshToken, csrf, exp, ip)) {
     sendError(401, "Invalid username or password");
     return;
   }
 
-  // R10B-5: Set THREE cookies:
-  // - timer12_jwt (access, 15min, httpOnly)
-  // - timer12_refresh (refresh, 7day, httpOnly) ← NEW
-  // - timer12_csrf (CSRF, 15min, readable by JS)
+  // Set THREE cookies:
+  // - timer12_jwt (access, 15min, HttpOnly + Secure in production)
+  // - timer12_refresh (refresh, 7day, HttpOnly + Secure in production) — NOT in JSON
+  // - timer12_csrf (CSRF, 15min, readable by JS for double-submit)
   String jwtCookie = "timer12_jwt=";
   jwtCookie += accessToken;
   jwtCookie += "; Path=/; Max-Age=";
   jwtCookie += Core::JWT_ACCESS_TTL_SECONDS;
   jwtCookie += "; SameSite=Strict; HttpOnly";
+  jwtCookie += COOKIE_SECURE_SUFFIX;
 
   String refreshCookie = "timer12_refresh=";
   refreshCookie += refreshToken;
   refreshCookie += "; Path=/; Max-Age=";
   refreshCookie += Core::JWT_REFRESH_TTL_SECONDS;
-  refreshCookie += "; SameSite=Strict; HttpOnly";  // httpOnly — JS can't read
+  refreshCookie += "; SameSite=Strict; HttpOnly";
+  refreshCookie += COOKIE_SECURE_SUFFIX;  // audit-fixes: Secure flag
 
   String csrfCookie = "timer12_csrf=";
   csrfCookie += csrf;
   csrfCookie += "; Path=/; Max-Age=";
   csrfCookie += Core::JWT_ACCESS_TTL_SECONDS;
   csrfCookie += "; SameSite=Strict";
+  csrfCookie += COOKIE_SECURE_SUFFIX;  // audit-fixes: Secure flag
 
   Web::http.sendHeader("Set-Cookie", jwtCookie);
   Web::http.sendHeader("Set-Cookie", refreshCookie, false);  // append
   Web::http.sendHeader("Set-Cookie", csrfCookie, false);     // append
 
+  // audit-fixes: response no longer includes refreshToken.
+  // Client must rely on the cookie (auto-sent on every request).
   String data = "{\"token\":\"";
   data += accessToken;
-  data += "\",\"refreshToken\":\"";
-  data += refreshToken;
   data += "\",\"csrfToken\":\"";
   data += csrf;
   data += "\",\"expiresAt\":";
@@ -125,27 +152,29 @@ inline void handleRefresh() {
   jwtCookie += "; Path=/; Max-Age=";
   jwtCookie += Core::JWT_ACCESS_TTL_SECONDS;
   jwtCookie += "; SameSite=Strict; HttpOnly";
+  jwtCookie += COOKIE_SECURE_SUFFIX;
 
   String refreshCookie = "timer12_refresh=";
   refreshCookie += newRefreshToken;
   refreshCookie += "; Path=/; Max-Age=";
   refreshCookie += Core::JWT_REFRESH_TTL_SECONDS;
   refreshCookie += "; SameSite=Strict; HttpOnly";
+  refreshCookie += COOKIE_SECURE_SUFFIX;
 
   String csrfCookie = "timer12_csrf=";
   csrfCookie += csrf;
   csrfCookie += "; Path=/; Max-Age=";
   csrfCookie += Core::JWT_ACCESS_TTL_SECONDS;
   csrfCookie += "; SameSite=Strict";
+  csrfCookie += COOKIE_SECURE_SUFFIX;
 
   Web::http.sendHeader("Set-Cookie", jwtCookie);
   Web::http.sendHeader("Set-Cookie", refreshCookie, false);
   Web::http.sendHeader("Set-Cookie", csrfCookie, false);
 
+  // audit-fixes: response no longer includes refreshToken.
   String data = "{\"token\":\"";
   data += newAccessToken;
-  data += "\",\"refreshToken\":\"";
-  data += newRefreshToken;
   data += "\",\"csrfToken\":\"";
   data += csrf;
   data += "\",\"expiresAt\":";
@@ -156,7 +185,9 @@ inline void handleRefresh() {
 
 // POST /api/logout
 // R10B-5: now revokes refresh token in NVS (true session termination)
+// audit-fixes: added CSRF check (logout CSRF is a known vector).
 inline void handleLogout() {
+  if (!requireCsrf()) return;
   Services::auth.logout(Web::http);
   // Clear all three cookies
   Web::http.sendHeader("Set-Cookie", "timer12_jwt=; Path=/; Max-Age=0");

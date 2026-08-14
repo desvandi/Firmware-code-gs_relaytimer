@@ -225,8 +225,7 @@ namespace Core {
   // ---------- OTA (P0 #3+#8+#9 + R10A-2 + R10B-1 — audit rounds 9/10A/10B) ----------
   // MQTT OTA now requires Ed25519 signature verification.
   // PWA must send: {action, url, version, size, sha256, signature, requestId}
-  // ESP32: HTTPS download → size check → SHA-256 verify → Ed25519 verify → Update.
-  //
+  // ESP32: HTTPS download → size check → SHA-256 verify → Ed25519 verify → Update.  //
   // ═══════════════════════════════════════════════════════════════════════════
   // R10B-1 SIGNING CONTRACT (CRITICAL — read this carefully):
   // ═══════════════════════════════════════════════════════════════════════════
@@ -269,6 +268,23 @@ namespace Core {
   // Empty = OTA hard-fails (refuse HTTPS download — R10A-5 fail-closed behavior).
   // For GitHub Releases: use DigiCert Global Root CA.
   constexpr const char* OTA_HTTPS_ROOT_CA = "";
+
+  // ---------- OTA URL ALLOWLIST (audit-fixes) ----------
+  // Comma-separated list of allowed HTTPS hosts for OTA firmware downloads.
+  // Empty string = allowlist DISABLED (NOT recommended for production).
+  //
+  // Rationale: HTTPS alone is not sufficient — if an attacker can compromise
+  // an MQTT command (or the PWA), they can specify any trusted HTTPS host
+  // (e.g., attacker-controlled GitHub fork). This allowlist constrains OTA
+  // downloads to a known set of update hosts.
+  //
+  // PRODUCTION example:
+  //   constexpr const char* OTA_ALLOWED_HOSTS =
+  //   "github.com,raw.githubusercontent.com,updates.yourdomain.com";
+  //
+  // Hosts are matched by suffix against the URL's hostname. Subdomains are
+  // allowed (e.g., "github.com" matches "github.com" but not "evilgithub.com").
+  constexpr const char* OTA_ALLOWED_HOSTS = "";
 
   // ---------- FILE PATHS ----------
   constexpr const char* PATH_CONFIG_JSON = "/config.json";

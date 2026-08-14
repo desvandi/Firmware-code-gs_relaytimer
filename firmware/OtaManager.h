@@ -25,6 +25,7 @@
 #define TIMER12_SERVICES_OTA_MANAGER_H
 
 #include <Arduino.h>
+#include <WebServer.h>
 
 namespace Services {
 
@@ -44,15 +45,42 @@ public:
   // Returns current boot attempt count (0 = healthy, >0 = retrying).
   uint8_t getBootAttempts() const { return _bootAttempts; }
 
+  // -------- REST OTA upload (used by OtaHandlers.h) --------
+  // Returns the latest firmware version string (for /api/ota/check).
+  // NOTE: currently a hardcoded constant — real GitHub Release check is not
+  // implemented. PWA should not rely on this for security decisions.
+  String getLatestVersion() const;
+
+  // Returns true if a newer firmware than current is available.
+  // NOTE: currently always false because LATEST_VERSION == FIRMWARE_VERSION.
+  bool checkUpdateAvailable() const;
+
+  // True while a REST OTA upload is in progress (blocks concurrent updates).
+  bool isUpdating() const { return _updating; }
+
+  // Bytes received so far for the current REST OTA upload.
+  size_t getProgress() const { return _totalReceived; }
+
+  // REST OTA upload chunk handler — called by ESP32 WebServer for each
+  // multipart chunk of the .bin upload. Signs nothing — REST OTA is
+  // only available on LAN mode (HTTPS-tunnelled) and requires JWT auth.
+  // For MQTT OTA (the signed path), see MqttClient::_handleOta().
+  void handleUpload(WebServer& server, const String& filename,
+                    size_t totalSize, uint8_t* data, size_t dataSize,
+                    bool final);
+
 private:
   uint8_t _bootAttempts = 0;
   bool _firstBootAfterOta = false;
+  bool _updating = false;
+  size_t _totalReceived = 0;
 
-  void _checkRollback();
   bool _verifyHealth();
 };
 
-extern OtaManager otaManager;
+// NOTE: extern global is named `ota` (not `otaManager`) — matches all caller
+// references in firmware_v4.ino, OtaHandlers.h, and StatusHandlers.h.
+extern OtaManager ota;
 
 } // namespace Services
 

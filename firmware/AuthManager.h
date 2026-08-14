@@ -24,9 +24,12 @@ public:
 
   // JWT login: returns access token (15min) + refresh token (7day, one-time use)
   // R10B-5: now also generates + stores refresh token in NVS.
+  // audit-fixes: accepts client IP to record login failures on the rate limiter.
+  //   /api/login brute-force was previously NOT rate-limited (only JWT verify
+  //   failures were). Now login() records failures just like checkAuth().
   bool login(const String& user, const String& pass,
              String& outAccessToken, String& outRefreshToken,
-             String& outCsrf, uint32_t& outAccessExp);
+             String& outCsrf, uint32_t& outAccessExp, uint32_t clientIp);
 
   // R10B-5: Refresh access token using refresh token.
   // Validates old refresh token, rotates it (old invalidated, new issued).

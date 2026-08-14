@@ -35,8 +35,12 @@ inline void handleStatus() {
   data["timezone"] = Core::timezone;
   data["wifiRssi"] = TimerNet::wifi.getRssi();
   data["freeHeap"] = ESP.getFreeHeap();
-  data["cpuLoadPercent"] = 10;  // mock
-  data["flashFreePercent"] = 35;  // mock
+  // audit-fixes: removed hardcoded cpuLoadPercent=10 and flashFreePercent=35.
+  //   These were mock values that misled the PWA into thinking telemetry was
+  //   real. Real CPU load measurement on ESP32 requires idle-task hook (not
+  //   implemented). Flash free space requires esp_partition_info (not worth
+  //   the memory cost for the value it provides). Omitted from response
+  //   rather than fabricating numbers.
   data["online"] = true;
 
   // Channels array
@@ -104,10 +108,17 @@ inline void handleStatus() {
   body.reserve(4096);
   doc["success"] = true;
   serializeJson(doc, body);
+  // audit-fixes: was `Access-Control-Allow-Origin: *` hardcoded — bypassed
+  //   Config::ALLOWED_CORS_ORIGINS. Now uses the shared helper so production
+  //   builds enforce the configured origin list.
+  String origin = getAllowedOrigin();
   Web::http.sendHeader("X-Frame-Options", "DENY");
   Web::http.sendHeader("Cache-Control", "no-store");
-  Web::http.sendHeader("Access-Control-Allow-Origin", "*");
-  Web::http.sendHeader("Access-Control-Allow-Credentials", "true");
+  if (origin.length() > 0) {
+    Web::http.sendHeader("Access-Control-Allow-Origin", origin);
+    Web::http.sendHeader("Access-Control-Allow-Credentials", "true");
+    if (origin != "*") Web::http.sendHeader("Vary", "Origin");
+  }
   Web::http.send(200, "application/json; charset=utf-8", body);
 }
 

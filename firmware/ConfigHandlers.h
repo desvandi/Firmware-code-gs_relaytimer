@@ -83,7 +83,9 @@ inline void handleSetConfig() {
     }
   }
   Storage::config.saveUserConfig();
-  sendSuccess("Config saved. Login ulang diperlukan dengan kredensial baru.");
+  // audit-fixes: was a partial Indonesian/English mix. Now English-only.
+  //   Indonesian translation should be in PWA, not in firmware responses.
+  sendSuccess("Config saved. Please log in again with the new credentials.");
 }
 
 // POST /api/config/device { deviceName?, timezone? }
@@ -157,9 +159,15 @@ inline void handleExportConfig() {
   String json = Storage::config.exportAll();
   Web::http.sendHeader("Content-Disposition",
                        "attachment; filename=\"timer12-config-backup.json\"");
+  // audit-fixes: was `Access-Control-Allow-Origin: *` hardcoded — now uses
+  //   shared helper so production builds enforce configured origin list.
+  String origin = getAllowedOrigin();
   Web::http.sendHeader("X-Frame-Options", "DENY");
-  Web::http.sendHeader("Access-Control-Allow-Origin", "*");
-  Web::http.sendHeader("Access-Control-Allow-Credentials", "true");
+  if (origin.length() > 0) {
+    Web::http.sendHeader("Access-Control-Allow-Origin", origin);
+    Web::http.sendHeader("Access-Control-Allow-Credentials", "true");
+    if (origin != "*") Web::http.sendHeader("Vary", "Origin");
+  }
   Web::http.send(200, "application/json; charset=utf-8", json);
 }
 

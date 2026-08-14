@@ -99,11 +99,10 @@ private:
                           const String& dataJson = "", const String& commandHash = "");
 
   void _buildTopics();
-  bool _isDuplicate(const String& requestId);
-  // R10E-1: _addProcessed is now ONLY called from ACK publishers (atomic).
-  // Not called separately from _handleCommand anymore.
-  void _addProcessed(const String& requestId, const String& commandHash,
-                     const String& ackResultJson);
+  // audit-fixes: removed _isDuplicate() and _addProcessed() declarations.
+  //   The in-memory dedup ring buffer was dead code (never called from
+  //   _handleCommand). All dedup is now authoritative via TransactionJournal
+  //   (Services::journal.isProcessed() / storeTransaction()).
 
   // OTA helpers (R10A-2: Ed25519 signature verification via Utils::ed25519VerifyHash)
   bool _downloadAndVerifyOta(const String& url, size_t expectedSize,
