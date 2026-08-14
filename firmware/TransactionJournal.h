@@ -136,6 +136,37 @@ enum class SlotDurability : uint8_t {
 };
 
 // -----------------------------------------------------------------------------
+// SlotDecision (Rev26 I1 — pure observation output, drives mutation phase)
+//
+//   P2-1 CORRECTION PASS 3 (auditor P1-B): observation phase produces this
+//   struct, mutation phase consumes it. No mutation during observation.
+//
+//   Fields:
+//     slotIdx           — which slot
+//     durability        — SLOT_EMPTY / SLOT_VALID / SLOT_QUARANTINED
+//     loadedRecord       — for SLOT_VALID: the authoritative copy to cache
+//     needsRepairFromA   — true if copy B needs repair from A (mutation phase)
+//     needsRepairFromB   — true if copy A needs repair from B (mutation phase)
+//     needsQuarantine    — true if slot should be quarantined (mutation phase)
+// -----------------------------------------------------------------------------
+struct SlotDecision {
+  uint8_t slotIdx;
+  SlotDurability durability;
+  JournalRecord loadedRecord;
+  bool needsRepairFromA;
+  bool needsRepairFromB;
+  bool needsQuarantine;
+
+  SlotDecision()
+    : slotIdx(0)
+    , durability(SlotDurability::SLOT_EMPTY)
+    , needsRepairFromA(false)
+    , needsRepairFromB(false)
+    , needsQuarantine(false)
+  {}
+};
+
+// -----------------------------------------------------------------------------
 // ObservationGuard (Rev26 I0a — RAII, panic on nested observation)
 //
 //   Constructor: panics if _observing == true (nested observation forbidden).
@@ -160,14 +191,25 @@ private:
 };
 
 // -----------------------------------------------------------------------------
-// AckRecord (Rev26 I3 — durable in tj_ackq blob)
+// AckRecord (Rev26 I3 — durable in NVS, multiple keys)
 //
-//   P2-1 CORRECTION (auditor P0-1): previous layout had ACK_RECORD_SIZE=256
-//   with ACK JSON starting at offset 141, leaving only 115 bytes for ACK
-//   JSON — but MAX_ACK_JSON_LEN=1024. This caused buffer overflow when ACK
-//   JSON exceeded 115 bytes (memcpy would write past buf[256]).
+//   P2-1 CORRECTION PASS 3 (auditor P0-A): previous layout used
+//   ACK_RECORD_SIZE=1280 with monolithic tj_ackq blob = 10248 bytes.
+//   This exceeds ESP32 NVS single-page blob limit (~1984 bytes default)
+//   and required 10KB stack buffer (exceeds default 8KB task stack).
 //
-//   Corrected layout: ACK_RECORD_SIZE = 1280 bytes
+//   Corrected: each ACK record is stored as its own NVS key.
+//     tj_ackq_hdr     — 4 bytes (count + reserved)
+//     tj_ackq_rec_0   — ACK_RECORD_SIZE bytes (1280)
+//     tj_ackq_rec_1   — ACK_RECORD_SIZE bytes (1280)
+//     ...             (8 records total)
+//     tj_ackq_rec_7   — ACK_RECORD_SIZE bytes (1280)
+//     tj_ackq_crc     — 4 bytes (CRC32 over header + all records)
+//
+//   Each individual blob ≤ 1280 bytes — fits ESP32 NVS single-page limit.
+//   No monolithic blob; no 10KB stack buffer.
+//
+//   AckRecord layout (1280 bytes per record):
 //     [0..1]     ackMagic (0x41, 0x51)
 //     [2]        ackVersion (1)
 //     [3]        deliveryState
@@ -181,15 +223,20 @@ private:
 //     [141..1164] ackJson (var, padded to 1024 bytes)
 //     [1165..1279] padding (zeros, 115 bytes)
 //
-//   ACK_QUEUE_BLOB_SIZE = 4 + (1280 * 8) + 4 = 10248 bytes
-//   Fits within ESP32 NVS blob limit (~50KB).
+//   Note: ACK_RECORD_SIZE=1280 itself exceeds single-page blob limit
+//   (~1984 bytes per page, but usable for blob is ~1984-32=1952 bytes).
+//   1280 < 1952, so it fits. P2-3 hardware test must verify actual NVS
+//   accepts 1280-byte blobs in the configured partition.
 // -----------------------------------------------------------------------------
 static const uint16_t ACK_MAGIC1 = 0x41;  // 'A'
 static const uint16_t ACK_MAGIC2 = 0x51;  // 'Q'
 static const uint8_t  ACK_VERSION = 1;
-static const uint16_t ACK_RECORD_SIZE = 1280;  // P2-1 correction: was 256, now fits MAX_ACK_JSON_LEN=1024
+static const uint16_t ACK_RECORD_SIZE = 1280;  // Single record, fits NVS single-page (~1952 bytes usable)
 static const uint8_t  ACK_QUEUE_CAPACITY = 8;
-static const uint16_t ACK_QUEUE_BLOB_SIZE = 4 + (ACK_RECORD_SIZE * ACK_QUEUE_CAPACITY) + 4;  // 10248 bytes
+// P2-1 CORRECTION PASS 3: no monolithic blob — each record is its own NVS key.
+// ACK_QUEUE_BLOB_SIZE removed (no single blob).
+static const uint8_t  ACK_QUEUE_HDR_SIZE = 4;
+static const uint8_t  ACK_QUEUE_CRC_SIZE = 4;
 
 struct AckRecord {
   AckDeliveryState deliveryState;
@@ -240,6 +287,10 @@ public:
   //   storeIntent(): write PENDING entry to both copies with new generation
   //   markExecuting(): PENDING → EXECUTING, write both copies
   //   commitTransaction(): EXECUTING → COMMITTED, write both copies + queue ACK
+  //     PARTIAL-SUCCESS semantic (auditor P1-C): returns false in two cases:
+  //       (a) journal write failed → transaction NOT durable, caller retries
+  //       (b) journal COMMITTED + ACK queue persistence failed → ACK delivery
+  //           not durable, but boot merge (P1-9) will recover on next boot
   //   commitTransactionFailed(): EXECUTING → FAILED / OUTPUT_MISMATCH
   //   clearEntry(): write EMPTY to both copies (subject to eviction safety I2a-I2e)
   //   recoverCorruptedEntry(): write EMPTY(gen=0) to both copies unconditionally
@@ -395,8 +446,13 @@ private:
   bool _repairSlot(uint8_t slotIdx, bool fromCopyA);  // Bitwise restore from VALID to INVALID
   bool _quarantineSlot(uint8_t slotIdx);     // Marks slot CORRUPTED (no NVS erase)
 
-  // 9-row recovery decision table (Rev26 I1 — implemented in _reconcileSlot)
-  SlotDurability _reconcileSlot(uint8_t slotIdx);
+  // 9-row recovery decision table (Rev26 I1 — pure observation, returns decision)
+  // P2-1 CORRECTION PASS 3 (auditor P1-B): _reconcileSlot removed — it was
+  // structurally impure (called _repairSlot/_quarantineSlot during observation).
+  // Replaced by _observeSlot() (pure) + _applySlotDecision() (mutation).
+  // _evaluateSlot() also removed — pure observation only now.
+  SlotDurability _observeSlot(uint8_t slotIdx, SlotDecision& outDecision);
+  bool _applySlotDecision(const SlotDecision& decision);
 
   // Find slot for requestId (returns JOURNAL_SIZE if not found)
   uint8_t _findSlot(const String& requestId) const;

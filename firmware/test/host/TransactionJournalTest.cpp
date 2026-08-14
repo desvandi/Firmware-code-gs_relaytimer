@@ -437,11 +437,12 @@ static void test_ack_queue_persistence_v2() {
     CHECK_EQ(journal.getPendingAckCount(), (uint8_t)1,
              "ACK queue count == 1 after commitTransaction");
 
-    // Verify tj_ackq exists in NVS
+    // Verify tj_ackq_hdr exists in NVS (multi-key layout, not monolithic blob)
     {
         Preferences prefs;
         prefs.begin("timer12", true);
-        CHECK(prefs.isKey("tj_ackq"), "NVS key tj_ackq exists");
+        CHECK(prefs.isKey("tj_ackq_hdr"), "NVS key tj_ackq_hdr exists (multi-key layout)");
+        CHECK(prefs.isKey("tj_ackq_rec_0"), "NVS key tj_ackq_rec_0 exists");
         prefs.end();
     }
 
@@ -938,11 +939,17 @@ static void test_boot_merge_journal_ack_queue() {
     CHECK_EQ(journal.getPendingAckCount(), (uint8_t)1,
              "ACK queued after commit");
 
-    // Simulate ACK queue loss: clear tj_ackq blob
+    // Simulate ACK queue loss: clear all tj_ackq_* NVS keys
     {
         Preferences prefs;
         prefs.begin("timer12", false);
-        prefs.remove("tj_ackq");
+        prefs.remove("tj_ackq_hdr");
+        prefs.remove("tj_ackq_crc");
+        for (uint8_t i = 0; i < 8; i++) {
+            char key[20];
+            snprintf(key, sizeof(key), "tj_ackq_rec_%u", i);
+            prefs.remove(key);
+        }
         prefs.end();
     }
 
@@ -954,6 +961,45 @@ static void test_boot_merge_journal_ack_queue() {
     // P1-9 fix: _mergeAckQueueFromJournal should have added the missing ACK
     CHECK_EQ(journal.getPendingAckCount(), (uint8_t)1,
              "ACK reconstructed from journal COMMITTED entry on boot merge");
+}
+
+// TEST 25 — Mutation helper invariant REAL (auditor P1-4 follow-up)
+// ============================================================================
+// Auditor noted TEST 19 was structural-only. This test verifies that
+// _loadFromNVS (which uses _observeSlot pure + _applySlotDecision mutation)
+// completes WITHOUT panic when slots need repair. If _repairSlot/_writeCopy
+// were called during observation (guard active), _assertMutationAllowed()
+// would panic. Successful completion proves the 2-phase separation works.
+// ============================================================================
+static void test_mutation_helper_invariant_real() {
+    printf("\n[TEST 25] Mutation helper invariant REAL (P1-4: repair during boot)\n");
+    resetJournal();
+    journal.begin();
+
+    // Create a slot that needs repair (corrupt copy B)
+    journal.storeIntent("req-p1-4-real", "set_state|ch=1|state=on", 1, true, false);
+    {
+        Preferences prefs;
+        prefs.begin("timer12", false);
+        prefs.remove("tj_slot_0_b");  // Force repair A→B on next load
+        prefs.end();
+    }
+
+    // Reload — _loadFromNVS should:
+    //   Phase 1: _observeSlot (pure, guard active) — detects B missing
+    //   Phase 2: _applySlotDecision (mutation, guard NOT active) — calls _repairSlot
+    // If _repairSlot were called during Phase 1, _assertMutationAllowed would panic.
+    journal.~TransactionJournal();
+    new (&journal) TransactionJournal();
+    journal.begin();  // Should complete without panic
+
+    // Verify slot was repaired (Phase 2 mutation succeeded)
+    SlotDurability d = journal._getSlotDurability(0);
+    CHECK(d == SlotDurability::SLOT_VALID,
+          "slot repaired via _applySlotDecision (mutation phase, guard not active)");
+
+    CHECK(journal.isProcessed("req-p1-4-real"),
+          "requestId findable after repair-via-mutation-phase");
 }
 
 // ============================================================================
@@ -999,6 +1045,7 @@ int main() {
     test_ack_persistence_failure_propagation(); // P1-7: failure propagation
     test_retry_state_persistence();           // P1-8: retry state persist
     test_boot_merge_journal_ack_queue();       // P1-9: boot merge
+    test_mutation_helper_invariant_real();    // P1-4: real invariant test
 
     printf("\n==========================================================\n");
     printf("RESULTS: %d passed, %d failed\n", g_passCount, g_failCount);
