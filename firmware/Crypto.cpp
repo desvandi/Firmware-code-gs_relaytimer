@@ -282,16 +282,21 @@ String generateToken(size_t hexChars) {
   return s;
 }
 
-// R10A-2 / R10C-2 (audit round 10C): Ed25519 signature verification for OTA firmware.
+// R10A-2 / R10C-2 / R10D-1 (audit round 10D): Ed25519 signature verification for OTA firmware.
 //
-// ENGINEER AUDIT FIX: Previous implementation used #include <mbedtls/ed25519.h>
-// and mbedtls_ed25519_verify() — but this low-level API was REMOVED in mbedtls 3.x
-// (used by ESP32 Arduino core 3.x). The header likely does NOT exist, causing
-// compile failure.
+// ENGINEER AUDIT FIX HISTORY:
+//   Round 10A: Used mbedtls/ed25519.h (REMOVED in mbedtls 3.x → compile error)
+//   Round 10C: Switched to PSA Crypto API but used WRONG identifiers:
+//              PSA_KEY_TYPE_ED25519_PUBLIC_KEY + PSA_ALG_PURE_ED25519
+//              (these do NOT exist in the PSA standard)
+//   Round 10D: Use CORRECT PSA identifiers per Mbed TLS / PSA spec:
+//              - Key type: PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_TWISTED_EDWARDS)
+//              - Algorithm: PSA_ALG_PURE_EDDSA
+//              - Key bits: 255 (Ed25519 curve size)
 //
-// FIX: Use PSA Crypto API (psa/crypto.h) which IS available in ESP-IDF 5.x
-// (bundled with ESP32 Arduino core 3.x). PSA is the officially supported
-// crypto API for ESP32. Ed25519 is supported via PSA_KEY_TYPE_ED25519_PUBLIC_KEY.
+// Reference: PSA Crypto API specification (Mbed TLS 3.x):
+//   Ed25519 is an ECC key on the Twisted Edwards curve family.
+//   PureEdDSA is the algorithm (no pre-hashing — signs message directly).
 //
 // Signing contract (R10B-1):
 //   signature = ed25519_sign(SHA256(firmware.bin), private_key)
@@ -328,8 +333,7 @@ bool ed25519VerifyHash(const char* publicKeyHex,
     return false;
   }
 
-  // Use PSA Crypto API for Ed25519 verification.
-  // PSA is the officially supported crypto API in ESP-IDF 5.x / Arduino core 3.x.
+  // R10D-1: Use PSA Crypto API with CORRECT identifiers per PSA/Mbed TLS spec.
   #include <psa/crypto.h>
 
   // Initialize PSA (idempotent — safe to call multiple times)
@@ -341,29 +345,36 @@ bool ed25519VerifyHash(const char* publicKeyHex,
     return false;
   }
 
-  // Set up key attributes for Ed25519 public key
+  // R10D-1 FIX: Correct PSA key type for Ed25519.
+  // Ed25519 = ECC on Twisted Edwards curve family, 255 bits.
+  // Previous code used PSA_KEY_TYPE_ED25519_PUBLIC_KEY which does NOT exist
+  // in the PSA standard — it would cause a compile error.
   psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
-  psa_set_key_type(&attrs, PSA_KEY_TYPE_ED25519_PUBLIC_KEY);
+  psa_set_key_type(&attrs,
+    PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_TWISTED_EDWARDS));
+  psa_set_key_bits(&attrs, 255);  // Ed25519 curve size
   psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_VERIFY_MESSAGE);
-  psa_set_key_algorithm(&attrs, PSA_ALG_PURE_ED25519);
+  // R10D-1 FIX: Correct algorithm identifier is PSA_ALG_PURE_EDDSA,
+  // NOT PSA_ALG_PURE_ED25519 (which does not exist in PSA standard).
+  psa_set_key_algorithm(&attrs, PSA_ALG_PURE_EDDSA);
 
   // Import the public key
   psa_key_id_t key_id = 0;
   status = psa_import_key(&attrs, publicKey, 32, &key_id);
   if (status != PSA_SUCCESS) {
     Serial.printf("[Ed25519] psa_import_key failed: %d\n", (int)status);
-    Serial.println("[Ed25519] If PSA_KEY_TYPE_ED25519_PUBLIC_KEY is not defined,");
+    Serial.println("[Ed25519] If PSA_ECC_FAMILY_TWISTED_EDWARDS is not defined,");
     Serial.println("[Ed25519]   Ed25519 is not compiled into this ESP32 mbedtls config.");
     Serial.println("[Ed25519]   Enable via menuconfig → Component config → mbedTLS →");
-    Serial.println("[Ed25519]   Curve25519/Curve448 (enable ED25519).");
+    Serial.println("[Ed25519]   Elliptic Curve DH/DSA (enable ED25519).");
     memset(publicKey, 0, sizeof(publicKey));
     memset(signature, 0, sizeof(signature));
     return false;
   }
 
-  // Verify the signature over the SHA-256 hash (passed as "message")
-  // PSA_ALG_PURE_ED25519 signs the message directly — we pass the 32-byte hash.
-  status = psa_verify_message(key_id, PSA_ALG_PURE_ED25519,
+  // R10D-1 FIX: Verify using PSA_ALG_PURE_EDDSA (not PSA_ALG_PURE_ED25519).
+  // PSA_ALG_PURE_EDDSA signs the message directly — we pass the 32-byte SHA-256 hash.
+  status = psa_verify_message(key_id, PSA_ALG_PURE_EDDSA,
                                hashBytes, hashLen,
                                signature, 64);
 
@@ -377,7 +388,7 @@ bool ed25519VerifyHash(const char* publicKeyHex,
     return false;
   }
 
-  Serial.println("[Ed25519] Signature verified OK (PSA Crypto)");
+  Serial.println("[Ed25519] Signature verified OK (PSA Crypto, PureEdDSA)");
   return true;
 }
 

@@ -58,6 +58,9 @@ private:
   unsigned long _lastPublishMs = 0;
   unsigned long _lastReconnectMs = 0;
   bool _initialized = false;
+  // R10D-2: Last ACK JSON published (stored for dedup buffer replay).
+  // Set by ACK publishers before _addProcessed is called.
+  String _lastAckJson;
 
   bool _connect();
   void _onMessage(char* topic, byte* payload, unsigned int length);
@@ -65,24 +68,22 @@ private:
   void _handleOta(const String& json);
 
   // Generic ACK publisher — accepts optional data JSON string.
-  // Used for ALL mutation ACKs (relay, schedule, pir, channel, time, system, config, ota).
   void _publishAck(const String& requestId, bool success, const char* message,
                    const String& dataJson = "");
 
   // Relay-specific ACK: looks up actual state and includes it in data.
-  // Used for both first-execution and duplicate ACKs (P0 #2 — audit round 9).
   void _publishRelayAck(const String& requestId, bool success, const char* message,
                         uint8_t channelId);
 
-  // Schedule ACK: includes the schedule object that was upserted/deleted.
+  // Schedule ACK
   void _publishScheduleAck(const String& requestId, bool success, const char* message,
                            int channelId, int scheduleId);
 
-  // PIR ACK: includes the PIR state after config/test.
+  // PIR ACK
   void _publishPirAck(const String& requestId, bool success, const char* message,
                       uint8_t pirId);
 
-  // Channel ACK: includes the renamed channel.
+  // Channel ACK
   void _publishChannelAck(const String& requestId, bool success, const char* message,
                           uint8_t channelId);
 
@@ -92,7 +93,14 @@ private:
 
   void _buildTopics();
   bool _isDuplicate(const String& requestId);
-  void _addProcessed(const String& requestId, const String& commandHash = "");
+  // R10D-2: _addProcessed now stores ackResultJson for duplicate replay.
+  void _addProcessed(const String& requestId, const String& commandHash = "",
+                     const String& ackResultJson = "");
+
+  // R10D-2: Helper that publishes ACK to MQTT + stores it for duplicate replay.
+  // All ACK publishers should call this instead of publishing directly.
+  void _publishAndStoreAck(const String& requestId, const String& ackJson,
+                           const String& commandHash);
 
   // OTA helpers (R10A-2: Ed25519 signature verification via Utils::ed25519VerifyHash)
   bool _downloadAndVerifyOta(const String& url, size_t expectedSize,

@@ -330,6 +330,21 @@ void MqttClient::publishLog(Core::LogType type, const String& message, int8_t ch
   _mqtt.publish(_topicLog.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
 }
 
+// R10D-2: Helper that publishes ACK JSON to MQTT + stores it in dedup buffer
+// for duplicate replay. Called by all ACK publishers after constructing the JSON.
+void MqttClient::_publishAndStoreAck(const String& requestId, const String& ackJson,
+                                      const String& commandHash) {
+  if (!_mqtt.connected() || requestId.length() == 0) return;
+  _mqtt.publish(_topicAck.c_str(), (const uint8_t*)ackJson.c_str(),
+                ackJson.length(), false);
+  // Store for duplicate replay (R10D-2)
+  if (commandHash.length() > 0) {
+    _addProcessed(requestId, commandHash, ackJson);
+  }
+  Serial.printf("[MQTT ACK] %s: published + stored (%d bytes)\n",
+                requestId.c_str(), ackJson.length());
+}
+
 // ---------------------------------------------------------------------------
 // Publish command ACK — ESP32 confirms command was received and executed.
 // PWA subscribes to ack topic and waits for confirmation.
@@ -344,6 +359,10 @@ void MqttClient::publishLog(Core::LogType type, const String& message, int8_t ch
 // P1 #11 (audit round 9): ALL mutation types now send ACK with type-specific
 // data. PWA transaction layer can update cache deterministically for every
 // mutation, not just relay.
+//
+// R10D-2 (audit round 10D): ACK JSON is now stored in dedup buffer for
+// verbatim replay on duplicate commands (instead of reconstructing from
+// command params, which lost actual results like scheduleId).
 // ---------------------------------------------------------------------------
 void MqttClient::_publishAck(const String& requestId, bool success, const char* message,
                               const String& dataJson) {
@@ -370,6 +389,7 @@ void MqttClient::_publishAck(const String& requestId, bool success, const char* 
 
   String json;
   serializeJson(doc, json);
+  _lastAckJson = json;  // R10D-2: store for dedup replay
   _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
   Serial.printf("[MQTT ACK] %s: %s\n", requestId.c_str(), success ? "OK" : "FAIL");
 }
@@ -401,6 +421,7 @@ void MqttClient::_publishRelayAck(const String& requestId, bool success, const c
 
   String json;
   serializeJson(doc, json);
+  _lastAckJson = json;  // R10D-2: store for dedup replay
   _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
   Serial.printf("[MQTT ACK] %s: %s (relay CH%d)\n", requestId.c_str(),
                 success ? "OK" : "FAIL", channelId);
@@ -425,6 +446,7 @@ void MqttClient::_publishScheduleAck(const String& requestId, bool success, cons
 
   String json;
   serializeJson(doc, json);
+  _lastAckJson = json;  // R10D-2: store for dedup replay
   _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
   Serial.printf("[MQTT ACK] %s: %s (schedule CH%d id=%d)\n", requestId.c_str(),
                 success ? "OK" : "FAIL", channelId, scheduleId);
@@ -454,6 +476,7 @@ void MqttClient::_publishPirAck(const String& requestId, bool success, const cha
 
   String json;
   serializeJson(doc, json);
+  _lastAckJson = json;  // R10D-2: store for dedup replay
   _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
   Serial.printf("[MQTT ACK] %s: %s (pir %d)\n", requestId.c_str(),
                 success ? "OK" : "FAIL", pirId);
@@ -479,6 +502,7 @@ void MqttClient::_publishChannelAck(const String& requestId, bool success, const
 
   String json;
   serializeJson(doc, json);
+  _lastAckJson = json;  // R10D-2: store for dedup replay
   _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
   Serial.printf("[MQTT ACK] %s: %s (channel CH%d)\n", requestId.c_str(),
                 success ? "OK" : "FAIL", channelId);
@@ -547,26 +571,21 @@ void MqttClient::_handleCommand(const String& json) {
       return;
     }
 
-    // True duplicate — re-ACK with actual state (P0 #2)
-    Serial.printf("[MQTT] Duplicate command detected: %s — re-ACKing with actual state\n", requestId.c_str());
+    // True duplicate — re-ACK with ORIGINAL result (R10D-2 fix).
+    // R10D-2: Instead of reconstructing ACK from command params (which lost
+    // actual execution results like scheduleId), replay the ORIGINAL ACK JSON
+    // that was stored when the command first executed successfully.
+    Serial.printf("[MQTT] Duplicate command detected: %s — replaying original ACK\n", requestId.c_str());
 
-    if (strcmp(type, "relay") == 0) {
-      int channelId = doc["channelId"] | 0;
-      if (channelId >= 1 && channelId <= Core::NUM_CHANNELS) {
-        _publishRelayAck(requestId, true, "Duplicate command (already executed)", channelId);
-      } else {
-        _publishAck(requestId, true, "Duplicate command (already executed)");
-      }
-    } else if (strcmp(type, "schedule") == 0) {
-      int channelId = doc["channelId"] | 0;
-      _publishScheduleAck(requestId, true, "Duplicate command (already executed)", channelId, 0);
-    } else if (strcmp(type, "pir") == 0) {
-      int id = doc["id"] | 0;
-      _publishPirAck(requestId, true, "Duplicate command (already executed)", id);
-    } else if (strcmp(type, "channel") == 0) {
-      int channelId = doc["channelId"] | 0;
-      _publishChannelAck(requestId, true, "Duplicate command (already executed)", channelId);
+    String originalAckJson = _getAckResultForRequestId(requestId);
+    if (originalAckJson.length() > 0) {
+      // Replay the exact ACK JSON that was sent originally
+      _mqtt.publish(_topicAck.c_str(), (const uint8_t*)originalAckJson.c_str(),
+                    originalAckJson.length(), false);
+      Serial.printf("[MQTT ACK] %s: replayed original ACK (%d bytes)\n",
+                    requestId.c_str(), originalAckJson.length());
     } else {
+      // Fallback: if original ACK not found (shouldn't happen), send generic
       _publishAck(requestId, true, "Duplicate command (already executed)");
     }
     return;
@@ -582,6 +601,67 @@ void MqttClient::_handleCommand(const String& json) {
       _publishAck(requestId, false, "Invalid command type");
     }
     return;
+  }
+
+  // R10D-3 (audit round 10D): Unknown-field rejection.
+  // Each command type has a FIXED set of allowed fields. Any field outside
+  // this whitelist → command REJECTED (not silently ignored).
+  // This prevents attacker from injecting extra fields that might affect
+  // execution but don't appear in commandHash.
+  {
+    JsonObject obj = doc.as<JsonObject>();
+    bool hasUnknownField = false;
+    String unknownFields = "";
+
+    for (JsonPair kv : obj) {
+      String key = kv.key().c_str();
+      bool allowed = false;
+
+      // Common allowed fields (all command types)
+      if (key == "type" || key == "action" || key == "requestId") {
+        allowed = true;
+      }
+      // Per-type allowed fields
+      else if (strcmp(type, "relay") == 0) {
+        if (key == "channelId" || key == "mode" || key == "manualState") allowed = true;
+      }
+      else if (strcmp(type, "schedule") == 0) {
+        if (key == "channelId" || key == "id" || key == "onTime" ||
+            key == "offTime" || key == "dayMask" || key == "enabled") allowed = true;
+      }
+      else if (strcmp(type, "pir") == 0) {
+        if (key == "id" || key == "enabled" || key == "holdTime") allowed = true;
+      }
+      else if (strcmp(type, "channel") == 0) {
+        if (key == "channelId" || key == "name") allowed = true;
+      }
+      else if (strcmp(type, "time") == 0) {
+        if (key == "datetime") allowed = true;
+      }
+      else if (strcmp(type, "system") == 0) {
+        // system: action only (no extra fields)
+      }
+      else if (strcmp(type, "config") == 0) {
+        if (key == "deviceName" || key == "timezone") allowed = true;
+      }
+
+      if (!allowed) {
+        hasUnknownField = true;
+        if (unknownFields.length() > 0) unknownFields += ", ";
+        unknownFields += key;
+      }
+    }
+
+    if (hasUnknownField) {
+      String msg = "Unknown fields rejected: " + unknownFields;
+      Serial.printf("[MQTT] %s\n", msg.c_str());
+      Services::Log.append(Core::LogType::AuthFail,
+        "SECURITY: Command rejected — unknown fields: " + unknownFields, 0);
+      if (requestId.length() > 0) {
+        _publishAck(requestId, false, msg.c_str());
+      }
+      return;  // no _addProcessed — command rejected
+    }
   }
 
   // ===========================================================================
@@ -1034,13 +1114,29 @@ void MqttClient::_handleOta(const String& json) {
     return;
   }
 
+  // R10D-4 (audit round 10D): Strict SemVer validation.
+  // Must be exactly X.Y.Z (no extra chars like "4.1.0-beta" or "4.1.0.1").
+  // sscanf with %d.%d.%d would accept "4.1.0foo" — we verify entire string consumed.
   int newMajor, newMinor, newPatch;
   int curMajor, curMinor, curPatch;
-  if (sscanf(version, "%d.%d.%d", &newMajor, &newMinor, &newPatch) != 3) {
+  char extraChar;
+  int scanResult = sscanf(version, "%d.%d.%d%c", &newMajor, &newMinor, &newPatch, &extraChar);
+  // scanResult == 3 means exactly X.Y.Z with no trailing chars.
+  // scanResult == 4 means there was extra junk after X.Y.Z → reject.
+  if (scanResult != 3) {
     Services::Log.append(Core::LogType::Error,
-      String("OTA: invalid version format (must be X.Y.Z): ") + version, 0);
+      String("OTA: invalid version format (must be X.Y.Z exactly, got: ") + version + ")", 0);
     if (requestId.length() > 0) {
-      _publishAck(requestId, false, "OTA: invalid version format (must be X.Y.Z)");
+      _publishAck(requestId, false, "OTA: invalid version format (must be X.Y.Z exactly)");
+    }
+    return;
+  }
+  // Additional validation: each component must be non-negative and reasonable
+  if (newMajor < 0 || newMinor < 0 || newPatch < 0 || newMajor > 999 || newMinor > 999 || newPatch > 999) {
+    Services::Log.append(Core::LogType::Error,
+      String("OTA: version components out of range: ") + version, 0);
+    if (requestId.length() > 0) {
+      _publishAck(requestId, false, "OTA: version components out of range (0-999)");
     }
     return;
   }
@@ -1289,21 +1385,25 @@ bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
 
 // ---------------------------------------------------------------------------
 // Request deduplication — prevent double-execution of retried commands
-// Uses a ring buffer of last 64 requestIds + commandHashes.
+// Uses a ring buffer of last 64 requestIds + commandHashes + ACK results.
 //
-// R10A-3 / R10C-4 (audit round 10C): Buffer increased from 16 to 64.
-// Engineer note: 16 is sufficient for normal retries, but not for long-term
-// replay protection. 64 gives ~64 commands of history (at 1 command/sec,
-// that's ~1 minute of replay window). For production, this should be paired
-// with broker ACL (attacker can't publish freely) + requestId TTL.
+// R10A-3 / R10C-4 / R10D-2 (audit round 10D):
+//   - Buffer size: 64 (increased from 16 in R10C-4)
+//   - Stores: requestId, commandHash, commandType, ackResultJson
+//   - On duplicate:
+//     - Same requestId + same commandHash → re-publish ORIGINAL ACK result
+//       (not reconstructed — preserves actual execution result like scheduleId)
+//     - Same requestId + DIFFERENT commandHash → reject "requestId reuse"
 //
-// R10A-3: Dedup binds requestId to command fingerprint.
-// - Same requestId + same commandHash → re-ACK original result (true duplicate)
-// - Same requestId + DIFFERENT commandHash → reject "requestId reuse"
+// R10D-2 FIX: Previous code reconstructed duplicate ACK from command params,
+// which lost the actual execution result (e.g., schedule upsert returned
+// scheduleId=0 on duplicate instead of the real saved scheduleId).
+// Now we store the full ACK JSON and replay it verbatim on duplicate.
 // ---------------------------------------------------------------------------
 #define DEDUP_BUFFER_SIZE 64
 static String _processedIds[DEDUP_BUFFER_SIZE];
-static String _processedHashes[DEDUP_BUFFER_SIZE];  // R10A-3: command hash per requestId
+static String _processedHashes[DEDUP_BUFFER_SIZE];
+static String _processedAckResults[DEDUP_BUFFER_SIZE];  // R10D-2: original ACK JSON
 static uint8_t _dedupIdx = 0;
 
 bool MqttClient::_isDuplicate(const String& requestId) {
@@ -1314,8 +1414,6 @@ bool MqttClient::_isDuplicate(const String& requestId) {
 }
 
 // R10A-3: Find the commandHash associated with a previously-seen requestId.
-// Returns empty string if requestId not found (shouldn't happen if _isDuplicate
-// was called first).
 String _getHashForRequestId(const String& requestId) {
   for (uint8_t i = 0; i < DEDUP_BUFFER_SIZE; i++) {
     if (_processedIds[i] == requestId) return _processedHashes[i];
@@ -1323,10 +1421,29 @@ String _getHashForRequestId(const String& requestId) {
   return "";
 }
 
-void MqttClient::_addProcessed(const String& requestId, const String& commandHash) {
+// R10D-2: Get the ORIGINAL ACK result JSON for a previously-processed requestId.
+// Returns empty string if not found.
+String _getAckResultForRequestId(const String& requestId) {
+  for (uint8_t i = 0; i < DEDUP_BUFFER_SIZE; i++) {
+    if (_processedIds[i] == requestId) return _processedAckResults[i];
+  }
+  return "";
+}
+
+// R10D-2: _addProcessed now also stores the ACK result JSON.
+// If ackResultJson is empty, uses _lastAckJson (set by ACK publishers).
+// Called AFTER successful execution + AFTER ACK is published.
+void MqttClient::_addProcessed(const String& requestId, const String& commandHash,
+                                const String& ackResultJson) {
+  String ackJson = ackResultJson;
+  if (ackJson.length() == 0) {
+    ackJson = _lastAckJson;  // R10D-2: use last published ACK JSON
+  }
   _processedIds[_dedupIdx] = requestId;
   _processedHashes[_dedupIdx] = commandHash;
+  _processedAckResults[_dedupIdx] = ackJson;
   _dedupIdx = (_dedupIdx + 1) % DEDUP_BUFFER_SIZE;
+  _lastAckJson = "";  // clear for next command
 }
 
 // R10A-3 / R10C-1 (audit round 10C): Compute a deterministic command fingerprint.
