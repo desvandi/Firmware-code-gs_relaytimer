@@ -1,3 +1,16 @@
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  Superseded by Rev18 for: ACK cleanup predicate, retryCount definition,  ║ -->
+<!-- ║  ACK re-publication invariant.                                            ║ -->
+<!-- ║  Refer to:                                                ║ -->
+<!-- ║    - CYCLE-8C-REV18-CLEANUP-BOUNDARY-SWEEP.md              ║ -->
+<!-- ║  for the authoritative supplement.                          ║ -->
+<!-- ║  Rev17 remains authoritative for verification ordering and retry phases.  ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
 # CYCLE-8C-Rev17: Transaction Journal v4 — ACK Semantics Closure
 
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
