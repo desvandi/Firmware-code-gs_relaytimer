@@ -1313,6 +1313,50 @@ void MqttClient::_handleOta(const String& json) {
   // canonical fields: url, version, size, sha256, signature.
   String commandHash = _computeCommandHash(doc);
 
+  // CYCLE-7 (fixes I-004): OTA commands now go through TransactionJournal for
+  //   dedup, just like regular commands. Previously _onMessage() routed OTA
+  //   directly to _handleOta(), bypassing journal.isProcessed() / storeIntent().
+  //   A replayed OTA command would trigger a fresh HTTPS download + flash write.
+  //   Now: check journal first, store intent before download.
+  if (requestId.length() > 0) {
+    if (Services::journal.isProcessed(requestId)) {
+      String previousHash = Services::journal.getCommandHash(requestId);
+      if (previousHash.length() > 0 && previousHash != commandHash) {
+        Serial.printf("[OTA] SECURITY: requestId reuse with different command! rid=%s\n", requestId.c_str());
+        Services::Log.append(Core::LogType::AuthFail,
+          "SECURITY: OTA requestId reuse with different command: " + requestId, 0);
+        _publishAck(requestId, false, "requestId reuse with different command — rejected");
+        return;
+      }
+
+      if (Services::journal.isCommitted(requestId)) {
+        Serial.printf("[OTA] Duplicate (COMMITTED): %s — replaying original ACK\n", requestId.c_str());
+        String originalAckJson = Services::journal.getAckJson(requestId);
+        if (originalAckJson.length() > 0) {
+          Services::journal.queueAck(requestId, originalAckJson);
+        } else {
+          _publishAck(requestId, true, "Duplicate OTA command (already executed)");
+        }
+      } else {
+        // PENDING — OTA was in-flight during crash. Don't re-download.
+        Serial.printf("[OTA] Duplicate (PENDING): %s — OTA in-progress, returning in-progress ACK\n",
+                      requestId.c_str());
+        _publishAck(requestId, true, "OTA command already received (in-progress). Wait and retry if needed.");
+      }
+      return;
+    }
+
+    // Store intent BEFORE download (prevents duplicate downloads on retry).
+    // Note: OTA is non-idempotent (writes to flash), so PENDING state is
+    // especially important here — re-download would waste flash write cycles.
+    if (!Services::journal.storeIntent(requestId, commandHash)) {
+      Serial.printf("[OTA] FATAL: storeIntent failed for rid=%s — refusing to download\n", requestId.c_str());
+      _publishAck(requestId, false,
+        "DURABILITY_FAILURE: cannot store OTA transaction intent — please retry");
+      return;
+    }
+  }
+
   if (strcmp(action, "update") != 0) {
     if (requestId.length() > 0) {
       _publishAck(requestId, false, "Invalid OTA action (use update)");

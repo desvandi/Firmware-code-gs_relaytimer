@@ -262,7 +262,11 @@ bool AuthManager::login(const String& user, const String& pass,
 
   // Issue access token (15min)
   outAccessToken = Utils::jwtSign(user, Core::jwtSecret, Core::JWT_ACCESS_TTL_SECONDS);
-  outAccessExp = (uint32_t)(millis() / 1000) + Core::JWT_ACCESS_TTL_SECONDS;
+  // CYCLE-7 (fixes I-001): expiresAt must be unix epoch seconds, NOT uptime.
+  //   Previous: (millis()/1000) + TTL — millis() is uptime since boot.
+  //   PWA compared this to Date.now()/1000 and always saw 'expired'.
+  //   Now: use rtc.getUnixTime() to match the JWT's internal `exp` claim.
+  outAccessExp = Drivers::rtc.getUnixTime() + Core::JWT_ACCESS_TTL_SECONDS;
 
   // R10B-5: Issue refresh token (7day, one-time use, stored in NVS)
   outRefreshToken = _generateRefreshToken();
@@ -291,7 +295,8 @@ bool AuthManager::refreshTokens(const String& refreshToken,
   // Issue new access token
   String username = Core::userConfig.wwwUser;  // single-user system
   outAccessToken = Utils::jwtSign(username, Core::jwtSecret, Core::JWT_ACCESS_TTL_SECONDS);
-  outAccessExp = (uint32_t)(millis() / 1000) + Core::JWT_ACCESS_TTL_SECONDS;
+  // CYCLE-7 (fixes I-001): expiresAt must be unix epoch seconds, NOT uptime.
+  outAccessExp = Drivers::rtc.getUnixTime() + Core::JWT_ACCESS_TTL_SECONDS;
 
   // Issue new refresh token (rotated)
   outRefreshToken = _generateRefreshToken();
