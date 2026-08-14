@@ -1,8 +1,9 @@
 # Timer Digital Relay v4.0 — Firmware + Google Apps Script
 
-> ESP32-WROOM-32 firmware (12-channel relay + 4 PIR + DS3231 RTC + PZEM-004T v3.0 power meter) and the Google Apps Script that bridges ESP32 logs to Gemini AI for energy insights.
+> ESP32-WROOM-32 firmware for 12-channel relay control + 4 PIR sensors + DS3231 RTC + PZEM-004T v3.0 power meter, with NVS-persisted transaction journal, Ed25519-signed OTA, and Google Apps Script AI insights pipeline.
 
 [![Firmware Version](https://img.shields.io/badge/firmware-v4.0.0-blue)](#)
+[![Security Audit](https://img.shields.io/badge/audit-round%2010K-brightgreen)](#security-audit-history)
 [![ESP32 Core](https://img.shields.io/badge/ESP32%20core-3.3.7-green)](#)
 [![License](https://img.shields.io/badge/license-proprietary-lightgrey)](#)
 
@@ -10,398 +11,762 @@ This repo holds the **device-side code** for the Timer Digital Relay v4.0 system
 
 ---
 
+## Table of Contents
+
+1. [Repository Layout](#repository-layout)
+2. [Architecture Overview](#architecture-overview)
+3. [Security Architecture (Rounds 9–10K)](#security-architecture-rounds-910k)
+4. [Production Deployment Guide](#production-deployment-guide)
+   - [Step 1: Generate Ed25519 Signing Keys](#step-1-generate-ed25519-signing-keys)
+   - [Step 2: Deploy Mosquitto MQTT Broker](#step-2-deploy-mosquitto-mqtt-broker)
+   - [Step 3: Deploy Google Apps Script](#step-3-deploy-google-apps-script)
+   - [Step 4: Configure Firmware (Config.h)](#step-4-configure-firmware-configh)
+   - [Step 5: Compile with PRODUCTION_BUILD Flag](#step-5-compile-with-production_build-flag)
+   - [Step 6: Flash + First Boot](#step-6-flash--first-boot)
+   - [Step 7: Connect PWA](#step-7-connect-pwa)
+5. [Development Setup (Quick Start)](#development-setup-quick-start)
+6. [Hardware Wiring](#hardware-wiring)
+7. [Firmware Subsystems](#firmware-subsystems)
+8. [OTA Firmware Update (Signed)](#ota-firmware-update-signed)
+9. [API Contract](#api-contract)
+10. [Power-Loss Test Plan](#power-loss-test-plan)
+11. [Security Audit History](#security-audit-history)
+12. [Known Limitations](#known-limitations)
+13. [Troubleshooting](#troubleshooting)
+
+---
+
 ## Repository Layout
 
 ```
 Firmware-code-gs_relaytimer/
-├── firmware/                       ← ESP32 Arduino sketch (53 files, flat layout)
-│   ├── firmware_v4.ino             ← main entry (setup + loop)
-│   ├── platformio.ini              ← PlatformIO config (optional — Arduino IDE also works)
-│   ├── Config.h                    ← all compile-time constants (pins, broker, GAS URL, etc.)
-│   ├── Types.h, Globals.h, Common.h
-│   ├── RelayDriver.{cpp,h}         ← 12-channel active-LOW relay (boot glitch fix)
-│   ├── PirDriver.{cpp,h}           ← 4× HC-SR501 (3-sample debounce, stuck detect)
-│   ├── RtcDriver.{cpp,h}           ← DS3231 over I2C (400 kHz Fast Mode)
-│   ├── PzemDriver.{cpp,h}          ← PZEM-004T v3.0 self-contained Modbus-RTU
-│   ├── WifiManager.{cpp,h}         ← AP+STA, password derived from MAC
-│   ├── MqttClient.{cpp,h}          ← MQTT remote control (TLS, ACK, dedup, LWT)
-│   ├── HttpServer.{cpp,h}          ← REST API (22 routes) + CORS
-│   ├── AuthManager.{cpp,h}         ← JWT (HS256), CSRF, rate limiter, factory-reset tokens
-│   ├── OtaManager.{cpp,h}          ← Update library + GitHub Release check (stub)
-│   ├── Scheduler.{cpp,h}           ← Schedule evaluation (overnight + dayMask)
-│   ├── RelayEngine.{cpp,h}         ← Priority: Manual > PIR > Schedule > Off
-│   ├── LogService.{cpp,h}          ← Activity log (JSON-lines) + audit log (plain text)
-│   ├── ConfigStore.{cpp,h}         ← User config + Schedule + Device config (CRC + backup)
-│   ├── FileSystem.{cpp,h}          ← LittleFS wrapper (mount, atomic write)
-│   ├── Crypto.{cpp,h}              ← SHA-256, PBKDF2, HMAC-SHA256, JWT, base64url
-│   ├── Crc.{cpp,h}                 ← CRC-32 (zlib polynomial)
-│   ├── Json.{cpp,h}                ← ArduinoJson helpers, parseMinutes, password strength
-│   ├── Advisor.{cpp,h}             ← GAS integration (hourly POST logs → Gemini insights)
-│   └── *Handlers.h                 ← 22 REST route handlers (one header per resource)
+├── firmware/                           ← ESP32 Arduino sketch (55 files, flat layout)
+│   ├── firmware_v4.ino                 ← main entry (setup + loop)
+│   ├── platformio.ini                  ← PlatformIO config (optional)
+│   ├── Config.h                        ← ALL compile-time constants (edit this!)
+│   │
+│   ├── ── Transaction Layer (R10G-R10K) ──
+│   ├── TransactionJournal.h            ← NVS-persisted transaction journal
+│   ├── TransactionJournal.cpp          ← CRC32 + magic + two-phase commit
+│   │
+│   ├── ── Network ──
+│   ├── MqttClient.h                    ← MQTT client + ACK transaction + dedup
+│   ├── MqttClient.cpp                  ← TLS, Ed25519 OTA, all mutation ACK
+│   ├── WifiManager.h                   ← AP+STA, Config Portal
+│   ├── WifiManager.cpp                 ← NVS credential generation (MQTT pass, GAS secret)
+│   ├── HttpServer.h                    ← REST API server (22 routes)
+│   ├── HttpServer.cpp                  ← CORS, security headers, route registration
+│   ├── Common.h                        ← Shared CORS + JSON helpers
+│   │
+│   ├── ── Auth ──
+│   ├── AuthManager.h                   ← JWT + CSRF + refresh token rotation
+│   ├── AuthManager.cpp                 ← NVS-backed refresh tokens, rate limiter
+│   ├── AuthHandlers.h                  ← /api/login, /api/logout, /api/refresh, /api/session
+│   │
+│   ├── ── OTA ──
+│   ├── OtaManager.h                    ← Boot health check + rollback
+│   ├── OtaManager.cpp                  ← esp_ota_mark_app_invalid_rollback_and_restart()
+│   ├── OtaHandlers.h                   ← REST /api/ota upload handler
+│   │
+│   ├── ── Drivers ──
+│   ├── RelayDriver.{cpp,h}             ← 12-channel active-LOW relay
+│   ├── PirDriver.{cpp,h}               ← 4× HC-SR501 PIR (debounce, stuck detect)
+│   ├── RtcDriver.{cpp,h}               ← DS3231 RTC (I2C 400kHz)
+│   ├── PzemDriver.{cpp,h}              ← PZEM-004T v3.0 (self-contained Modbus-RTU)
+│   │
+│   ├── ── Services ──
+│   ├── RelayEngine.{cpp,h}             ← Priority: Manual > PIR > Schedule > Off
+│   ├── Scheduler.{cpp,h}               ← Schedule evaluation (overnight + dayMask)
+│   ├── LogService.{cpp,h}              ← Activity log (JSON-lines) + audit log
+│   ├── Advisor.{cpp,h}                 ← GAS integration (hourly POST → Gemini)
+│   │
+│   ├── ── Storage ──
+│   ├── ConfigStore.{cpp,h}             ← LittleFS persistence + NVS (JWT secret, refresh tokens)
+│   ├── FileSystem.{cpp,h}              ← LittleFS wrapper
+│   │
+│   ├── ── Crypto ──
+│   ├── Crypto.{cpp,h}                  ← SHA-256, PBKDF2, HMAC, JWT, Ed25519 (PSA Crypto API)
+│   ├── Crc.{cpp,h}                     ← CRC-32 (zlib)
+│   ├── Json.{cpp,h}                    ← ArduinoJson helpers
+│   │
+│   ├── ── REST Handlers (12 files) ──
+│   ├── *Handlers.h                     ← 22 route handlers (one header per resource)
+│   │
+│   └── Types.h, Globals.h              ← Data structures + global state
 │
 ├── code.gs/
-│   └── Code.gs                     ← Google Apps Script (ESP32 → Gemini AI insights)
+│   └── Code.gs                         ← Google Apps Script (HMAC + Gemini)
 │
-└── README.md                       ← this file
+├── scripts/
+│   └── sign_firmware.py                ← Ed25519 signing tool (generate keys + sign firmware)
+│
+├── TEST_PLAN.md                        ← 12 power-loss acceptance tests
+└── README.md                           ← this file
 ```
 
-The firmware uses a **flat layout** (all `.cpp`/`.h` files at the root of `firmware/`) so it works with both the Arduino IDE (which auto-discovers `.ino` + same-folder sources) and PlatformIO. There is **no nested `src/` directory** because Arduino IDE does not scan subfolders by default — keeping everything flat avoids missing-include errors.
+The firmware uses a **flat layout** (all `.cpp`/`.h` files at root of `firmware/`) so it works with both Arduino IDE (auto-discovers `.ino` + same-folder sources) and PlatformIO. There is **no nested `src/` directory**.
 
 ---
 
 ## Architecture Overview
 
 ```
-                          ┌───────────────────────────┐
-                          │  ESP32-WROOM-32 (this repo)│
-                          │                           │
-   PIR 1-4 ─── GPIO 34-39 │  RelayEngine             │ ── GPIO 13,14,16-23,25-27 ──→ Relay 1-12
-   DS3231 ──── I2C (32,33) │  Scheduler               │
-   PZEM-004T ─ UART2 (4,5) │  AuthManager (JWT/CSRF)  │
-                          │  PzemDriver (Modbus-RTU)  │
-                          │  Advisor (GAS pipeline)   │
-                          └─────────┬────────┬────────┘
-                                    │        │
-                          REST (80) │        │ MQTT (1883/8883)
-                                    │        │
-                       ┌────────────┘        └─────────────┐
-                       │                                    │
-              ┌────────▼─────────┐               ┌──────────▼──────────┐
-              │ Cloudflare Tunnel │               │  MQTT Broker        │
-              │ (optional, LAN)   │               │  (HiveMQ public or  │
-              └────────┬─────────┘               │   self-hosted w/TLS)│
-                       │                          └──────────┬──────────┘
-              ┌────────▼─────────┐                            │
-              │  PWA on Vercel   │◄───────────────────────────┘
-              │  (Remote-Relay)  │       WSS (8884) for PWA
-              └──────────────────┘
-                       ▲
-                       │ HTTPS (hourly POST logs)
-              ┌────────┴─────────┐
-              │ Google Apps Script│
-              │   (Code.gs)       │
-              └────────┬─────────┘
-                       │ HTTPS
-              ┌────────▼─────────┐
-              │  Gemini API       │
-              │  (AI insights)    │
+                          ┌─────────────────────────────────────────┐
+                          │     ESP32-WROOM-32 (this repo)           │
+                          │                                         │
+   PIR 1-4 ─── GPIO 34-39 │  TransactionJournal (NVS, CRC32, 2PC)  │
+   DS3231 ──── I2C (32,33) │  MqttClient (TLS, ACK, Ed25519 OTA)    │
+   PZEM-004T ─ UART2 (4,5) │  AuthManager (JWT 15min + refresh 7d)  │
+                          │  RelayEngine (Manual>PIR>Schedule>Off)  │
+                          │  PzemDriver (Modbus-RTU, self-contained) │
+                          │  Advisor (GAS HMAC → Gemini)            │
+                          │  OtaManager (boot health + rollback)    │
+                          └────────┬──────────┬──────────┬─────────┘
+                                   │          │          │
+                         REST (80) │          │ MQTT     │ HTTPS (hourly)
+                                   │          │ 8883/TLS │ + HMAC
+                       ┌───────────┘          │          └──────────┐
+                       │                      │                     │
+              ┌────────▼─────────┐   ┌────────▼────────┐   ┌────────▼────────┐
+              │ Cloudflare Tunnel │   │ Mosquitto Broker │   │ Google Apps     │
+              │ (optional, LAN)   │   │ (self-hosted,    │   │ Script Web App  │
+              └────────┬─────────┘   │  TLS + ACL +     │   │                 │
+                       │             │  per-device auth) │   │ → Gemini API    │
+              ┌────────▼─────────┐   └────────┬────────┘   │ → cache 1 hour  │
+              │  PWA on Vercel   │◄───────────┘            └─────────────────┘
+              │  (Remote-Relay)  │    WSS (8884) for PWA
               └──────────────────┘
 ```
 
-**Key design principle**: the ESP32 is the **single source of truth**. It keeps working even if internet, Cloudflare, Vercel, Google, or the MQTT broker are all down. The PWA is just a UI; all scheduling, PIR logic, RTC time, and relay control live in firmware and run locally.
+**Key design principle**: ESP32 is the **single source of truth**. It keeps working even if internet, Cloudflare, Vercel, Google, or the MQTT broker are all down. The PWA is just a UI; all scheduling, PIR logic, RTC time, and relay control live in firmware and run locally.
 
 ---
 
-## Firmware — Build & Flash
+## Security Architecture (Rounds 9–10K)
+
+This firmware has been through **12 rounds of security audit** by an external engineer. Key hardening applied:
+
+### Transaction Layer (R10G–R10K)
+
+- **NVS-persisted transaction journal**: `{requestId, commandHash, ackJson}` stored in flash. Survives reboot. Same requestId → NEVER re-execute → always replay original ACK.
+- **Two-phase commit**: `tj_entry_N` (blob data) + `tj_commit_N` (1-byte commit flag). writeIdx persisted BEFORE commit flag. All 3 failure scenarios verified safe.
+- **CRC32 + magic + version**: Every blob has `[magic:2][version:1][valid:1][CRC32:4][payload]`. CRC mismatch → entry rejected, slot freed.
+- **64-entry LRU journal**: At 100 commands/day, oldest entry is ~15 hours old when evicted. PWA retry window is ~2 minutes. 15h >> 2min.
+- **ACK retry queue**: Pending ACKs retried every 2s (max 10 attempts). On boot: all stored ACKs re-queued from NVS.
+
+### MQTT Security (R10A–R10F)
+
+- **TLS mandatory** in production (port 8883/8884). `setCACert(MQTT_ROOT_CA)`. No `setInsecure()` fallback.
+- **PRODUCTION_BUILD flag**: When defined, enforces TLS + username + password + CA + CORS + OTA pubkey + OTA CA. Hard-fail if any missing.
+- **Password removed from topic** (R10C-3): Topic is `timer12/<mac>/<subtopic>`. Auth via broker credentials, authz via broker ACL.
+- **Strict requestId validation**: Required, max 64 chars, safe ASCII only.
+- **Unknown-field rejection**: Each command type has whitelist. Extra fields → command rejected.
+- **Per-command-type canonical hash**: `commandHash = SHA-256(type|action|field1=val1|...)`. requestId bound to exact command.
+
+### OTA Security (R10B–R10D)
+
+- **Ed25519 signature verification** via PSA Crypto API: `PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_TWISTED_EDWARDS)` + `PSA_ALG_PURE_EDDSA`.
+- **Signing contract**: `signature = ed25519_sign(SHA256(firmware.bin), private_key)`. ESP32 verifies signature over 32-byte SHA-256 hash.
+- **HTTPS download**: `WiFiClientSecure` + `setCACert(OTA_HTTPS_ROOT_CA)`. No plain HTTP.
+- **Strict SemVer**: `sscanf("%d.%d.%d%c")` — rejects "4.1.0foo", "4.1.0-beta", "4.1.0.1".
+- **Anti-downgrade**: New version must be strictly greater than current.
+- **Boot health check + rollback**: 3 failed boots → `esp_ota_mark_app_invalid_rollback_and_restart()`.
+
+### Auth Security (R10B-5)
+
+- **JWT access token**: 15-minute TTL (HS256, per-device random NVS secret).
+- **Refresh token rotation**: 7-day TTL, one-time use, NVS-backed. `/api/refresh` validates + rotates. Reuse of invalidated token → security violation.
+- **JWT secret**: Random 32-byte per-device, stored in NVS. No compile-time fallback.
+- **PBKDF2-HMAC-SHA256** password hashing (10000 iterations, 16-byte salt).
+- **CSRF double-submit cookie**: sameSite=Strict, constant-time compare.
+- **Rate limiter**: 5 fails → 60s block, 10 fails → 5min block.
+
+### GAS Security (R10A–R10C)
+
+- **HMAC-SHA256 authentication**: ESP32 signs each POST with `HMAC-SHA256(deviceSecret, timestamp\nnonce\ndeviceId\nbody)`.
+- **Auth metadata via URL params** (not HTTP headers — GAS doesn't expose headers): `?deviceId=...&timestamp=...&nonce=...&signature=...`
+- **Timestamp ±5min tolerance** + **nonce replay protection** (LockService atomic check).
+- **Anonymous device ID**: `SHA-256(MAC).substring(0, 16)`. Gemini never sees raw MAC.
+- **Body validation**: Max 16KB, max 100 logs, max 32-char channel names.
+
+---
+
+## Production Deployment Guide
+
+### Step 1: Generate Ed25519 Signing Keys
+
+OTA firmware updates require Ed25519 signature verification. Generate a keypair once:
+
+```bash
+# Install cryptography library
+pip install cryptography
+
+# Generate keypair (one-time per project)
+python3 scripts/sign_firmware.py --gen-keys
+
+# Output:
+#   firmware_signing_private.pem  (KEEP SECRET — signing machine only)
+#   firmware_signing_public.pem   (can be public)
+#
+# Serial output will show the public key hex:
+#   constexpr const char* OTA_ED25519_PUBLIC_KEY_HEX = "abcdef0123456789...";
+```
+
+**⚠️ CRITICAL**: Add `firmware_signing_private.pem` to `.gitignore`. NEVER commit the private key.
+
+### Step 2: Deploy Mosquitto MQTT Broker
+
+Production 220V relay control requires a self-hosted MQTT broker with TLS + ACL + per-device credentials.
+
+#### 2a. Provision VPS
+
+- **Recommended**: DigitalOcean Droplet ($4/mo) or Hetzner Cloud (€3.29/mo)
+- **OS**: Ubuntu 22.04 LTS
+- **Domain**: Register a domain (e.g., `mqtt.yourdomain.com`) and point DNS A record to VPS IP
+
+#### 2b. Install Mosquitto
+
+```bash
+ssh root@your-vps
+apt update && apt install -y mosquitto mosquitto-clients certbot
+```
+
+#### 2c. Get Let's Encrypt TLS Certificate
+
+```bash
+certbot certonly --standalone -d mqtt.yourdomain.com
+# Certificates saved to:
+#   /etc/letsencrypt/live/mqtt.yourdomain.com/fullchain.pem
+#   /etc/letsencrypt/live/mqtt.yourdomain.com/privkey.pem
+```
+
+#### 2d. Configure Mosquitto
+
+Create `/etc/mosquitto/conf.d/timer12.conf`:
+
+```
+# TLS listener on port 8883
+listener 8883
+certfile /etc/letsencrypt/live/mqtt.yourdomain.com/fullchain.pem
+keyfile /etc/letsencrypt/live/mqtt.yourdomain.com/privkey.pem
+tls_version tlsv1.2
+
+# Require authentication
+allow_anonymous false
+password_file /etc/mosquitto/passwd
+
+# ACL file
+acl_file /etc/mosquitto/acl
+```
+
+#### 2e. Create Device Credentials
+
+```bash
+# Create password file with first user (device MAC as username)
+mosquitto_passwd -c /etc/mosquitto/passwd device-A4CF12345678
+# Enter a strong password when prompted
+
+# Add more devices
+mosquitto_passwd /etc/mosquitto/passwd device-A4CF12345679
+```
+
+#### 2f. Configure ACL (Per-Device Topic Restrictions)
+
+Create `/etc/mosquitto/acl`:
+
+```
+# Device A4CF12345678 — can only access its own topics
+user device-A4CF12345678
+topic readwrite timer12/A4CF12345678/#
+
+# Device A4CF12345679
+user device-A4CF12345679
+topic readwrite timer12/A4CF12345679/#
+
+# PWA can subscribe to any device (if you trust the PWA)
+# For stricter security, create a separate PWA user with read-only access
+```
+
+#### 2g. Restart Mosquitto
+
+```bash
+systemctl restart mosquitto
+systemctl enable mosquitto
+```
+
+#### 2h. Get Root CA for Firmware
+
+The firmware needs the **Let's Encrypt root CA** (ISRG Root X1) to verify the broker's TLS certificate:
+
+```bash
+# Download ISRG Root X1
+curl https://letsencrypt.org/certs/isrgrootx1.pem -o isrgrootx1.pem
+cat isrgrootx1.pem
+# Copy the entire PEM content — you'll paste it into Config.h MQTT_ROOT_CA
+```
+
+Also get the CA for your OTA download host (e.g., GitHub Releases uses DigiCert):
+
+```bash
+# For GitHub Releases:
+# Download DigiCert Global Root CA
+curl https://dl.digicert.com/DigiCertGlobalRootCA.crt -o digicert.pem
+openssl x509 -inform DER -in digicert.pem -out digicert_global_root.pem
+cat digicert_global_root.pem
+```
+
+### Step 3: Deploy Google Apps Script
+
+The GAS Web App receives hourly logs from ESP32 and calls Gemini API for AI insights.
+
+#### 3a. Create GAS Project
+
+1. Open [script.google.com](https://script.google.com) → **New Project**
+2. Delete default code, paste contents of `code.gs/Code.gs`
+3. Save project (name it "Timer12 AI Insights")
+
+#### 3b. Set Gemini API Key
+
+1. Get free API key at [aistudio.google.com](https://aistudio.google.com/app/apikey)
+2. In GAS: **Project Settings → Script Properties → Edit script properties**
+3. Add: `GEMINI_API_KEY` = your API key
+
+#### 3c. Deploy as Web App
+
+1. **Deploy → New Deployment**
+2. Type: **Web App**
+3. Execute as: **Me**
+4. Who has access: **Anyone** (anonymous — HMAC provides auth)
+5. Copy deployment URL: `https://script.google.com/macros/s/AKfyc.../exec`
+
+#### 3d. Register Device HMAC Secret
+
+When ESP32 first boots, it generates a 32-byte random GAS secret and prints to Serial:
+
+```
+[WiFi] GAS HMAC Secret: <64 hex chars>
+[WiFi] Copy GAS secret to GAS Script Properties:
+[WiFi]   Key: DEVICE_<anonymousId>_SECRET
+[WiFi]   Value: <64 hex chars>
+```
+
+1. Copy the anonymous ID (16 hex chars) and secret (64 hex chars) from Serial
+2. In GAS: **Project Settings → Script Properties → Edit script properties**
+3. Add: `DEVICE_<anonymousId>_SECRET` = `<64 hex chars>`
+
+### Step 4: Configure Firmware (Config.h)
+
+Edit `firmware/Config.h` with your production values:
+
+```cpp
+// ── MQTT Broker ──
+constexpr const char* MQTT_BROKER_HOST = "mqtt.yourdomain.com";
+constexpr uint16_t MQTT_BROKER_PORT = 8883;  // TLS
+constexpr const char* MQTT_BROKER_USERNAME = "device-A4CF12345678";
+constexpr const char* MQTT_BROKER_PASSWORD = "your-device-password";
+
+// ── TLS Root CA (paste full PEM, multi-line) ──
+constexpr const char* MQTT_ROOT_CA =
+"-----BEGIN CERTIFICATE-----\n"
+"MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw\n"
+"TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh\n"
+"cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4\n"
+"... (full ISRG Root X1 PEM) ...\n"
+"-----END CERTIFICATE-----\n";
+
+// ── CORS (your PWA's Vercel URL) ──
+constexpr const char* ALLOWED_CORS_ORIGINS = "https://remote-relay.vercel.app";
+
+// ── GAS URL ──
+constexpr const char* GAS_INSIGHTS_URL = "https://script.google.com/macros/s/AKfyc.../exec";
+
+// ── OTA Ed25519 Public Key (from Step 1) ──
+constexpr const char* OTA_ED25519_PUBLIC_KEY_HEX = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+// ── OTA HTTPS Root CA (for GitHub Releases, etc.) ──
+constexpr const char* OTA_HTTPS_ROOT_CA =
+"-----BEGIN CERTIFICATE-----\n"
+"... (DigiCert Global Root CA PEM) ...\n"
+"-----END CERTIFICATE-----\n";
+```
+
+### Step 5: Compile with PRODUCTION_BUILD Flag
+
+**Arduino IDE:**
+1. Open `firmware/firmware_v4.ino`
+2. **File → Preferences → Settings → "Additional boards manager URLs"** — ensure ESP32 core 3.3.7+ is installed
+3. **Tools → Board → ESP32 Dev Module**
+4. **Tools → Partition Scheme → "Default 4MB with spiffs"** (required for OTA rollback)
+5. **File → Preferences → Settings → "Show verbose output during: compilation"**
+6. Add `-DPRODUCTION_BUILD` to compile flags:
+   - **Arduino IDE 2.x**: Use `arduino-cli` or edit `platform.local.txt`
+   - **PlatformIO**: Add to `platformio.ini`:
+     ```ini
+     build_flags = -DPRODUCTION_BUILD
+     ```
+7. Click **Upload**
+
+**PRODUCTION_BUILD enforces:**
+- TLS port (8883/8884) mandatory
+- MQTT_BROKER_USERNAME/PASSWORD mandatory
+- MQTT_ROOT_CA mandatory
+- ALLOWED_CORS_ORIGINS ≠ "*"
+- OTA_ED25519_PUBLIC_KEY_HEX non-empty
+- OTA_HTTPS_ROOT_CA non-empty
+
+If any check fails → firmware refuses to boot (hard fail).
+
+### Step 6: Flash + First Boot
+
+1. Connect ESP32 via USB
+2. Click **Upload** in Arduino IDE
+3. Open **Serial Monitor** at 115200 baud
+4. Observe boot sequence:
+
+```
+========================================
+Timer 12 Relay v4.0.0
+Build: Aug 14 2026 ...
+Cloud-Ready Architecture (modular)
+========================================
+[WiFi] MQTT Password: K7M3P9XQ
+[WiFi] Device PIN: 123456
+[WiFi] GAS HMAC Secret: a1b2c3d4e5f6...
+[WiFi] Copy GAS secret to GAS Script Properties:
+[WiFi]   Key: DEVICE_a1b2c3d4e5f6a1b2_SECRET
+[WiFi]   Value: a1b2c3d4e5f6...
+========================================
+WiFi: connecting to STA "YourWiFi"...
+WiFi STA connected! IP: 192.168.1.50, RSSI: -55 dBm
+[MQTT] PRODUCTION_BUILD flag defined — enforcing all production requirements
+[MQTT] Production mode: TLS + auth + CA verified ✓
+[MQTT] TLS: using configured root CA for broker cert validation
+[MQTT] Using TLS (port 8883)
+MQTT: connected!
+[Journal] Loaded 0 valid transactions from NVS (capacity 64)
+[PZEM] PZEM-004T v3.0 detected!
+[AI] GAS URL configured
+[AI] Will POST logs every 60 minutes
+Boot complete. Ready.
+[OTA] Boot attempts: 0/3 (first boot after OTA: no)
+```
+
+5. **Copy these values** (needed for PWA login):
+   - **MAC Address** (shown in Serial or on the WiFi AP)
+   - **MQTT Password** (8 chars)
+   - **GAS HMAC Secret** (64 hex chars — register in GAS Script Properties)
+   - **Device PIN** (6 digits — for factory reset)
+
+### Step 7: Connect PWA
+
+1. Open PWA URL (Vercel deployment)
+2. Scroll to **"Remote Mode (MQTT)"** card
+3. Enter:
+   - **Device ID (MAC):** 12 hex chars from Serial (e.g., `A4CF12345678`)
+   - **MQTT Password:** 8 chars from Serial (e.g., `K7M3P9XQ`)
+4. Click **Connect via MQTT**
+5. Dashboard loads — control relays from anywhere
+
+**PWA env vars** (set in Vercel → Settings → Environment Variables):
+
+| Variable | Value |
+|----------|-------|
+| `NEXT_PUBLIC_MQTT_BROKER_URL` | `wss://mqtt.yourdomain.com:8884/mqtt` |
+| `NEXT_PUBLIC_MQTT_USERNAME` | PWA broker username (or device username) |
+| `NEXT_PUBLIC_MQTT_PASSWORD` | PWA broker password (or device password) |
+| `NEXT_PUBLIC_GAS_INSIGHTS_URL` | GAS Web App URL from Step 3c |
+
+---
+
+## Development Setup (Quick Start)
+
+For development/testing without production security:
 
 ### Prerequisites
 
-- **Arduino IDE 2.x** (recommended for end users) or **PlatformIO Core** (`pip install platformio`)
-- **ESP32 Arduino Core v3.3.7+** by Espressif (Boards Manager → "esp32 by Espressif Systems")
+- **Arduino IDE 2.x** (or PlatformIO Core)
+- **ESP32 Arduino Core v3.3.7+** by Espressif
 - **Libraries** (Library Manager):
   - `RTClib` by Adafruit (DS3231)
   - `ArduinoJson` by Benoit Blanchon (v6.19+)
   - `PubSubClient` by Nick O'Leary (MQTT)
-- USB driver for your board's USB-UART bridge:
-  - CP2102 (most ESP32 dev boards) → Silicon Labs CP210x driver
-  - CH340 (cheaper clones) → WCH CH340 driver
-- USB cable (data-capable, not charge-only)
+- USB driver: CP2102 (Silicon Labs) or CH340 (WCH)
 
-### Build with Arduino IDE
+### Build (Development Mode)
 
-1. Clone this repo: `git clone https://github.com/desvandi/Firmware-code-gs_relaytimer.git`
+1. Clone: `git clone https://github.com/desvandi/Firmware-code-gs_relaytimer.git`
 2. Open `firmware/firmware_v4.ino` in Arduino IDE
-3. Select board: **ESP32 Dev Module** (or match your specific board)
-4. Set board options:
-   - Upload Speed: `921600`
-   - Flash Size: `4MB (32Mb)`
-   - Partition Scheme: `Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)`
-   - PSRAM: `Disabled` (most WROOM-32 boards have no PSRAM)
-5. Click **Upload** (→ arrow)
-6. Open Serial Monitor at **115200 baud** to view boot output
+3. Select board: **ESP32 Dev Module**
+4. Leave `Config.h` defaults (HiveMQ public broker, port 1883, no auth)
+5. Click **Upload**
+6. Open Serial Monitor at 115200 baud
 
-### Build with PlatformIO (alternative)
+### First Boot (Development)
+
+ESP32 starts in **AP mode**:
+- SSID: `Timer12-Setup`
+- Connect to it, open `http://192.168.4.1`
+- Enter WiFi SSID + password
+- ESP32 reboots to STA mode
+
+### Default Credentials (Development Only)
+
+```
+Username: admin
+Password: printed to Serial (derived from MAC)
+MQTT Password: printed to Serial (8 random chars)
+```
+
+**⚠️ Development mode is NOT secure for 220V relay control.** Use PRODUCTION_BUILD for real deployment.
+
+---
+
+## Hardware Wiring
+
+### Pin Mapping
+
+| Component | GPIO | Type | Notes |
+|-----------|------|------|-------|
+| **Relay 1** | 13 | Output | Active-LOW (LOW=ON) |
+| **Relay 2** | 14 | Output | |
+| **Relay 3** | 16 | Output | |
+| **Relay 4** | 17 | Output | |
+| **Relay 5** | 18 | Output | |
+| **Relay 6** | 19 | Output | |
+| **Relay 7** | 21 | Output | |
+| **Relay 8** | 22 | Output | |
+| **Relay 9** | 23 | Output | |
+| **Relay 10** | 25 | Output | |
+| **Relay 11** | 26 | Output | |
+| **Relay 12** | 27 | Output | |
+| **PIR 1** | 34 | Input-only | HC-SR501 → Relay 9 |
+| **PIR 2** | 35 | Input-only | HC-SR501 → Relay 10 |
+| **PIR 3** | 36 | Input-only | HC-SR501 → Relay 11 (SENSOR_VP) |
+| **PIR 4** | 39 | Input-only | HC-SR501 → Relay 12 (SENSOR_VN) |
+| **I2C SDA** | 32 | I2C Data | DS3231 (400kHz Fast Mode) |
+| **I2C SCL** | 33 | I2C Clock | DS3231 |
+| **PZEM RX** | 5 | UART RX | PZEM TX → ESP32 GPIO5 |
+| **PZEM TX** | 4 | UART TX | ESP32 GPIO4 → PZEM RX |
+
+### Power Supply
+
+- **ESP32**: USB 5V or VIN pin
+- **Relay module**: External 5V ≥1A PSU (NOT from ESP32 pin)
+- **CRITICAL**: ESP32 GND and relay PSU GND must be connected (shared ground)
+- **PZEM-004T**: Connects directly to 220V AC mains for measurement
+
+### ⚠️ 220V AC Safety
+
+- Relays control **mains voltage**. Only wire when power is OFF at the breaker.
+- Use adequate wire gauge (≥1.5mm² for 10A loads).
+- Enclose in an IP-rated box.
+- Add a fuse per channel.
+- If unsure, **consult a licensed electrician**.
+
+---
+
+## Firmware Subsystems
+
+### 1. Transaction Journal (`TransactionJournal.cpp`)
+
+NVS-persisted durable transaction log. See [Security Architecture](#security-architecture-rounds-910k) for details.
+
+**Key constants** (in `TransactionJournal.h`):
+- `JOURNAL_SIZE = 64` entries
+- `BLOB_SIZE = 1200` bytes per entry
+- `MAX_PENDING_ACKS = 8`
+- `MAX_ACK_RETRIES = 10`
+- `ACK_RETRY_INTERVAL_MS = 2000`
+
+### 2. MQTT Client (`MqttClient.cpp`)
+
+- **Topic format**: `timer12/<mac>/<subtopic>` (no password in topic)
+- **TLS**: `WiFiClientSecure` + `setCACert(MQTT_ROOT_CA)` when port is 8883/8884
+- **ACK transaction**: All mutations send type-specific ACK data. PWA validates via discriminated union.
+- **Ed25519 OTA**: Signed firmware verification via PSA Crypto API.
+- **Validation pipeline**: parse → validate type → validate fields (whitelist) → validate requestId → compute hash → journal lookup → execute → atomic ACK
+
+### 3. Auth Manager (`AuthManager.cpp`)
+
+- **JWT access token**: 15min TTL, HS256, per-device random NVS secret
+- **Refresh token**: 7day TTL, one-time use, NVS-backed, rotation on `/api/refresh`
+- **Rate limiter**: 5 fails → 60s block, 10 fails → 5min block
+- **Factory reset**: 2-step (prepare → confirm), one-time token (60s TTL)
+
+### 4. OTA Manager (`OtaManager.cpp`)
+
+- **Boot health check**: Increments boot_attempts in NVS. If > 3 → rollback.
+- `markBootHealthy()`: Called at end of setup() if all subsystems OK. Calls `esp_ota_mark_app_valid_cancel_rollback()`.
+
+### 5. PZEM-004T v3.0 (`PzemDriver.cpp`)
+
+Self-contained Modbus-RTU (no external library):
+- 7 raw parameters: voltage, current, power, energy, frequency, PF, alarm
+- 3 derived: apparent power (VA), reactive power (VAR), daily energy
+- 5 alarm thresholds: undervoltage, overvoltage, overcurrent, overpower, low PF
+- CRC-16 validation on every Modbus response
+
+### 6. Relay Engine (`RelayEngine.cpp`)
+
+Priority: **Manual > PIR > Schedule > Off**
+- PIR can only force ON, never OFF
+- PIR cannot override Manual mode
+- Stuck PIR (HIGH > 30 min) → force-disabled for 5 min cooldown
+
+### 7. Advisor (`Advisor.cpp`)
+
+Hourly POST to Google Apps Script:
+- Collects last 50 log entries + PZEM data
+- Computes anonymous device ID: `SHA-256(MAC).substring(0, 16)`
+- Signs with HMAC-SHA256(deviceSecret, timestamp\nnonce\ndeviceId\nbody)
+- Auth metadata sent as URL query params (GAS doesn't expose HTTP headers)
+- Watchdog-safe: 8s HTTP timeout, `esp_task_wdt_reset()` during file reads + HTTP
+
+---
+
+## OTA Firmware Update (Signed)
+
+### Signing Firmware
 
 ```bash
-cd firmware
-pio run                 # build only
-pio run -t upload       # build + flash
-pio device monitor      # serial monitor (115200 baud)
+# Sign a new firmware release
+python3 scripts/sign_firmware.py firmware.bin 4.1.0
+
+# Output:
+#   firmware.bin.sha256     — 64 hex chars (SHA-256 of binary)
+#   firmware.bin.sig        — 128 hex chars (Ed25519 signature over SHA-256)
+#   firmware.bin.ota.json   — OTA command payload (fill in URL + version)
 ```
 
-### First Boot — Configuration
+### Triggering OTA via MQTT
 
-On first boot, the firmware starts in **AP mode**:
-- SSID: `Timer12-XXXXXX` (last 6 of MAC)
-- Password: printed to Serial (also derived from MAC)
-- Open `http://192.168.4.1` to configure:
-  - WiFi SSID + password (for STA mode, internet access)
-  - MQTT broker host + port + credentials (optional, for remote mode)
-  - GAS URL (optional, for AI insights)
+Publish to `timer12/<mac>/ota`:
 
-After configuration, the ESP32 reboots into **STA mode** (your home WiFi). If WiFi fails, it falls back to AP mode automatically.
-
-### Default Credentials
-
-The firmware generates a random admin password derived from the ESP32's MAC address on first boot:
-
-```
-T<last-4-hex-of-MAC><mid-4-hex><low-4-hex>
+```json
+{
+  "action": "update",
+  "url": "https://github.com/your-repo/releases/download/v4.1.0/firmware.bin",
+  "version": "4.1.0",
+  "size": 1234567,
+  "sha256": "abcdef0123456789...",
+  "signature": "abcdef0123456789...",
+  "requestId": "uuid-here"
+}
 ```
 
-The password is printed to **Serial** during boot — copy and store it securely. The default username is `admin`. Change via `POST /api/config/password` (requires current password).
-
-### MQTT Password
-
-For MQTT mode, a separate password is generated (8 alphanumeric chars, uppercase). Also printed to Serial during boot:
-
-```
-MAC: A4CF12345678
-MQTT Password: K7M3P9XQ
-```
-
-The PWA login uses these two values. The MQTT password is embedded in the topic path (`timer12/<mac>/<mqttPass>/command`) so anyone subscribing/publishing must know it.
+ESP32 flow: HTTPS download → size check → SHA-256 verify → Ed25519 verify → Update → reboot → health check.
 
 ---
 
-## Hardware Pinout
+## API Contract
 
-| Component | GPIO | Notes                              |
-|-----------|------|------------------------------------|
-| Relay 1   | 13   | Active-LOW module                  |
-| Relay 2   | 14   |                                    |
-| Relay 3   | 16   |                                    |
-| Relay 4   | 17   |                                    |
-| Relay 5   | 18   |                                    |
-| Relay 6   | 19   |                                    |
-| Relay 7   | 21   |                                    |
-| Relay 8   | 22   |                                    |
-| Relay 9   | 23   |                                    |
-| Relay 10  | 25   |                                    |
-| Relay 11  | 26   |                                    |
-| Relay 12  | 27   |                                    |
-| PIR 1     | 34   | Input-only, no pull                |
-| PIR 2     | 35   | Input-only, no pull                |
-| PIR 3     | 36   | Input-only (SENSOR_VP)             |
-| PIR 4     | 39   | Input-only (SENSOR_VN)             |
-| I2C SDA   | 32   | DS3231                             |
-| I2C SCL   | 33   | DS3231                             |
-| PZEM RX   | 4    | ESP32 GPIO4 → PZEM TX              |
-| PZEM TX   | 5    | ESP32 GPIO5 → PZEM RX              |
+All REST responses: `{ "success": bool, "message": string, "data": T }`
 
-⚠️ **220V AC SAFETY**: Relays control mains voltage. Only wire when power is OFF at the breaker. Use adequate wire gauge (≥1.5mm² for 10A loads). Enclose in an IP-rated box. Add a fuse per channel. If unsure, consult a licensed electrician.
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | `/api/login` | JWT (15min) + refresh (7day) + CSRF cookies |
+| POST | `/api/refresh` | Rotate access + refresh tokens |
+| POST | `/api/logout` | Revoke refresh token in NVS |
+| GET | `/api/session` | Check current session |
+| GET | `/api/status` | Full SystemStatus (12 channels + PIRs + PZEM) |
+| GET | `/api/version` | FirmwareInfo + OTA status |
+| POST | `/api/relay` | SET_STATE on/off / set_mode |
+| POST | `/api/schedule` | Upsert schedule (max 4/channel) |
+| DELETE | `/api/schedule?id=N` | Delete schedule |
+| POST | `/api/pir` | Update PIR config |
+| POST | `/api/time` | Set RTC time |
+| GET | `/api/log` | Activity log (filterable) |
+| POST | `/api/channel` | Rename channel |
+| POST | `/api/reboot` | Reboot ESP32 |
+| POST | `/api/ota` | Upload firmware (REST, not MQTT) |
+| POST | `/api/factory_reset/prepare` | Generate reset token (60s) |
+| POST | `/api/factory_reset/confirm` | Execute factory reset |
 
 ---
 
-## Firmware — Key Subsystems
+## Power-Loss Test Plan
 
-### 1. MQTT Remote Mode (`MqttClient.cpp`)
+See **[TEST_PLAN.md](TEST_PLAN.md)** for the complete 12-test power-loss acceptance plan.
 
-- **Outbound connection** to broker (works behind CGNAT/MiFi — no port forwarding needed)
-- **Topic format**: `timer12/<mac>/<subtopic>` (R10C-3: password removed from topic)
-- **Authentication**: via broker credentials (username/password in MQTT CONNECT)
-- **Authorization**: via broker ACL (per-device topic restrictions)
-- **TLS support**: if broker port is 8883/8884, uses `WiFiClientSecure` with `setCACert(MQTT_ROOT_CA)`. **Fail-closed**: if `MQTT_ROOT_CA` is empty in production mode, firmware refuses to connect (no `setInsecure()` fallback).
-- **Production guard** (R10A-5): port 8883/8884 requires ALL of: `MQTT_BROKER_USERNAME`, `MQTT_BROKER_PASSWORD`, `MQTT_ROOT_CA`. Missing any → hard fail.
-- **ACK transaction layer** (R10E-1: atomic publish+store):
-  - Every command includes `requestId` (UUID)
-  - Validation order (R10E-2): parse → validate type → validate fields (whitelist) → compute hash → dedup check → execute → ACK
-  - Dedup buffer: 64 entries + 15min TTL (R10E-3)
-  - On duplicate: replay ORIGINAL ACK JSON (not reconstructed — R10D-2/R10E-1)
-  - requestId reuse with different command → rejected (R10A-3)
-  - Unknown fields → rejected (R10D-3)
-  - SET_STATE only (no TOGGLE, for idempotency)
-- **LWT** (Last Will & Testament): publishes `0` to `online` topic on disconnect → PWA shows offline status
-- **Status publishing**: every 5s, publishes full SystemStatus JSON to `status` topic (retained=false, QoS 1)
+**Acceptance criterion**: "Tidak ada keadaan recovery di mana sebuah command yang sudah dieksekusi dapat dieksekusi kedua kali karena journal kehilangkan committed record."
 
-### 2. PZEM-004T v3.0 Power Meter (`PzemDriver.cpp`)
-
-Self-contained Modbus-RTU implementation (no external library):
-
-- **Reads every 1s** via UART2 (GPIO4/5, 9600 baud)
-- **7 raw parameters**: voltage, current, active power, energy, frequency, power factor, alarm status
-- **3 derived parameters**:
-  - Apparent Power (VA) = V × A
-  - Reactive Power (VAR) = √(VA² − W²)
-  - Daily Energy (kWh) — accumulated since midnight, auto-reset on day change
-- **Daily stats**: max power, average power, energy today
-- **5 alarm thresholds** (configurable in `Config.h`):
-  - Undervoltage (< 200V), Overvoltage (> 240V)
-  - Overcurrent (> 16A), Overpower (> 3500W)
-  - Low power factor (< 0.85)
-- **Cooldown**: 60s between same-alarm repeats (prevents log spam)
-- **CRC-16 (Modbus)** validation on every response — corrupt frames are dropped
-
-### 3. Scheduler (`Scheduler.cpp`)
-
-- **Per-channel schedules** (max 4 per channel × 12 channels = 48 max)
-- **dayMask**: bitmask of 7 days (bit 0 = Sunday, bit 6 = Saturday)
-- **Overnight handling**: if `onTime > offTime` (e.g., 18:00 → 06:00), schedule wraps midnight
-- **1-minute resolution**: schedules checked every loop iteration against current RTC time
-- **Conflict resolution**: if multiple schedules for same channel overlap, latest-wins (manual review recommended)
-
-### 4. Relay Engine Priority (`RelayEngine.cpp`)
-
-```
-For each channel i (1..12):
-  1. If channels[i].modeAuto == false:
-       → Manual mode: relay = channels[i].manualState (source: 'manual' or 'off')
-  2. Else if i has PIR (9..12) AND channels[i].pirEnabled:
-       → If PIR stuck (HIGH > 30 min): ignore PIR, fall through to schedule
-       → Else if PIR motion OR within hold-time window: relay = ON (source: 'pir')
-       → Else if schedule active: relay = ON (source: 'schedule')
-       → Else: OFF
-  3. Else (no PIR or PIR disabled):
-       → If schedule active: relay = ON (source: 'schedule')
-       → Else: OFF
-```
-
-- PIR can only force ON, never force OFF
-- PIR cannot override Manual mode
-- Stuck PIR (HIGH > 30 min) is force-disabled for 5 min cooldown, then re-tested
-- Source tracking (`Manual` / `Pir` / `Schedule` / `Off`) is exposed in `/api/status` for PWA UI
-
-### 5. Auth & Security (`AuthManager.cpp`)
-
-- **JWT (HS256)**: 1-hour TTL, signed with device-generated secret (stored in NVS)
-- **CSRF**: separate `timer12_csrf` cookie (readable by JS, httpOnly=false), echoed in `X-CSRF-Token` header for mutations
-- **Cookie flags**: `Secure` (in production), `SameSite=Strict`, `Path=/`
-- **Rate limiter** (per IP): 5 fails → 60s block, 10 fails → 5 min block
-- **Factory reset**: 2-step (prepare → confirm), one-time token (60s TTL)
-- **Password storage**: PBKDF2-HMAC-SHA256 (10000 iterations, 16-byte salt)
-
-### 6. GAS AI Pipeline (`Advisor.cpp`)
-
-Every 1 hour (configurable via `GAS_POST_INTERVAL_MS` in `Config.h`):
-
-1. Reads last 50 entries from `/activity.log` (LittleFS)
-2. Collects PZEM data (voltage, current, power, energy, frequency, PF, etc.)
-3. Computes **anonymous device ID** = `SHA-256(MAC).substring(0, 16)` — Gemini never sees the real MAC
-4. Builds JSON payload (~4-12 KB) and POSTs to GAS URL
-5. **Watchdog-safe**: HTTP timeout 8s (watchdog is 10s), `esp_task_wdt_reset()` called before, during (every 50 lines of file read), and after HTTP
+All 12 tests must PASS on actual ESP32 hardware before 220V production deployment.
 
 ---
 
-## Google Apps Script — Deployment
+## Security Audit History
 
-`code.gs/Code.gs` is a single-file Google Apps Script that receives ESP32 logs and calls Gemini.
-
-### Setup
-
-1. Open **[script.google.com](https://script.google.com)** → New Project
-2. Delete the default `Code.gs` content, paste the contents of `code.gs/Code.gs` from this repo
-3. Set the Gemini API key:
-   - Project Settings → Script Properties → Add property
-   - Name: `GEMINI_API_KEY`
-   - Value: your Gemini API key (get one free at **[aistudio.google.com](https://aistudio.google.com/app/apikey)**)
-4. Deploy → New Deployment:
-   - Type: **Web App**
-   - Execute as: **Me**
-   - Who has access: **Anyone** (anonymous — required because ESP32 has no Google auth)
-5. Copy the deployment URL (e.g., `https://script.google.com/macros/s/AKfyc.../exec`)
-
-### Wire the URL to ESP32 + PWA
-
-- **ESP32 firmware** (`Config.h`):
-  ```cpp
-  #define GAS_INSIGHTS_URL "https://script.google.com/macros/s/AKfyc.../exec"
-  ```
-- **PWA** (Vercel env var):
-  ```
-  NEXT_PUBLIC_GAS_INSIGHTS_URL=https://script.google.com/macros/s/AKfyc.../exec
-  ```
-
-### Endpoints
-
-| Method | URL                                       | Purpose                                      |
-|--------|-------------------------------------------|----------------------------------------------|
-| GET    | `?action=insights&mac=<anonymousId>`      | Fetch cached AI insights (1h TTL)            |
-| GET    | `?action=health`                          | Service health + Gemini config check         |
-| POST   | (root)                                    | ESP32 pushes logs → triggers Gemini analysis |
-
-### Privacy & Safety
-
-- ESP32 sends only the **first 16 chars of SHA-256(MAC)** — never the raw MAC. Gemini cannot reverse this to identify the device hardware address.
-- Logs contain channel names, relay states, and event messages — review these before deploying if you have privacy-sensitive channel names (e.g., "Bedroom Lights").
-- Gemini API key is stored in **Script Properties** (not in source code) — safe to commit this repo publicly.
-- 1-hour cache TTL prevents Gemini API abuse (max 24 Gemini calls per device per day).
-- All Gemini responses are strictly JSON-validated; malformed responses fall back to mock insights (no crash).
+| Round | Focus | Key Changes |
+|-------|-------|-------------|
+| R9 | MQTT contract, ACK transaction, SET_STATE, requestId dedup | Foundation |
+| R10A | GAS HMAC transport, Ed25519, requestId binding, JWT NVS, TLS guard | 5 P0 blockers |
+| R10B | Signing contract, typed ACK, publisher internal, refresh token, SemVer, OTA rollback | 7 protocol fixes |
+| R10C | Compile error, PSA Crypto, canonical hash, topic password removal | 4 critical fixes |
+| R10D | PSA Ed25519 correct API, dedup replay original, unknown-field reject, strict SemVer | 4 fixes |
+| R10E | Atomic ACK transaction, validation reorder, dedup TTL | 4 fixes |
+| R10F | Publish failure handling, expired dedup cleanup, PRODUCTION_BUILD flag | 5 fixes |
+| R10G | NVS transaction journal, ACK retry queue, strict requestId | Architectural shift |
+| R10H | NVS atomicity (blob write), LRU 64 entries, commit flag | 4 fixes |
+| R10I | CRC32 + magic + version | Integrity protection |
+| R10J | Separate commit key (true two-phase) | Power-loss safety |
+| R10K | writeIdx-before-commit ordering fix | Failure ordering fix |
 
 ---
 
-## Firmware v4.0 API Contract
+## Known Limitations
 
-All responses follow: `{ "success": bool, "message": string, "data": T }`.
+1. **LRU eviction**: After 64 commands, oldest entry is evicted. At 100 commands/day, oldest is ~15h old. PWA retry window is ~2min. If PWA retries after 15h, command may re-execute. **Accepted risk** for IoT device.
 
-| Method | Endpoint                              | Purpose                                  |
-|--------|---------------------------------------|------------------------------------------|
-| POST   | `/api/login`                          | JWT + CSRF token + cookies               |
-| POST   | `/api/logout`                         | Clear session cookies                    |
-| GET    | `/api/session`                        | Check current session                    |
-| GET    | `/api/status`                         | Full SystemStatus (12 channels + PIRs)   |
-| GET    | `/api/version`                        | FirmwareInfo + OTA status                |
-| GET    | `/api/health`                         | Hardware diagnostics                     |
-| POST   | `/api/relay`                          | SET_STATE on/off / set_mode (no TOGGLE)  |
-| POST   | `/api/schedule`                       | Upsert schedule (per-channel, max 4)     |
-| DELETE | `/api/schedule?id=N`                  | Delete schedule                          |
-| POST   | `/api/pir`                            | Update PIR config (enabled / holdTime)   |
-| POST   | `/api/pir/test`                       | Manual test trigger                      |
-| POST   | `/api/time`                           | Set RTC time                             |
-| GET    | `/api/log?type=&channelId=&limit=`    | Filterable activity log (JSON)           |
-| GET    | `/api/audit_log`                      | Plain-text audit log                     |
-| GET    | `/api/config`                         | User + device info                       |
-| POST   | `/api/config`                         | Update username / password (legacy)      |
-| POST   | `/api/config/device`                  | Update device name / timezone            |
-| POST   | `/api/config/password`                | Change password (verify current)         |
-| GET    | `/api/config/export`                  | Full backup JSON                         |
-| POST   | `/api/config/import`                  | Restore from backup JSON                 |
-| POST   | `/api/reboot`                         | Reboot ESP32                             |
-| POST   | `/api/ota`                            | Upload firmware binary                   |
-| POST   | `/api/ota/check`                      | Check GitHub Release for newer firmware  |
-| POST   | `/api/factory_reset/prepare`          | Generate one-time reset token (60s)      |
-| POST   | `/api/factory_reset/confirm`          | Execute factory reset                    |
+2. **Execute→store gap**: If ESP32 crashes between executing a command and storing to NVS journal, the command will be re-executed on PWA retry. For SET_STATE (relay ON/OFF): idempotent, safe. For schedule upsert: may create duplicate (capped at 4/channel). **Fundamental limitation** without hardware transaction support.
+
+3. **Ed25519 build verification**: PSA Crypto API identifiers are correct per spec, but actual build + known-answer test on Arduino IDE 2.3.8 + ESP32 core 3.3.7 has NOT been verified. If `PSA_ECC_FAMILY_TWISTED_EDWARDS` is not defined, enable via menuconfig → mbedTLS → Elliptic Curve DH/DSA.
+
+4. **NVS wear**: 64 entries × ~5 NVS writes per transaction = ~320 writes per full journal cycle. At 100 commands/day: ~3-5 year flash lifetime. Acceptable for IoT device.
+
+5. **Development default**: Repository ships with insecure defaults (HiveMQ public, port 1883, no auth, CORS `*`). This is for development only. **Use PRODUCTION_BUILD flag for real deployment.**
 
 ---
 
-## Security Audit Notes
+## Troubleshooting
 
-This firmware has been through 8 rounds of security audit by an external engineer. Key hardening already applied:
+### Firmware won't compile
 
-### Already Fixed
+- **`PSA_ECC_FAMILY_TWISTED_EDWARDS` not defined**: Enable mbedTLS Ed25519 via menuconfig (PlatformIO) or Arduino IDE board config.
+- **`esp_crc.h` not found**: Should be in ESP32 core 3.x. If missing, install/update ESP32 core.
+- **`mbedtls/ed25519.h` not found**: This header was REMOVED in mbedtls 3.x. The code now uses `psa/crypto.h` instead. If you see this error, you're compiling an old version.
 
-- ✅ **MQTT transaction ACK layer** (PWA side): UUID requestId, 5s timeout, deep schema validation, settle-once connect pattern, subscribe-before-resolve
-- ✅ **Firmware requestId dedup**: ring buffer of 16, re-ACKs duplicates (does NOT re-execute) — safe for at-least-once MQTT delivery
-- ✅ **Idempotent relay control**: `SET_STATE ON/OFF` only (no `TOGGLE`) — retried commands converge to same state
-- ✅ **JWT secret never leaks**: stored in NVS, not in any API response or log
-- ✅ **CSRF double-submit cookie**: sameSite=Strict, constant-time compare
-- ✅ **Factory reset 2-step**: prepare → confirm with one-time token (60s TTL)
-- ✅ **Watchdog-safe GAS POST**: HTTP timeout 8s, `esp_task_wdt_reset()` during file reads and HTTP
-- ✅ **Anonymous device ID for Gemini**: SHA-256(MAC) prefix, never raw MAC
-- ✅ **PZEM alarm cooldown**: 60s between same-alarm repeats (prevents log spam)
-- ✅ **CRC validation on PZEM Modbus**: corrupt frames dropped silently
-- ✅ **Boot glitch fix**: relay pins pulled HIGH during boot (active-LOW relays stay OFF until explicitly driven)
+### MQTT won't connect
 
-### Known Limitations (updated Round 10E)
+- **`FATAL: Production mode requires MQTT_ROOT_CA`**: Paste ISRG Root X1 PEM into `Config.h MQTT_ROOT_CA`.
+- **`FATAL: PRODUCTION_BUILD requires TLS port`**: Change `MQTT_BROKER_PORT` to 8883.
+- **Connection refused**: Check Mosquitto is running, firewall allows port 8883, TLS cert is valid.
+- **Auth failed**: Check `MQTT_BROKER_USERNAME`/`PASSWORD` match `mosquitto_passwd` entries.
 
-- ⚠️ **MQTT broker**: HiveMQ public broker (port 1883, anonymous) is the DEFAULT for development only. For production 220V relay control, deploy self-hosted Mosquitto with TLS (port 8883) + ACL + per-device credentials. Set `MQTT_BROKER_HOST`, `MQTT_BROKER_PORT=8883`, `MQTT_BROKER_USERNAME`, `MQTT_BROKER_PASSWORD`, `MQTT_ROOT_CA` in `Config.h`. Firmware will hard-fail if any is missing in production mode (R10A-5).
-- ⚠️ **Ed25519 build verification**: PSA Crypto API identifiers are correct (R10D-1), but actual build + known-answer test on Arduino IDE 2.3.8 + ESP32 core 3.3.7 has NOT been verified by the developer. If `PSA_ECC_FAMILY_TWISTED_EDWARDS` is not defined, enable via menuconfig → mbedTLS → Elliptic Curve DH/DSA.
-- ⚠️ **CORS**: `ALLOWED_CORS_ORIGINS = "*"` is the DEFAULT (development). For production, set to your PWA's Vercel URL in `Config.h`.
-- ⚠️ **OTA signing**: `OTA_ED25519_PUBLIC_KEY_HEX` and `OTA_HTTPS_ROOT_CA` are empty by default. OTA will hard-fail until these are configured. Generate keypair with `scripts/sign_firmware.py --gen-keys`.
-- ⚠️ **MQTT topic password**: REMOVED from topic in R10C-3. Auth is now via broker credentials. The `mqttPass` value from Serial Monitor is kept for backward compat but NOT used in topic path.
+### OTA fails
 
-See `firmware/CONTRACT_VERIFICATION.md` (not included in this repo — ask the project owner) for the full audit trail.
+- **`OTA: FATAL — OTA_ED25519_PUBLIC_KEY_HEX not configured`**: Generate keys with `sign_firmware.py --gen-keys`, paste public key into Config.h.
+- **`Ed25519 signature verification FAILED`**: Ensure you signed with `sign_firmware.py` (signs SHA-256 hash, NOT full binary). Do NOT use `openssl pkeyutl` directly.
+- **`SHA-256 mismatch`**: Binary was modified after signing. Re-sign after any change.
+- **`downgrade blocked`**: New version must be strictly greater than current (e.g., 4.0.0 → 4.1.0).
+
+### PWA can't connect
+
+- **PWA shows "MQTT password must be at least 4 chars"**: Enter the 8-char password from Serial Monitor.
+- **MQTT timeout**: Check broker URL in PWA env vars (`NEXT_PUBLIC_MQTT_BROKER_URL`). Must be `wss://` (not `ws://`) for TLS.
+- **PWA shows "LAN mode disabled"**: This is expected in production MQTT-only mode. Use the MQTT card instead.
+
+### GAS insights not working
+
+- **`Device not registered (no HMAC secret found)`**: Copy the GAS HMAC secret from ESP32 Serial to GAS Script Properties.
+- **`Timestamp out of tolerance`**: Ensure ESP32 RTC is set (via PWA Settings → Set RTC Time).
+- **`Invalid signature`**: Ensure GAS secret in Script Properties matches exactly what ESP32 printed to Serial.
 
 ---
 
-## Companion PWA Dashboard
+## Companion Repositories
 
-The web UI lives in a separate repo: **[desvandi/Remote-Relay](https://github.com/desvandi/Remote-Relay)**
-
-- Next.js 16 PWA with App Router, TypeScript 5, Tailwind 4, shadcn/ui
-- Deployed on Vercel (free tier)
-- Two login modes:
-  - **LAN/REST mode**: calls ESP32 REST API via Cloudflare Tunnel (fast, same-WiFi)
-  - **MQTT remote mode**: connects directly to MQTT broker over WSS (works from anywhere, no port forwarding)
+- **PWA Dashboard**: [desvandi/Remote-Relay](https://github.com/desvandi/Remote-Relay) — Next.js 16 PWA, deployed on Vercel
+- **Firmware + Code.gs**: This repo
 
 ---
 
