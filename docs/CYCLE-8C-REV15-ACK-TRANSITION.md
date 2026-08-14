@@ -1,3 +1,15 @@
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  This document has been superseded by Rev16 for ACK state machine + retention.  ║ -->
+<!-- ║  Refer to:                                                ║ -->
+<!-- ║    - CYCLE-8C-REV16-ACK-STATE-MACHINE-CLOSURE.md           ║ -->
+<!-- ║  for the authoritative supplement.                          ║ -->
+<!-- ║  Rev15 remains authoritative for mutation boundary, terminology, CRC gate.  ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
 # CYCLE-8C-Rev15: Transaction Journal v4 — ACK Transition & Mutation Boundary Closure
 
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
