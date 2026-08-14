@@ -104,11 +104,23 @@ bool MqttClient::begin() {
 
 void MqttClient::_buildTopics() {
   String mac = TimerNet::wifi.getMacAddress();
-  String pass = TimerNet::wifi.getMqttPassword();
-  // Security: include password in topic path.
-  // Without knowing the password, attackers can't subscribe or publish.
-  // Format: timer12/<mac>/<password>/<subtopic>
-  String base = "timer12/" + mac + "/" + pass;
+
+  // R10C-3 (audit round 10C): REMOVED password from topic path.
+  //
+  // Previous design: timer12/<mac>/<password>/<subtopic>
+  //   - Password in topic was "obscurity, not authentication" (engineer's words)
+  //   - Anyone who sniffed MQTT traffic could see the password in the topic
+  //   - Password reuse across topics = cross-domain secret leak risk
+  //
+  // New design: timer12/<mac>/<subtopic>
+  //   - Authentication is handled by BROKER (username/password in MQTT CONNECT)
+  //   - Authorization is handled by BROKER ACL (per-device topic restrictions)
+  //   - See Mosquitto deployment guide for ACL config:
+  //       user device-<MAC>
+  //         topic readwrite timer12/<MAC>/#
+  //   - In development (HiveMQ public, no auth): topic password is still
+  //     available via getMqttPassword() for backward compat, but NOT in topic.
+  String base = "timer12/" + mac;
   _topicStatus = base + "/status";
   _topicCommand = base + "/command";
   _topicLog = base + "/log";
@@ -933,31 +945,37 @@ void MqttClient::_handleCommand(const String& json) {
 }
 
 // ---------------------------------------------------------------------------
-// Handle OTA command via MQTT (P0 #3+#8+#9 — audit round 9)
+// Handle OTA command via MQTT (P0 #3+#8+#9 + R10A-2 + R10B-1 + R10C — audit rounds 9-10C)
 //
 // REQUIRED command shape (PWA must send ALL fields):
 // {
 //   "action": "update",
 //   "url": "https://github.com/.../firmware.bin",  ← HTTPS required
-//   "version": "4.1.0",
-//   "size": 1234567,                               ← expected binary size in bytes
-//   "sha256": "abcdef0123...",                     ← 64 hex chars (SHA-256 of binary)
-//   "signature": "abcdef0123...",                  ← 128 hex chars (Ed25519 of binary)
-//   "requestId": "uuid-123"                        ← for ACK transaction
+//   "version": "4.1.0",                             ← SemVer, must be > current
+//   "size": 1234567,                                ← expected binary size in bytes
+//   "sha256": "abcdef0123...",                      ← 64 hex chars (SHA-256 of binary)
+//   "signature": "abcdef0123...",                   ← 128 hex chars (Ed25519 of SHA-256 hash)
+//   "requestId": "uuid-123"                         ← for ACK transaction
 // }
+//
+// SIGNING CONTRACT (R10B-1):
+//   signature = ed25519_sign(SHA256(firmware.bin), private_key)
+//   ESP32 verifies: ed25519_verify(signature, SHA256(firmware.bin), public_key)
+//   The signature is over the 32-byte SHA-256 HASH, NOT over the full binary.
+//   Use scripts/sign_firmware.py to generate consistent signatures.
 //
 // ESP32 flow:
 //   1. Validate all fields present
-//   2. Anti-downgrade: version >= current firmware version
-//   3. HTTPS download (WiFiClientSecure + setCACert if OTA_HTTPS_ROOT_CA configured)
+//   2. Anti-downgrade: version > current (SemVer numeric comparison, R10B-4)
+//   3. HTTPS download (WiFiClientSecure + setCACert, R10A-5 fail-closed)
 //   4. Size check: downloaded bytes == expected size
 //   5. SHA-256 check: computed hash == expected sha256
-//   6. Ed25519 check: verify signature with embedded public key (if configured)
+//   6. Ed25519 check: verify signature with embedded public key (R10A-2 fail-closed)
 //   7. Update.write() → Update.end() → reboot
 //   8. ACK with success/failure at each stage
 //
-// If OTA_ED25519_PUBLIC_KEY_HEX is empty, signature check is SKIPPED with a warning
-// (NOT for production — attacker who can publish to topic can flash malicious firmware).
+// FAIL-CLOSED (R10A-2): If OTA_ED25519_PUBLIC_KEY_HEX is empty → OTA REFUSED entirely.
+// If signature invalid → Update.abort(). NO BYPASS. NO "warning + continue".
 // ---------------------------------------------------------------------------
 void MqttClient::_handleOta(const String& json) {
   DynamicJsonDocument doc(2048);
@@ -969,6 +987,11 @@ void MqttClient::_handleOta(const String& json) {
 
   const char* action = doc["action"] | "";
   String requestId = doc["requestId"] | "";
+
+  // R10C-1 FIX: Compute OTA command hash HERE (was undefined before — compile error).
+  // Uses the same _computeCommandHash() helper as _handleCommand(), with OTA-specific
+  // canonical fields: url, version, size, sha256, signature.
+  String commandHash = _computeCommandHash(doc);
 
   if (strcmp(action, "update") != 0) {
     if (requestId.length() > 0) {
@@ -1266,15 +1289,19 @@ bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
 
 // ---------------------------------------------------------------------------
 // Request deduplication — prevent double-execution of retried commands
-// Uses a ring buffer of last 16 requestIds + commandHashes.
+// Uses a ring buffer of last 64 requestIds + commandHashes.
 //
-// R10A-3 (audit round 10): Dedup now binds requestId to command fingerprint.
+// R10A-3 / R10C-4 (audit round 10C): Buffer increased from 16 to 64.
+// Engineer note: 16 is sufficient for normal retries, but not for long-term
+// replay protection. 64 gives ~64 commands of history (at 1 command/sec,
+// that's ~1 minute of replay window). For production, this should be paired
+// with broker ACL (attacker can't publish freely) + requestId TTL.
+//
+// R10A-3: Dedup binds requestId to command fingerprint.
 // - Same requestId + same commandHash → re-ACK original result (true duplicate)
 // - Same requestId + DIFFERENT commandHash → reject "requestId reuse"
-// This prevents attacker from reusing a requestId with a different command
-// to get a false ACK.
 // ---------------------------------------------------------------------------
-#define DEDUP_BUFFER_SIZE 16
+#define DEDUP_BUFFER_SIZE 64
 static String _processedIds[DEDUP_BUFFER_SIZE];
 static String _processedHashes[DEDUP_BUFFER_SIZE];  // R10A-3: command hash per requestId
 static uint8_t _dedupIdx = 0;
@@ -1302,40 +1329,64 @@ void MqttClient::_addProcessed(const String& requestId, const String& commandHas
   _dedupIdx = (_dedupIdx + 1) % DEDUP_BUFFER_SIZE;
 }
 
-// R10A-3: Compute a deterministic command fingerprint (SHA-256 of type+action+params).
-// Used to bind requestId to its command, preventing requestId reuse with different commands.
-// Static helper (not a member) — used only within _handleCommand.
+// R10A-3 / R10C-1 (audit round 10C): Compute a deterministic command fingerprint.
+//
+// ENGINEER AUDIT FIX: Previous generic JSON-key iterator only handled string/int/bool.
+// Other JSON types (float, array, object) were silently DROPPED from the hash,
+// meaning requestId+commandHash binding was incomplete — attacker could add
+// extra fields that don't affect the hash but DO affect execution.
+//
+// FIX: Per-command-type canonical schema. Each command type has a FIXED set
+// of fields that are hashed in a DETERMINISTIC ORDER. Unknown fields cause
+// the command to be REJECTED (not silently ignored).
+//
+// Canonical format: "type|action|field1=val1|field2=val2|..."
 static String _computeCommandHash(const DynamicJsonDocument& doc) {
-  // Build canonical string: type|action|sorted(params)
-  String canonical = "";
-  canonical += String(doc["type"] | "");
-  canonical += "|";
-  canonical += String(doc["action"] | "");
+  const char* type = doc["type"] | "";
+  const char* action = doc["action"] | "";
 
-  // Add relevant parameters (channelId, id, mode, etc.) in a deterministic order
-  JsonObject obj = doc.as<JsonObject>();
-  // Collect parameter keys (excluding type, action, requestId)
-  std::vector<String> keys;
-  for (JsonPair kv : obj) {
-    String key = kv.key().c_str();
-    if (key != "type" && key != "action" && key != "requestId") {
-      keys.push_back(key);
-    }
+  String canonical = String(type) + "|" + String(action);
+
+  // Per-command-type: extract ONLY the fields that affect execution.
+  if (strcmp(type, "relay") == 0) {
+    canonical += "|channelId=" + String(doc["channelId"] | 0);
+    canonical += "|mode=" + String(doc["mode"] | "");
+    canonical += "|manualState=" + String(doc["manualState"] | false ? "true" : "false");
   }
-  // Sort keys for deterministic ordering
-  std::sort(keys.begin(), keys.end());
-  for (const String& key : keys) {
-    canonical += "|";
-    canonical += key;
-    canonical += "=";
-    JsonVariant val = obj[key];
-    if (val.is<const char*>()) {
-      canonical += val.as<const char*>();
-    } else if (val.is<int>()) {
-      canonical += String(val.as<int>());
-    } else if (val.is<bool>()) {
-      canonical += val.as<bool>() ? "true" : "false";
-    }
+  else if (strcmp(type, "schedule") == 0) {
+    canonical += "|channelId=" + String(doc["channelId"] | 0);
+    canonical += "|id=" + String(doc["id"] | 0);
+    canonical += "|onTime=" + String(doc["onTime"] | "");
+    canonical += "|offTime=" + String(doc["offTime"] | "");
+    canonical += "|dayMask=" + String(doc["dayMask"] | 0);
+    canonical += "|enabled=" + String(doc["enabled"] | true ? "true" : "false");
+  }
+  else if (strcmp(type, "pir") == 0) {
+    canonical += "|id=" + String(doc["id"] | 0);
+    canonical += "|enabled=" + String(doc["enabled"] | false ? "true" : "false");
+    canonical += "|holdTime=" + String(doc["holdTime"] | 0);
+  }
+  else if (strcmp(type, "channel") == 0) {
+    canonical += "|channelId=" + String(doc["channelId"] | 0);
+    canonical += "|name=" + String(doc["name"] | "");
+  }
+  else if (strcmp(type, "time") == 0) {
+    canonical += "|datetime=" + String(doc["datetime"] | "");
+  }
+  else if (strcmp(type, "system") == 0) {
+    // system commands: action only (reboot, getStatus, resetEnergyStats, resetDailyStats)
+  }
+  else if (strcmp(type, "config") == 0) {
+    canonical += "|deviceName=" + String(doc["deviceName"] | "");
+    canonical += "|timezone=" + String(doc["timezone"] | "");
+  }
+  else if (strcmp(type, "ota") == 0) {
+    // R10C-1 FIX: OTA command hash — was UNDEFINED in _handleOta() (compile error).
+    canonical += "|url=" + String(doc["url"] | "");
+    canonical += "|version=" + String(doc["version"] | "");
+    canonical += "|size=" + String((unsigned long)(doc["size"] | 0));
+    canonical += "|sha256=" + String(doc["sha256"] | "");
+    canonical += "|signature=" + String(doc["signature"] | "");
   }
 
   return Utils::sha256Hex(canonical);

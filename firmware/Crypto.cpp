@@ -282,21 +282,25 @@ String generateToken(size_t hexChars) {
   return s;
 }
 
-// R10A-2 (audit round 10): Ed25519 signature verification for OTA firmware.
-// Uses mbedtls's Ed25519 implementation (bundled with ESP32 Arduino core).
+// R10A-2 / R10C-2 (audit round 10C): Ed25519 signature verification for OTA firmware.
 //
-// Construction: signs the 32-byte SHA-256 hash of the firmware binary
-// (NOT the full binary — ESP32 doesn't have enough RAM to buffer 2MB).
-// The PWA signing tool must use the same convention: sign SHA-256(firmware).
+// ENGINEER AUDIT FIX: Previous implementation used #include <mbedtls/ed25519.h>
+// and mbedtls_ed25519_verify() — but this low-level API was REMOVED in mbedtls 3.x
+// (used by ESP32 Arduino core 3.x). The header likely does NOT exist, causing
+// compile failure.
 //
-// This is "pure Ed25519 over a hash" — not standard Ed25519ph (which uses
-// a different domain separator), but cryptographically sound as long as
-// both sides agree. The signature proves: "holder of private key signs
-// this 32-byte hash", and SHA-256 is collision-resistant.
+// FIX: Use PSA Crypto API (psa/crypto.h) which IS available in ESP-IDF 5.x
+// (bundled with ESP32 Arduino core 3.x). PSA is the officially supported
+// crypto API for ESP32. Ed25519 is supported via PSA_KEY_TYPE_ED25519_PUBLIC_KEY.
+//
+// Signing contract (R10B-1):
+//   signature = ed25519_sign(SHA256(firmware.bin), private_key)
+//   ESP32 verifies: ed25519_verify(signature, SHA256(firmware.bin), public_key)
+//   We pass the 32-byte SHA-256 hash as the "message" to PSA.
+//   Signing tool (scripts/sign_firmware.py) uses the same convention.
 bool ed25519VerifyHash(const char* publicKeyHex,
                        const char* signatureHex,
                        const uint8_t* hashBytes, size_t hashLen) {
-#if defined(MBEDTLS_ED25519_C)
   // Parse public key (32 bytes from 64 hex chars)
   if (strlen(publicKeyHex) != 64) {
     Serial.println("[Ed25519] Invalid public key length (must be 64 hex chars)");
@@ -324,36 +328,57 @@ bool ed25519VerifyHash(const char* publicKeyHex,
     return false;
   }
 
-  // Use mbedtls's Ed25519 verify (pure mode — signs the message directly)
-  // We pass the 32-byte SHA-256 hash as the "message".
-  // mbedtls_ed25519_verify returns 0 on success, non-zero on failure.
-  extern "C" {
-    #include <mbedtls/ed25519.h>
-  }
+  // Use PSA Crypto API for Ed25519 verification.
+  // PSA is the officially supported crypto API in ESP-IDF 5.x / Arduino core 3.x.
+  #include <psa/crypto.h>
 
-  int ret = mbedtls_ed25519_verify(
-    signature, 64,           // signature + length
-    hashBytes, hashLen,      // message + length (here: the SHA-256 hash)
-    publicKey, 32            // public key + length
-  );
-
-  // Clear sensitive data
-  memset(publicKey, 0, sizeof(publicKey));
-
-  if (ret != 0) {
-    Serial.printf("[Ed25519] Verification FAILED (mbedtls error: -0x%04X)\n", -ret);
+  // Initialize PSA (idempotent — safe to call multiple times)
+  psa_status_t status = psa_crypto_init();
+  if (status != PSA_SUCCESS) {
+    Serial.printf("[Ed25519] psa_crypto_init failed: %d\n", (int)status);
+    memset(publicKey, 0, sizeof(publicKey));
+    memset(signature, 0, sizeof(signature));
     return false;
   }
 
-  Serial.println("[Ed25519] Signature verified OK");
+  // Set up key attributes for Ed25519 public key
+  psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
+  psa_set_key_type(&attrs, PSA_KEY_TYPE_ED25519_PUBLIC_KEY);
+  psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_VERIFY_MESSAGE);
+  psa_set_key_algorithm(&attrs, PSA_ALG_PURE_ED25519);
+
+  // Import the public key
+  psa_key_id_t key_id = 0;
+  status = psa_import_key(&attrs, publicKey, 32, &key_id);
+  if (status != PSA_SUCCESS) {
+    Serial.printf("[Ed25519] psa_import_key failed: %d\n", (int)status);
+    Serial.println("[Ed25519] If PSA_KEY_TYPE_ED25519_PUBLIC_KEY is not defined,");
+    Serial.println("[Ed25519]   Ed25519 is not compiled into this ESP32 mbedtls config.");
+    Serial.println("[Ed25519]   Enable via menuconfig → Component config → mbedTLS →");
+    Serial.println("[Ed25519]   Curve25519/Curve448 (enable ED25519).");
+    memset(publicKey, 0, sizeof(publicKey));
+    memset(signature, 0, sizeof(signature));
+    return false;
+  }
+
+  // Verify the signature over the SHA-256 hash (passed as "message")
+  // PSA_ALG_PURE_ED25519 signs the message directly — we pass the 32-byte hash.
+  status = psa_verify_message(key_id, PSA_ALG_PURE_ED25519,
+                               hashBytes, hashLen,
+                               signature, 64);
+
+  // Clean up
+  psa_destroy_key(key_id);
+  memset(publicKey, 0, sizeof(publicKey));
+  memset(signature, 0, sizeof(signature));
+
+  if (status != PSA_SUCCESS) {
+    Serial.printf("[Ed25519] Verification FAILED (PSA error: %d)\n", (int)status);
+    return false;
+  }
+
+  Serial.println("[Ed25519] Signature verified OK (PSA Crypto)");
   return true;
-#else
-  Serial.println("[Ed25519] FATAL: MBEDTLS_ED25519_C not compiled in!");
-  Serial.println("[Ed25519] Enable in ESP32 Arduino core mbedtls config:");
-  Serial.println("[Ed25519]   #define MBEDTLS_ED25519_C");
-  Serial.println("[Ed25519]   #define MBEDTLS_SHA512_C  (Ed25519 uses SHA-512 internally)");
-  return false;  // fail-closed
-#endif
 }
 
 } // namespace Utils
