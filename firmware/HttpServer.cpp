@@ -165,6 +165,9 @@ void HttpServer::_registerRoutes() {
   http.on("/api/status", HTTP_GET, Web::Handlers::handleStatus);
   http.on("/api/version", HTTP_GET, Web::Handlers::handleVersion);
   http.on("/api/health", HTTP_GET, Web::Handlers::handleHealth);
+  // CYCLE-7 (fixes F-013): endpoint for PWA to fetch GAS HMAC secret.
+  //   PWA uses this secret to sign GET requests to GAS (Code.gs now requires HMAC).
+  http.on("/api/gas_secret", HTTP_GET, Web::Handlers::handleGasSecret);
 
   // Relay
   http.on("/api/relay", HTTP_POST, Web::Handlers::handleRelay);

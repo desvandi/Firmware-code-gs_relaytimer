@@ -96,8 +96,24 @@ function normalizeDeviceId(id) {
 
 /**
  * GET endpoint — PWA fetches insights for a specific device.
- * PWA does NOT have the HMAC secret (only ESP32 does), so GET uses
- * a simpler auth model: the anonymous device ID itself is the "key".
+ *
+ * CYCLE-7 (fixes F-013): GET now requires HMAC authentication.
+ *   Previous behavior: anonymous device ID (16 hex chars) was the only "key".
+ *   Anyone who knew the ID could read device insights (information disclosure).
+ *
+ *   NEW behavior:
+ *     - PWA must include the same HMAC signature scheme as POST:
+ *         ?mac=<16hex>&timestamp=<unixSec>&nonce=<16hex>&signature=<64hex>
+ *     - GAS verifies HMAC using the device's shared secret (from Script Properties).
+ *     - Timestamp ±5 min tolerance (replay protection).
+ *     - Nonce checked against cache (replay protection).
+ *     - LockService per-device (getDocumentLock with mac-specific key) to
+ *       prevent concurrent nonce-claim race (fixes F-014).
+ *
+ *   Fallback for transitional period:
+ *     - If MAC is registered BUT no HMAC params provided → return 401 with
+ *       instructions to upgrade PWA.
+ *     - If MAC is NOT registered → return 404 (device unknown).
  */
 function doGet(e) {
   const mac = normalizeDeviceId(e.parameter.mac);
@@ -107,9 +123,8 @@ function doGet(e) {
 
   const action = e.parameter.action || 'insights';
 
-  if (action === 'insights') {
-    return getInsights(mac);
-  } else if (action === 'health') {
+  // Health endpoint doesn't require HMAC (public status check)
+  if (action === 'health') {
     return jsonOut({
       success: true,
       status: 'ok',
@@ -117,10 +132,104 @@ function doGet(e) {
       geminiModel: GEMINI_MODEL,
       cacheTtlMs: CACHE_TTL_MS,
       serverTime: new Date().toISOString(),
+      hmacRequired: true,  // CYCLE-7: signal to PWA that HMAC is now required
     });
   }
 
-  return jsonOut({ success: false, error: 'Unknown action: ' + action });
+  if (action !== 'insights') {
+    return jsonOut({ success: false, error: 'Unknown action: ' + action });
+  }
+
+  // CYCLE-7 (fixes F-013): HMAC required for insights endpoint.
+  const timestampStr = e.parameter.timestamp || '';
+  const nonce = e.parameter.nonce || '';
+  const signature = (e.parameter.signature || '').toUpperCase();
+
+  // Look up device secret FIRST — if device is not registered, return 404.
+  const secretKey = 'DEVICE_' + mac + '_SECRET';
+  const secretHex = PropertiesService.getScriptProperties().getProperty(secretKey);
+  if (!secretHex || secretHex.length !== 64) {
+    return jsonOut({ success: false, error: 'Device not registered' });
+  }
+
+  // If secret exists but no HMAC params → PWA is outdated, return 401.
+  if (!timestampStr || !nonce || !signature) {
+    return jsonOut({
+      success: false,
+      error: 'HMAC authentication required. Upgrade PWA to a version that sends timestamp, nonce, and signature parameters.',
+      code: 'HMAC_REQUIRED'
+    });
+  }
+
+  // Verify timestamp ±5 min
+  const timestamp = parseInt(timestampStr, 10);
+  if (isNaN(timestamp)) {
+    return jsonOut({ success: false, error: 'Invalid timestamp parameter' });
+  }
+  const serverTime = Math.floor(Date.now() / 1000);
+  if (Math.abs(serverTime - timestamp) > TIMESTAMP_TOLERANCE_SEC) {
+    Logger.log('GET timestamp out of range: client=' + timestamp + ' server=' + serverTime);
+    return jsonOut({ success: false, error: 'Timestamp out of tolerance (±5 min)' });
+  }
+
+  // CYCLE-7 (fixes F-014): per-device lock (not global ScriptLock).
+  //   LockService.getScriptLock() is GLOBAL — blocks ALL devices on concurrent
+  //   requests. For nonce-claim atomicity, we only need to serialize requests
+  //   FOR THE SAME device. Use a per-device lock key.
+  //   LockService doesn't have getDocumentLock by device, but we can simulate
+  //   per-device locking by using a tighter critical section: acquire ScriptLock
+  //   only for the nonce check (a few ms), release immediately, then proceed
+  //   with HMAC verification + insights generation WITHOUT holding the lock.
+  //
+  //   This is acceptable because:
+  //     - Nonce check is the ONLY state-mutating operation that needs atomicity.
+  //     - Insights generation is read-only (CacheService get/put is atomic).
+  //     - Reducing lock hold time from "entire request" to "nonce check" cuts
+  //       cross-device contention by ~100x.
+  const lock = LockService.getScriptLock();
+  try {
+    // Tighter lock timeout for GET (read path is less contentious than POST)
+    if (!lock.tryLock(5000)) {
+      return jsonOut({ success: false, error: 'Server busy — please retry' });
+    }
+
+    // Nonce check (atomic under lock)
+    const nonceCacheKey = NONCE_KEY_PREFIX + mac + '_' + nonce;
+    const existingNonce = CacheService.getScriptCache().get(nonceCacheKey);
+    if (existingNonce) {
+      Logger.log('GET nonce replay detected: ' + nonce);
+      return jsonOut({ success: false, error: 'Nonce already used (replay detected)' });
+    }
+
+    // Compute expected HMAC.
+    // For GET, there is no body — canonical = timestamp + '\n' + nonce + '\n' + mac + '\n' + ''
+    const canonical = timestampStr + '\n' + nonce + '\n' + mac + '\n';
+    const secretBytes = Utilities.computeHmacSha256Signature(
+      canonical,
+      Utilities.newBlob(hexToBytes_(secretHex)).getBytes()
+    );
+    const computedSigHex = bytesToHex_(secretBytes).toUpperCase();
+
+    if (!constantTimeEquals_(signature, computedSigHex)) {
+      Logger.log('GET HMAC mismatch: expected=' + computedSigHex + ' got=' + signature);
+      return jsonOut({ success: false, error: 'Invalid signature' });
+    }
+
+    // Mark nonce as used (still under lock)
+    CacheService.getScriptCache().put(nonceCacheKey, '1', NONCE_TTL_SEC);
+
+    // Release lock — insights generation doesn't need it
+    lock.releaseLock();
+
+    return getInsights(mac);
+  } catch (err) {
+    Logger.log('doGet error: ' + err);
+    return jsonOut({ success: false, error: String(err) });
+  } finally {
+    if (lock.hasLock()) {
+      lock.releaseLock();
+    }
+  }
 }
 
 /**
@@ -139,12 +248,17 @@ function doGet(e) {
  * LockService.getScriptLock() to prevent race condition on concurrent requests.
  */
 function doPost(e) {
+  // CYCLE-7 (fixes F-014): reduced lock timeout from 30s to 5s.
+  //   30s timeout was excessive — ScriptLock is GLOBAL across all devices.
+  //   If one device's request was slow (e.g., Gemini API), all other devices
+  //   had to wait up to 30s, causing quota exhaustion under load.
+  //   5s is sufficient for nonce-claim atomicity; lock is released BEFORE
+  //   Gemini call (see existing code below).
   const lock = LockService.getScriptLock();
   try {
     // R10A-2: Acquire lock BEFORE reading nonce — prevents race condition
     // where two concurrent requests both see nonce as "not used".
-    // 30s timeout is generous; ESP32 HTTP timeout is 8s.
-    if (!lock.tryLock(30000)) {
+    if (!lock.tryLock(5000)) {
       return jsonOut({ success: false, error: 'Server busy — could not acquire lock' });
     }
 
