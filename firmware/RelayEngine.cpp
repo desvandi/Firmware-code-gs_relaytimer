@@ -1,6 +1,13 @@
 // =============================================================================
 // Services/RelayEngine.cpp
 // =============================================================================
+// CYCLE-8B (C8A-007): Added boot phase guard — RelayEngine cannot modify
+//   relay state during PRE_INIT/SAFE_INIT/LOADING_NVS/SNAPSHOT/RECONCILING
+//   phases. Only RESTORING (forceRefresh from setup) and RUNNING (normal
+//   operation) are allowed to modify relay state.
+//   This prevents scheduler/PIR logic from contaminating the snapshot used
+//   for transaction reconciliation.
+// =============================================================================
 #include "RelayEngine.h"
 #include "RelayDriver.h"
 #include "PirDriver.h"
@@ -9,6 +16,7 @@
 #include "LogService.h"
 #include "ConfigStore.h"
 #include "Globals.h"
+#include "TransactionJournal.h"  // CYCLE-8B: boot phase guard
 
 namespace Services {
 
@@ -66,6 +74,14 @@ bool RelayEngine::_computeChannel(uint8_t idx, uint16_t currentMin, int weekdayI
 }
 
 void RelayEngine::tick() {
+  // CYCLE-8B (C8A-007): Guard against relay modification during boot recovery.
+  // During PRE_INIT through RECONCILING phases, RelayEngine must NOT modify
+  // relay state — this would contaminate the snapshot used for reconciliation.
+  // Only RESTORING (forceRefresh from setup) and RUNNING (normal loop) are allowed.
+  if (!Services::journal.isRunning() &&
+      Services::journal.getBootPhase() != BootPhase::RESTORING) {
+    return;
+  }
   if (!Drivers::rtc.isValid()) return;
   int y, m, d, h, mi, s, weekday;
   Drivers::rtc.getDateTime(y, m, d, h, mi, s, weekday);

@@ -123,6 +123,16 @@ void setup() {
   Serial.println(F("Cloud-Ready Architecture (modular)"));
   Serial.println(F("========================================"));
 
+  // CYCLE-8B: Boot recovery phase tracking.
+  // Boot sequence is now EXPLICIT about ordering to fix C8A-001:
+  //   1. PRE_INIT → SAFE_INIT: minimal GPIO init (all OFF, known safe state)
+  //   2. SAFE_INIT → LOADING_NVS: load LittleFS, config, RTC
+  //   3. LOADING_NVS → SNAPSHOT: capture raw GPIO output state
+  //   4. SNAPSHOT → RECONCILING: reconcile incomplete transactions
+  //   5. RECONCILING → RESTORING: start MQTT/journal, restore app state
+  //   6. RESTORING → RUNNING: start RelayEngine (NOW it can apply logic)
+  Services::journal.setBootPhase(Services::BootPhase::PRE_INIT);
+
   // ---------- WATCHDOG INIT ----------
 #if ESP_IDF_VERSION_MAJOR >= 5
   esp_task_wdt_config_t twdt_config = {
@@ -136,7 +146,7 @@ void setup() {
 #endif
   esp_task_wdt_add(NULL);
 
-  // ---------- INIT DRIVERS (PIR + Relays before storage to avoid glitches) ----------
+  // ---------- INIT DRIVERS (PIR first to avoid glitches) ----------
   Drivers::pir.begin();
   esp_task_wdt_reset();
 
@@ -158,6 +168,7 @@ void setup() {
   Services::Log.begin();
 
   // ---------- STORAGE: load configs ----------
+  Services::journal.setBootPhase(Services::BootPhase::LOADING_NVS);
   Storage::config.loadDeviceConfig();
   esp_task_wdt_reset();
   Storage::config.loadUserConfig();
@@ -166,14 +177,25 @@ void setup() {
   esp_task_wdt_reset();
 
   // ---------- DRIVERS: RTC + Relays ----------
+  // CYCLE-8B: RelayDriver.begin() sets all relays to OFF (safe state).
+  // This is the "SAFE_INIT" phase — GPIO is now in a known state.
+  // We do NOT call RelayEngine.forceRefresh() here (that comes later, after
+  // reconciliation). This ensures the snapshot captures the safe-OFF state,
+  // NOT the state after scheduler/PIR logic has been applied.
   Drivers::rtc.begin();
   Drivers::relay.begin();
+  Services::journal.setBootPhase(Services::BootPhase::SAFE_INIT);
 
   // ---------- PZEM-004T v3.0 POWER METER (optional, via UART) ----------
   Drivers::pzem.begin();
 
-  // ---------- INITIAL RELAY COMPUTATION ----------
-  Services::relayEngine.forceRefresh();
+  // CYCLE-8B (fixes C8A-001): Capture raw GPIO output snapshot BEFORE
+  // RelayEngine runs. The snapshot reflects the safe-OFF state set by
+  // RelayDriver.begin(). This is the BASELINE for reconciliation.
+  // IMPORTANT: RelayEngine.forceRefresh() is deliberately DEFERRED until after
+  // reconciliation completes. This prevents scheduler/PIR logic from
+  // contaminating the evidence used for recovery.
+  Services::journal.captureOutputSnapshot();
 
   // ---------- NETWORK: WiFi STA (join MiFi) + AP fallback ----------
   Serial.println(F("========================================"));
@@ -188,11 +210,26 @@ void setup() {
   // ---------- AUTH ----------
   Services::auth.begin();
 
-  // ---------- OTA ----------
+  // ---------- OTA (mark healthy later) ----------
   Services::ota.begin();
 
   // ---------- MQTT (remote internet access via CGNAT) ----------
+  // CYCLE-8B: MqttClient::begin() calls TransactionJournal::begin() which
+  // loads journal entries from NVS. Reconciliation is now a SEPARATE step
+  // (see below) that runs AFTER the snapshot is captured.
   Services::mqtt.begin();
+
+  // CYCLE-8B (fixes C8A-001): Reconcile incomplete transactions using snapshot.
+  // This MUST happen BEFORE RelayEngine.forceRefresh() so that RelayEngine
+  // sees the reconciled state and doesn't overwrite recovery decisions.
+  Services::journal.reconcilePendingEntries();
+
+  // CYCLE-8B: Now that recovery is complete, restore application state.
+  // RelayEngine.forceRefresh() applies scheduler/PIR/manual logic to GPIO.
+  // This is the FIRST time RelayEngine runs after boot — all prior GPIO
+  // state was the safe-OFF state or the snapshot.
+  Services::journal.setBootPhase(Services::BootPhase::RESTORING);
+  Services::relayEngine.forceRefresh();
 
   // ---------- AI ADVISOR (stub) ----------
   AI::advisor.begin("");  // GAS URL not configured yet
@@ -201,15 +238,16 @@ void setup() {
   Web::server.begin();
 
   // ---------- BOOT COMPLETE ----------
+  // CYCLE-8B: Switch to RUNNING phase. MQTT commands, PIR triggers, and
+  // scheduler ticks are now allowed to modify relay state.
+  Services::journal.setBootPhase(Services::BootPhase::RUNNING);
+
   Core::metrics.bootTime = millis() / 1000;
   Services::Log.append(Core::LogType::Restart,
     String("System boot complete v") + Core::FIRMWARE_VERSION, 0);
   Serial.println(F("Boot complete. Ready."));
 
   // R10B-6: Mark firmware as healthy (cancels rollback).
-  // All critical subsystems (LittleFS, WiFi, RTC, Relay, MQTT, WebServer)
-  // have initialized successfully. If this is first boot after OTA, the
-  // firmware is now marked VALID — rollback will not trigger on next boot.
   Services::ota.markBootHealthy();
   esp_task_wdt_reset();
 }

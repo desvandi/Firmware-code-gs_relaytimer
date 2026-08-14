@@ -746,6 +746,28 @@ void MqttClient::_onMessage(char* topic, byte* payload, unsigned int length) {
 }
 
 void MqttClient::_handleCommand(const String& json) {
+  // CYCLE-8B (C8A-007): Reject commands during boot recovery phase.
+  //   During PRE_INIT through RECONCILING, the system is not ready to accept
+  //   commands — RelayEngine is not running, journal is being reconciled.
+  //   Commands received during this window are ACKed with a "not ready" message
+  //   so PWA knows to retry.
+  if (!Services::journal.isRunning()) {
+    Serial.printf("[MQTT] REJECTED: system not ready (boot phase=%u)\n",
+                  (uint8_t)Services::journal.getBootPhase());
+    // Try to extract requestId for ACK
+    DynamicJsonDocument doc(1024);
+    DeserializationError err = deserializeJson(doc, json);
+    String requestId = "";
+    if (!err) {
+      requestId = doc["requestId"] | "";
+    }
+    if (requestId.length() > 0) {
+      _publishAck(requestId, false,
+        "System not ready (boot recovery in progress) — please retry in a moment");
+    }
+    return;
+  }
+
   DynamicJsonDocument doc(1024);
   DeserializationError err = deserializeJson(doc, json);
   if (err) {
@@ -948,53 +970,61 @@ void MqttClient::_handleCommand(const String& json) {
     }
   }
 
-  // CYCLE-8A: Store durable INTENT record with expanded metadata.
-  // For relay commands, record channelId + desiredState + previousKnownState.
-  // For non-relay commands, channelId=0 (N/A).
-  // This allows boot reconciliation to compare GPIO state with desiredState.
-  {
-    uint8_t intentChannelId = 0;
-    bool intentDesiredState = false;
-    bool intentPreviousKnown = false;
+  // CYCLE-8B (fixes C8A-005): Validate ALL command fields BEFORE storeIntent.
+  //   Previous order: storeIntent → validate channel → validate action → execute
+  //   This left PENDING entries for invalid commands, contaminating the journal.
+  //   New order: validate EVERYTHING → storeIntent → markExecuting → execute
+  //   Invalid commands never create journal entries.
+  //
+  // Pre-validate relay commands
+  uint8_t intentChannelId = 0;
+  bool intentDesiredState = false;
+  bool intentPreviousKnown = false;
 
-    if (strcmp(type, "relay") == 0) {
-      int ch = doc["channelId"] | 0;
-      if (ch >= 1 && ch <= Core::NUM_CHANNELS) {
-        intentChannelId = (uint8_t)ch;
-        uint8_t idx = ch - 1;
-        intentPreviousKnown = Core::relayState[idx];
-        // desiredState depends on action:
-        //   "on"  → true
-        //   "off" → false
-        //   "set_mode" with manualState → manualState value
-        const char* actionStr = doc["action"] | "";
-        if (strcmp(actionStr, "on") == 0) {
-          intentDesiredState = true;
-        } else if (strcmp(actionStr, "off") == 0) {
-          intentDesiredState = false;
-        } else if (strcmp(actionStr, "set_mode") == 0) {
-          const char* mode = doc["mode"] | "";
-          if (strcmp(mode, "manual") == 0) {
-            intentDesiredState = doc["manualState"] | false;
-          } else {
-            // set_mode auto — doesn't directly change relay state, use current
-            intentDesiredState = Core::relayState[idx];
-          }
-        }
+  if (strcmp(type, "relay") == 0) {
+    int ch = doc["channelId"] | 0;
+    if (ch < 1 || ch > Core::NUM_CHANNELS) {
+      _publishAck(requestId, false, "Invalid channelId");
+      return;  // No journal entry created
+    }
+    intentChannelId = (uint8_t)ch;
+    uint8_t idx = ch - 1;
+    intentPreviousKnown = Core::relayState[idx];
+
+    const char* actionStr = doc["action"] | "";
+    if (strcmp(actionStr, "on") == 0) {
+      intentDesiredState = true;
+    } else if (strcmp(actionStr, "off") == 0) {
+      intentDesiredState = false;
+    } else if (strcmp(actionStr, "set_mode") == 0) {
+      const char* mode = doc["mode"] | "";
+      if (strcmp(mode, "manual") == 0) {
+        intentDesiredState = doc["manualState"] | false;
+      } else if (strcmp(mode, "auto") == 0) {
+        // set_mode auto doesn't directly change relay state
+        intentDesiredState = Core::relayState[idx];
+      } else {
+        _publishAck(requestId, false, "Invalid mode (use auto/manual)");
+        return;  // No journal entry created
       }
+    } else {
+      _publishAck(requestId, false, "Invalid relay action (use on/off/set_mode)");
+      return;  // No journal entry created
     }
+  }
 
-    if (!Services::journal.storeIntent(requestId, commandHash,
-                                        intentChannelId, intentDesiredState,
-                                        intentPreviousKnown)) {
-      Serial.printf("[MQTT] FATAL: storeIntent failed for rid=%s — refusing to execute\n",
-                    requestId.c_str());
-      Services::Log.append(Core::LogType::Error,
-        "storeIntent FAILED — command rejected: " + requestId, 0);
-      _publishAck(requestId, false,
-        "DURABILITY_FAILURE: cannot store transaction intent — please retry");
-      return;
-    }
+  // CYCLE-8A: Store durable INTENT record with expanded metadata.
+  // Now that validation is complete, store the intent.
+  if (!Services::journal.storeIntent(requestId, commandHash,
+                                      intentChannelId, intentDesiredState,
+                                      intentPreviousKnown)) {
+    Serial.printf("[MQTT] FATAL: storeIntent failed for rid=%s — refusing to execute\n",
+                  requestId.c_str());
+    Services::Log.append(Core::LogType::Error,
+      "storeIntent FAILED — command rejected: " + requestId, 0);
+    _publishAck(requestId, false,
+      "DURABILITY_FAILURE: cannot store transaction intent — please retry");
+    return;
   }
 
 
@@ -1002,30 +1032,10 @@ void MqttClient::_handleCommand(const String& json) {
   // RELAY COMMANDS
   // ===========================================================================
   if (strcmp(type, "relay") == 0) {
-    int channelId = doc["channelId"] | 0;
-    if (channelId < 1 || channelId > Core::NUM_CHANNELS) {
-      if (requestId.length() > 0) _publishAck(requestId, false, "Invalid channelId");
-      // CYCLE-8A: clear the intent we just stored (command invalid, allow retry)
-      Services::journal.clearEntry(requestId);
-      return;
-    }
+    int channelId = intentChannelId;
     uint8_t idx = channelId - 1;
 
-    // P0 #1: Validate action BEFORE execution. Invalid action → success:false.
-    bool actionValid = (strcmp(action, "on") == 0 || strcmp(action, "off") == 0 ||
-                        strcmp(action, "set_mode") == 0);
-    if (!actionValid) {
-      Serial.printf("[MQTT] Invalid relay action: %s\n", action);
-      if (requestId.length() > 0) {
-        _publishAck(requestId, false, "Invalid relay action (use on/off/set_mode)");
-      }
-      Services::journal.clearEntry(requestId);
-      return;
-    }
-
-    // CYCLE-8A: Mark EXECUTING right before the GPIO write.
-    // This narrows the crash window: if crash happens between storeIntent and
-    // markExecuting, we know execute was NEVER called.
+    // CYCLE-8B: Mark EXECUTING right before the GPIO write.
     if (!Services::journal.markExecuting(requestId)) {
       Serial.printf("[MQTT] markExecuting failed for rid=%s — aborting\n", requestId.c_str());
       _publishAck(requestId, false, "Internal error: cannot mark transaction as executing");
@@ -1043,36 +1053,32 @@ void MqttClient::_handleCommand(const String& json) {
       bool manualState = doc["manualState"] | false;
       if (strcmp(mode, "auto") == 0) {
         Services::relayEngine.setMode(idx, true);
-      } else if (strcmp(mode, "manual") == 0) {
+      } else {  // manual (already validated above)
         Services::relayEngine.setMode(idx, false);
         Services::relayEngine.setManual(idx, manualState);
-      } else {
-        if (requestId.length() > 0) {
-          _publishAck(requestId, false, "Invalid mode (use auto/manual)");
-        }
-        Services::journal.clearEntry(requestId);
-        return;
       }
     }
 
-    // CYCLE-8A: After execute, verify GPIO matches desired (honest reporting).
-    // If GPIO doesn't match, the relay.execute() may have failed silently.
+    // CYCLE-8B (fixes C8A-008): GPIO readback after execute.
+    //   If GPIO doesn't match desired → success=FALSE (not success=true+warning).
+    //   For relay mains, success=true on mismatch is a dangerous contract.
     bool actualGpio = Drivers::relay.readLogicalState(idx);
-    bool desired = Core::relayState[idx];  // what we THINK the relay should be
-    const char* ackMessage;
+    bool desired = Core::relayState[idx];
+
+    publishStatus();
+
     if (actualGpio == desired) {
-      ackMessage = "Relay command executed";
+      _publishRelayAck(requestId, true, "Relay command executed", channelId, commandHash);
     } else {
-      // GPIO mismatch after execute — relay driver may have failed.
-      // Still commit (state is set in RAM) but report the discrepancy.
-      ackMessage = "Relay command sent (WARNING: GPIO readback mismatch — physical state may differ)";
+      // GPIO mismatch — command failed to produce expected output.
+      // Report success=false so PWA knows to retry or investigate.
       Services::Log.append(Core::LogType::Error,
         "GPIO readback mismatch after relay execute: ch=" + String(channelId) +
         " expected=" + (desired ? "ON" : "OFF") + " actual=" + (actualGpio ? "ON" : "OFF"), channelId);
+      _publishRelayAck(requestId, false,
+        "OUTPUT_MISMATCH: GPIO readback does not match desired state (relay driver may have failed)",
+        channelId, "");  // empty commandHash = don't commit to journal (allow retry)
     }
-
-    publishStatus();
-    _publishRelayAck(requestId, true, ackMessage, channelId, commandHash);
   }
 
   // ===========================================================================

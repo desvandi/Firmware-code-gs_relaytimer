@@ -43,6 +43,51 @@ const char* TransactionJournal::_stateToString(TransactionState s) {
   }
 }
 
+// CYCLE-8B
+const char* TransactionJournal::_phaseToString(BootPhase p) {
+  switch (p) {
+    case BootPhase::PRE_INIT:     return "PRE_INIT";
+    case BootPhase::SAFE_INIT:    return "SAFE_INIT";
+    case BootPhase::LOADING_NVS:  return "LOADING_NVS";
+    case BootPhase::SNAPSHOT:     return "SNAPSHOT";
+    case BootPhase::RECONCILING:  return "RECONCILING";
+    case BootPhase::RESTORING:    return "RESTORING";
+    case BootPhase::RUNNING:      return "RUNNING";
+    default: return "UNKNOWN";
+  }
+}
+
+// ============================================================================
+// CYCLE-8B: Boot phase management
+// ============================================================================
+void TransactionJournal::setBootPhase(BootPhase phase) {
+  BootPhase old = _bootPhase;
+  _bootPhase = phase;
+  Serial.printf("[Journal] Boot phase: %s → %s\n", _phaseToString(old), _phaseToString(phase));
+}
+
+// ============================================================================
+// CYCLE-8B: Capture raw GPIO output state BEFORE RelayEngine runs
+// ============================================================================
+void TransactionJournal::captureOutputSnapshot() {
+  setBootPhase(BootPhase::SNAPSHOT);
+  for (uint8_t i = 0; i < Core::NUM_CHANNELS && i < 16; i++) {
+    _outputSnapshot[i] = Drivers::relay.readLogicalState(i);
+  }
+  _snapshotCaptured = true;
+  Serial.printf("[Journal] Output snapshot captured: ");
+  for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
+    Serial.printf("%d", _outputSnapshot[i] ? 1 : 0);
+  }
+  Serial.println();
+}
+
+bool TransactionJournal::getSnapshotState(uint8_t channelIdx) const {
+  if (channelIdx >= 16) return false;
+  if (!_snapshotCaptured) return false;
+  return _outputSnapshot[channelIdx];
+}
+
 // ============================================================================
 // Deserialize blob (version 2) + verify integrity
 // ============================================================================
@@ -323,45 +368,35 @@ void TransactionJournal::_clearSlotNVS(uint8_t idx) {
 }
 
 // ============================================================================
-// Boot: Load all valid entries + reconcile
+// Boot: Load all valid entries (does NOT reconcile — caller must capture
+// snapshot first, then call reconcilePendingEntries)
 // ============================================================================
 void TransactionJournal::begin() {
   _loadFromNVS();
   Serial.printf("[Journal] Loaded %u entries from NVS (capacity %u, version=%u)\n",
                 _journalSize, JOURNAL_SIZE, BLOB_VERSION);
-
-  // CYCLE-8A: Reconcile PENDING/EXECUTING entries with actual GPIO state.
-  uint8_t reconciled = reconcilePendingEntries();
-
+  // CYCLE-8B: reconciliation is now a SEPARATE step, called by setup()
+  // AFTER captureOutputSnapshot(). This fixes C8A-001.
   // Queue COMMITTED and COMMITTED_UNKNOWN ACKs for re-delivery
-  uint8_t committed = 0, committedUnknown = 0, pending = 0, failed = 0;
+  uint8_t committed = 0, committedUnknown = 0, pending = 0, executing = 0, failed = 0;
   for (uint8_t i = 0; i < JOURNAL_SIZE; i++) {
-    if (_journalValid[i]) {
-      switch (_journalState[i]) {
-        case TransactionState::COMMITTED:
-          committed++;
-          if (_journalAcks[i].length() > 0) {
-            queueAck(_journalIds[i], _journalAcks[i]);
-          }
-          break;
-        case TransactionState::COMMITTED_UNKNOWN:
-          committedUnknown++;
-          if (_journalAcks[i].length() > 0) {
-            queueAck(_journalIds[i], _journalAcks[i]);
-          }
-          break;
-        case TransactionState::FAILED:
-          failed++;
-          break;
-        case TransactionState::PENDING:
-        case TransactionState::EXECUTING:
-          pending++;
-          break;
-      }
+    if (!_journalValid[i]) continue;
+    switch (_journalState[i]) {
+      case TransactionState::COMMITTED:
+        committed++;
+        if (_journalAcks[i].length() > 0) queueAck(_journalIds[i], _journalAcks[i]);
+        break;
+      case TransactionState::COMMITTED_UNKNOWN:
+        committedUnknown++;
+        if (_journalAcks[i].length() > 0) queueAck(_journalIds[i], _journalAcks[i]);
+        break;
+      case TransactionState::FAILED:           failed++; break;
+      case TransactionState::PENDING:          pending++; break;
+      case TransactionState::EXECUTING:       executing++; break;
     }
   }
-  Serial.printf("[Journal] Boot summary: %u committed, %u committed_unknown, %u failed, %u pending (reconciled %u)\n",
-                committed, committedUnknown, failed, pending, reconciled);
+  Serial.printf("[Journal] Pre-reconcile: %u committed, %u committed_unknown, %u failed, %u pending, %u executing\n",
+                committed, committedUnknown, failed, pending, executing);
 }
 
 void TransactionJournal::_loadFromNVS() {
@@ -440,10 +475,33 @@ void TransactionJournal::_loadFromNVS() {
 }
 
 // ============================================================================
-// CYCLE-8A: Reconcile PENDING/EXECUTING entries with actual GPIO state
+// CYCLE-8B: Reconcile PENDING/EXECUTING entries using captured SNAPSHOT
+// ============================================================================
+// IMPORTANT (fixes C8A-001): This uses the SNAPSHOT captured by
+// captureOutputSnapshot(), NOT live GPIO reads. The snapshot was taken AFTER
+// RelayDriver.begin() (safe OFF state) but BEFORE RelayEngine.forceRefresh().
+//
+// Reconciliation logic (CYCLE-8B, honest about limitations):
+//   - PENDING entries: execute DEFINITELY didn't run (journal says so).
+//     Snapshot is OFF (safe init). desiredState may be ON or OFF.
+//       - desired=OFF: idempotent no-op, can't tell → COMMITTED_UNKNOWN (conservative)
+//       - desired=ON: execute didn't run, snapshot=OFF → FAILED (allow retry) — CORRECT
+//   - EXECUTING entries: execute MAY have run, but GPIO is now OFF (safe init).
+//     We CANNOT determine if execute ran before crash.
+//     → mark COMMITTED_UNKNOWN (conservative) — PWA gets disclaimer
+//
+// This is the best we can do without battery-backed GPIO register.
+// For true pre-crash GPIO recovery, hardware revision is needed.
 // ============================================================================
 uint8_t TransactionJournal::reconcilePendingEntries() {
+  setBootPhase(BootPhase::RECONCILING);
   uint8_t count = 0;
+
+  if (!_snapshotCaptured) {
+    Serial.println("[Journal] WARNING: reconcilePendingEntries() called before captureOutputSnapshot()!");
+    Serial.println("[Journal]   Snapshot is stale — reconciliation may be inaccurate.");
+  }
+
   for (uint8_t i = 0; i < JOURNAL_SIZE; i++) {
     if (!_journalValid[i]) continue;
     if (_journalState[i] != TransactionState::PENDING &&
@@ -455,59 +513,59 @@ uint8_t TransactionJournal::reconcilePendingEntries() {
                   i, _journalIds[i].c_str(), _stateToString(_journalState[i]),
                   _journalChannelId[i], _journalDesiredState[i]);
 
-    // Non-relay commands (channelId == 0): can't reconcile via GPIO.
-    // Leave as PENDING/EXECUTING — these are schedule/config commands that
-    // either completed idempotently or need manual review.
-    if (_journalChannelId[i] == 0) {
-      Serial.printf("[Journal] Slot %u: non-relay command, cannot reconcile via GPIO — marking COMMITTED_UNKNOWN (best-effort)\n", i);
-      Services::Log.append(Core::LogType::Error,
-        "Non-relay transaction reconciled as COMMITTED_UNKNOWN (no GPIO verification possible): " + _journalIds[i], 0);
-      _setTransactionStateNVS(i, TransactionState::COMMITTED_UNKNOWN);
-      continue;
-    }
+    TransactionState oldState = _journalState[i];
+    TransactionState newState;
 
-    // Relay command: read actual GPIO output state
-    uint8_t chIdx = _journalChannelId[i] - 1;  // channelId is 1-based, array is 0-based
-    if (chIdx >= Core::NUM_CHANNELS) {
-      Serial.printf("[Journal] Slot %u: invalid channelId %u — marking FAILED\n", i, _journalChannelId[i]);
-      _setTransactionStateNVS(i, TransactionState::FAILED);
-      continue;
-    }
-
-    bool actualGpioState = Drivers::relay.readLogicalState(chIdx);
-    bool desired = _journalDesiredState[i];
-
-    if (actualGpioState == desired) {
-      // GPIO matches desired — likely succeeded (or was already in desired state)
-      Serial.printf("[Journal] Slot %u: GPIO matches desired (actual=%d desired=%d) → COMMITTED_UNKNOWN\n",
-                    i, actualGpioState, desired);
-      Services::Log.append(Core::LogType::Error,
-        "Transaction reconciled as COMMITTED_UNKNOWN (GPIO matches but no durable proof of execution): " + _journalIds[i], 0);
-      _setTransactionStateNVS(i, TransactionState::COMMITTED_UNKNOWN);
+    if (_journalState[i] == TransactionState::PENDING) {
+      // PENDING — execute DEFINITELY didn't run.
+      // For relay commands: snapshot is OFF (safe init).
+      //   - desired=ON: execute didn't run → FAILED (allow retry) — CORRECT
+      //   - desired=OFF: idempotent, can't tell → COMMITTED_UNKNOWN (conservative)
+      // For non-relay (channelId=0): can't verify via GPIO → COMMITTED_UNKNOWN
+      if (_journalChannelId[i] == 0) {
+        newState = TransactionState::COMMITTED_UNKNOWN;
+        Services::Log.append(Core::LogType::Error,
+          "Non-relay PENDING transaction reconciled as COMMITTED_UNKNOWN (no GPIO verification): " + _journalIds[i], 0);
+      } else if (_journalDesiredState[i]) {
+        // desired=ON, but PENDING means execute never ran → FAILED
+        newState = TransactionState::FAILED;
+        Services::Log.append(Core::LogType::Error,
+          "PENDING transaction with desired=ON reconciled as FAILED (execute never ran): " + _journalIds[i], 0);
+      } else {
+        // desired=OFF — idempotent, snapshot is OFF, can't tell → conservative
+        newState = TransactionState::COMMITTED_UNKNOWN;
+        Services::Log.append(Core::LogType::Error,
+          "PENDING transaction with desired=OFF reconciled as COMMITTED_UNKNOWN (idempotent, can't verify): " + _journalIds[i], 0);
+      }
     } else {
-      // GPIO doesn't match desired — execute didn't happen or failed
-      Serial.printf("[Journal] Slot %u: GPIO mismatch (actual=%d desired=%d) → FAILED (will allow retry)\n",
-                    i, actualGpioState, desired);
+      // EXECUTING — execute MAY have run, but GPIO is now OFF (safe init).
+      // We CANNOT determine if execute ran before crash.
+      // → mark COMMITTED_UNKNOWN (conservative) — PWA gets disclaimer
+      newState = TransactionState::COMMITTED_UNKNOWN;
       Services::Log.append(Core::LogType::Error,
-        "Transaction reconciled as FAILED (GPIO doesn't match desired state): " + _journalIds[i], 0);
-      _setTransactionStateNVS(i, TransactionState::FAILED);
+        "EXECUTING transaction reconciled as COMMITTED_UNKNOWN (GPIO was safe-init OFF, cannot determine if execute ran): " + _journalIds[i], 0);
     }
+
+    _setTransactionStateNVS(i, newState);
+    Serial.printf("[Journal] Slot %u: %s → %s\n", i, _stateToString(oldState), _stateToString(newState));
   }
   return count;
 }
 
-// Reconcile a single entry (used on retry during normal operation)
+// Reconcile a single entry (used on retry during RUNNING phase — uses LIVE GPIO)
 TransactionState TransactionJournal::reconcileEntry(const String& requestId) {
   int idx = _findInJournal(requestId);
   if (idx < 0) return TransactionState::PENDING;
 
   if (_journalState[idx] != TransactionState::PENDING &&
       _journalState[idx] != TransactionState::EXECUTING) {
-    return _journalState[idx];  // already resolved
+    return _journalState[idx];
   }
 
+  // During RUNNING phase, use live GPIO read (snapshot is stale by now).
+  // This is the Cycle 8A behavior — acceptable for retry during normal operation
+  // because RelayEngine has been running and GPIO reflects current logic.
   if (_journalChannelId[idx] == 0) {
-    // Non-relay command — can't reconcile via GPIO, mark as COMMITTED_UNKNOWN
     _setTransactionStateNVS(idx, TransactionState::COMMITTED_UNKNOWN);
     return _journalState[idx];
   }
@@ -704,20 +762,23 @@ bool TransactionJournal::storeTransaction(const String& requestId,
 }
 
 // ============================================================================
-// CYCLE-8A: clearEntry — remove a FAILED entry (allows retry with same requestId)
+// CYCLE-8B: clearEntry — allows clearing PENDING, EXECUTING, and FAILED.
+//   NOT allowed: COMMITTED, COMMITTED_UNKNOWN (these are durable).
+//   Fixes C8A-005: invalid commands that leave PENDING entries can now be cleared.
 // ============================================================================
 void TransactionJournal::clearEntry(const String& requestId) {
   int idx = _findInJournal(requestId);
   if (idx < 0) return;
 
-  if (_journalState[idx] != TransactionState::FAILED) {
-    Serial.printf("[Journal] clearEntry: rid=%s state=%s (only FAILED can be cleared)\n",
-                  requestId.c_str(), _stateToString(_journalState[idx]));
+  TransactionState state = _journalState[idx];
+  if (state == TransactionState::COMMITTED || state == TransactionState::COMMITTED_UNKNOWN) {
+    Serial.printf("[Journal] clearEntry: rid=%s state=%s — cannot clear durable entry\n",
+                  requestId.c_str(), _stateToString(state));
     return;
   }
 
-  Serial.printf("[Journal] Clearing FAILED entry: rid=%s (slot %u) — retry allowed\n",
-                requestId.c_str(), idx);
+  Serial.printf("[Journal] Clearing entry: rid=%s (slot %u, state=%s) — retry allowed\n",
+                requestId.c_str(), idx, _stateToString(state));
   _clearSlotNVS(idx);
   _journalValid[idx] = false;
   _journalCommitted[idx] = false;
