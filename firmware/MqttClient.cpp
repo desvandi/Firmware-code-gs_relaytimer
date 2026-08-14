@@ -1091,14 +1091,36 @@ void MqttClient::_handleCommand(const String& json) {
     if (actualGpio == desired) {
       _publishRelayAck(requestId, true, "Relay command executed", channelId, commandHash);
     } else {
-      // GPIO mismatch — command failed to produce expected output.
-      // Report success=false so PWA knows to retry or investigate.
+      // CYCLE-8C (fixes C8BR1-008): GPIO mismatch → durable terminal state.
+      //   Previous: empty commandHash = don't commit (left entry as EXECUTING).
+      //   This was wrong — physical execute was attempted but produced wrong output.
+      //   Now: commit as EXECUTION_FAILED_OUTPUT_MISMATCH (durable terminal).
+      //   Operator must investigate physical relay (welded/stuck/driver fault).
+      //   No auto-retry — this is a hardware problem, not a transient failure.
       Services::Log.append(Core::LogType::Error,
         "GPIO readback mismatch after relay execute: ch=" + String(channelId) +
         " expected=" + (desired ? "ON" : "OFF") + " actual=" + (actualGpio ? "ON" : "OFF"), channelId);
-      _publishRelayAck(requestId, false,
-        "OUTPUT_MISMATCH: GPIO readback does not match desired state (relay driver may have failed)",
-        channelId, "");  // empty commandHash = don't commit to journal (allow retry)
+
+      // Build failure ACK JSON
+      StaticJsonDocument<512> failDoc;
+      failDoc["requestId"] = requestId;
+      failDoc["success"] = false;
+      failDoc["message"] = "OUTPUT_MISMATCH: GPIO readback does not match desired state (relay driver may have failed — operator investigation required)";
+      failDoc["timestamp"] = (uint64_t)Drivers::rtc.getUnixTime() * 1000ULL;
+      JsonObject data = failDoc.createNestedObject("data");
+      data["channelId"] = channelId;
+      data["expectedState"] = desired;
+      data["actualGpioState"] = actualGpio;
+      data["transactionState"] = "EXECUTION_FAILED_OUTPUT_MISMATCH";
+      String failJson;
+      serializeJson(failDoc, failJson);
+
+      // Commit as durable terminal failure (no auto-retry)
+      Services::journal.commitTransactionFailed(
+        requestId, failJson, Services::TransactionState::EXECUTION_FAILED_OUTPUT_MISMATCH);
+
+      // Publish failure ACK immediately
+      _finalizeAndPublishAck(requestId, false, failJson, "");
     }
   }
 

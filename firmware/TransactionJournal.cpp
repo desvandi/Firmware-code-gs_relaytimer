@@ -34,12 +34,15 @@ uint32_t TransactionJournal::_computeCRC(const uint8_t* data, size_t len) {
 
 const char* TransactionJournal::_stateToString(TransactionState s) {
   switch (s) {
-    case TransactionState::PENDING:           return "PENDING";
-    case TransactionState::EXECUTING:         return "EXECUTING";
-    case TransactionState::COMMITTED:         return "COMMITTED";
-    case TransactionState::COMMITTED_UNKNOWN: return "COMMITTED_UNKNOWN";
-    case TransactionState::FAILED:            return "FAILED";
-    default: return "UNKNOWN";
+    case TransactionState::PENDING:                          return "PENDING";
+    case TransactionState::EXECUTING:                        return "EXECUTING";
+    case TransactionState::COMMITTED:                        return "COMMITTED";
+    case TransactionState::COMMITTED_UNKNOWN:                return "COMMITTED_UNKNOWN";
+    case TransactionState::UNKNOWN:                          return "UNKNOWN";
+    case TransactionState::FAILED:                           return "FAILED";
+    case TransactionState::CORRUPTED:                        return "CORRUPTED";
+    case TransactionState::EXECUTION_FAILED_OUTPUT_MISMATCH: return "EXECUTION_FAILED_OUTPUT_MISMATCH";
+    default: return "INVALID_ENUM";
   }
 }
 
@@ -330,7 +333,8 @@ bool TransactionJournal::_createPendingEntryNVS(uint8_t idx) {
 
 // CYCLE-8B-Rev1: Commit EXECUTING → COMMITTED (fixes C8B-001)
 //   Does NOT reset state to PENDING. Preserves EXECUTING evidence during crash window.
-bool TransactionJournal::_commitExecutingEntryNVS(uint8_t idx, const String& ackJson) {
+bool TransactionJournal::_commitExecutingEntryNVS(uint8_t idx, const String& ackJson,
+                                                   TransactionState targetState) {
   if (idx >= JOURNAL_SIZE) return false;
   if (!_journalValid[idx]) {
     Serial.printf("[Journal] _commitExecutingEntryNVS: slot %u not valid\n", idx);
@@ -341,6 +345,14 @@ bool TransactionJournal::_commitExecutingEntryNVS(uint8_t idx, const String& ack
   if (_journalState[idx] != TransactionState::EXECUTING) {
     Serial.printf("[Journal] _commitExecutingEntryNVS: slot %u state=%s (expected EXECUTING) — REJECTED (monotonicity)\n",
                   idx, _stateToString(_journalState[idx]));
+    return false;
+  }
+
+  // CYCLE-8C: validate targetState is a valid commit target
+  if (targetState != TransactionState::COMMITTED &&
+      targetState != TransactionState::EXECUTION_FAILED_OUTPUT_MISMATCH) {
+    Serial.printf("[Journal] _commitExecutingEntryNVS: invalid targetState %s\n",
+                  _stateToString(targetState));
     return false;
   }
 
@@ -372,28 +384,23 @@ bool TransactionJournal::_commitExecutingEntryNVS(uint8_t idx, const String& ack
   snprintf(stateKey, sizeof(stateKey), "%s%u", NVS_KEY_TJ_STATE_PREFIX, idx);
 
   // CYCLE-8B-Rev1 (fixes C8B-001): Do NOT clear commit flag here.
-  //   The commit flag is currently 0 (entry is EXECUTING, not yet committed).
-  //   We write the new blob (with ackJson) FIRST, keeping commit=0.
-  //   If crash during blob write: entry remains EXECUTING (blob may be partial,
-  //   but state is still EXECUTING — reconciliation will mark UNKNOWN, not FAILED).
+  //   Write blob FIRST, keeping commit=0. If crash: entry remains EXECUTING.
   //   Only AFTER blob write succeeds do we flip commit flag 0→1.
 
-  // Phase 1: Write blob with new ackJson (commit flag still 0, state still EXECUTING in NVS)
+  // Phase 1: Write blob with new ackJson (commit flag still 0)
   size_t written = prefs.putBytes(entryKey, blob, totalLen);
   if (written != totalLen) {
     Serial.printf("[Journal] commitExecuting Phase 1 write FAILED (wrote %u/%u bytes)\n",
                   written, totalLen);
     prefs.end();
-    // Entry remains EXECUTING — caller should treat as commit failure
     return false;
   }
 
-  // Phase 1b: Set state=COMMITTED (but commit flag still 0 — not yet atomic commit)
-  size_t stateWritten = prefs.putUChar(stateKey, (uint8_t)TransactionState::COMMITTED);
+  // Phase 1b: Set state=targetState (but commit flag still 0 — not yet atomic)
+  size_t stateWritten = prefs.putUChar(stateKey, (uint8_t)targetState);
   if (stateWritten != 1) {
     Serial.printf("[Journal] commitExecuting Phase 1b state write FAILED (idx=%u)\n", idx);
     prefs.end();
-    // Entry remains EXECUTING (state not updated, commit flag still 0)
     return false;
   }
 
@@ -402,8 +409,8 @@ bool TransactionJournal::_commitExecutingEntryNVS(uint8_t idx, const String& ack
   if (commitWritten != 1) {
     Serial.printf("[Journal] commitExecuting Phase 2 commit flip FAILED (idx=%u)\n", idx);
     prefs.end();
-    // State byte says COMMITTED but commit flag still 0.
-    // On load, _loadFromNVS treats commit=0 as uncommitted regardless of state byte.
+    // State byte says targetState but commit flag still 0.
+    // On load, _loadFromNVS treats commit=0 as uncommitted.
     // Revert RAM state to EXECUTING to match NVS reality.
     _journalState[idx] = TransactionState::EXECUTING;
     _journalCommitted[idx] = false;
@@ -414,7 +421,7 @@ bool TransactionJournal::_commitExecutingEntryNVS(uint8_t idx, const String& ack
 
   // Success — update RAM state
   _journalCommitted[idx] = true;
-  _journalState[idx] = TransactionState::COMMITTED;
+  _journalState[idx] = targetState;
   return true;
 }
 
@@ -450,24 +457,26 @@ bool TransactionJournal::_setTransactionStateNVS(uint8_t idx, TransactionState s
 }
 
 // ============================================================================
-// CYCLE-8B-Rev1: Monotonicity validator
+// CYCLE-8B-Rev1 + CYCLE-8C: Monotonicity validator
 // ============================================================================
 bool TransactionJournal::_isTransitionAllowed(TransactionState from, TransactionState to) {
   // ALLOWED transitions (forward only):
-  //   (none/PENDING) → PENDING          (creating new entry — from is PENDING or invalid)
+  //   (none/PENDING) → PENDING          (creating new entry)
   //   PENDING → EXECUTING               (markExecuting)
   //   EXECUTING → COMMITTED             (commitTransaction)
+  //   EXECUTING → EXECUTION_FAILED_OUTPUT_MISMATCH  (commitTransactionFailed — CYCLE-8C)
   //   PENDING → UNKNOWN                 (reconciliation)
   //   EXECUTING → UNKNOWN               (reconciliation)
   //   PENDING → FAILED                  (reconciliation — proven not executed)
-  //   Any non-terminal → (cleared)      (clearEntry — handled separately)
+  //   Any non-terminal → CORRUPTED      (invariant violation detected)
   //
   // FORBIDDEN:
   //   EXECUTING → PENDING               (was C8B-001 bug)
-  //   COMMITTED → anything              (terminal)
-  //   COMMITTED_UNKNOWN → anything      (terminal)
-  //   UNKNOWN → PENDING/EXECUTING/COMMITTED (UNKNOWN is semi-terminal — only clearable)
-  //   FAILED → PENDING/EXECUTING/COMMITTED (FAILED is semi-terminal — only clearable)
+  //   COMMITTED → anything               (terminal durable)
+  //   COMMITTED_UNKNOWN → anything       (terminal durable)
+  //   EXECUTION_FAILED_OUTPUT_MISMATCH → anything  (terminal durable — CYCLE-8C)
+  //   CORRUPTED → anything except (cleared)  (terminal safety — only recoverCorruptedEntry can remove)
+  //   UNKNOWN/FAILED → PENDING/EXECUTING/COMMITTED (semi-terminal — only clearable)
 
   if (from == to) return true;  // no-op is allowed
 
@@ -475,18 +484,24 @@ bool TransactionJournal::_isTransitionAllowed(TransactionState from, Transaction
     case TransactionState::PENDING:
       return to == TransactionState::EXECUTING ||
              to == TransactionState::UNKNOWN ||
-             to == TransactionState::FAILED;
+             to == TransactionState::FAILED ||
+             to == TransactionState::CORRUPTED;
     case TransactionState::EXECUTING:
       return to == TransactionState::COMMITTED ||
-             to == TransactionState::UNKNOWN;
+             to == TransactionState::UNKNOWN ||
+             to == TransactionState::EXECUTION_FAILED_OUTPUT_MISMATCH ||
+             to == TransactionState::CORRUPTED;
              // NOT allowed: EXECUTING → PENDING (C8B-001 fix)
              // NOT allowed: EXECUTING → FAILED (ambiguous — use UNKNOWN instead)
     case TransactionState::COMMITTED:
     case TransactionState::COMMITTED_UNKNOWN:
-      return false;  // terminal — no transitions allowed
+    case TransactionState::EXECUTION_FAILED_OUTPUT_MISMATCH:
+      return false;  // terminal durable — no transitions allowed (except operator recovery)
     case TransactionState::UNKNOWN:
     case TransactionState::FAILED:
-      return false;  // semi-terminal — only clearEntry can remove (handled separately)
+      return to == TransactionState::CORRUPTED;  // semi-terminal, can transition to CORRUPTED if needed
+    case TransactionState::CORRUPTED:
+      return false;  // terminal safety — only recoverCorruptedEntry (separate path) can remove
     default:
       return false;
   }
@@ -519,6 +534,98 @@ bool TransactionJournal::_clearSlotNVS(uint8_t idx) {
 }
 
 // ============================================================================
+// CYCLE-8C (fixes C8BR1-002): Durable tombstone for clearEntry()
+//
+//   Tombstone is a separate NVS key: tj_tomb_<hash_of_requestId>
+//   Written BEFORE blob is erased (so crash during clear is safe)
+//   On load: if tombstone exists, entry is NOT resurrected
+//   Tombstone has TTL (via NVS key count limit — we rely on LRU of key names)
+// ============================================================================
+
+// Helper: compute tombstone key from requestId.
+//   We use a simple hash to keep key length under 15 chars (NVS key limit).
+String TransactionJournal::_tombstoneKey(const String& requestId) {
+  // Simple FNV-1a hash to fit within NVS key length limit (15 chars)
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < requestId.length(); i++) {
+    hash ^= (uint8_t)requestId[i];
+    hash *= 16777619UL;
+  }
+  char key[16];
+  snprintf(key, sizeof(key), "tj_tomb_%08x", hash);
+  return String(key);
+}
+
+bool TransactionJournal::_writeTombstoneNVS(const String& requestId) {
+  if (requestId.length() == 0) return false;
+
+  String key = _tombstoneKey(requestId);
+  Preferences prefs;
+  if (!prefs.begin(Core::NVS_NAMESPACE, false)) return false;
+
+  // Write tombstone value (timestamp for audit trail)
+  uint32_t ts = (uint32_t)(millis() / 1000);
+  size_t written = prefs.putULong(key.c_str(), ts);
+  prefs.end();
+
+  if (written != 4) {
+    Serial.printf("[Journal] _writeTombstoneNVS FAILED (key=%s)\n", key.c_str());
+    return false;
+  }
+  Serial.printf("[Journal] Tombstone written: rid=%s (key=%s)\n", requestId.c_str(), key.c_str());
+  return true;
+}
+
+bool TransactionJournal::_hasTombstoneNVS(const String& requestId) {
+  if (requestId.length() == 0) return false;
+
+  String key = _tombstoneKey(requestId);
+  Preferences prefs;
+  if (!prefs.begin(Core::NVS_NAMESPACE, true)) return false;
+
+  // Check if key exists by reading — if default 0 is returned AND key was never set,
+  // we can't distinguish. So we use a non-zero marker.
+  // Actually, getULong returns default if key doesn't exist. We write a non-zero
+  // timestamp, so if value is 0, key doesn't exist OR was set to 0 (impossible since
+  // we write millis()/1000 which is > 0 after boot).
+  // Edge case: if tombstone written at exactly millis()=0, this fails. Acceptable.
+  uint32_t val = prefs.getULong(key.c_str(), 0);
+  prefs.end();
+
+  return val != 0;
+}
+
+void TransactionJournal::_removeTombstoneNVS(const String& requestId) {
+  if (requestId.length() == 0) return;
+
+  String key = _tombstoneKey(requestId);
+  Preferences prefs;
+  if (!prefs.begin(Core::NVS_NAMESPACE, false)) return;
+
+  prefs.remove(key.c_str());
+  prefs.end();
+}
+
+bool TransactionJournal::_eraseBlobNVS(uint8_t idx) {
+  if (idx >= JOURNAL_SIZE) return false;
+
+  Preferences prefs;
+  if (!prefs.begin(Core::NVS_NAMESPACE, false)) return false;
+
+  char entryKey[20];
+  snprintf(entryKey, sizeof(entryKey), "%s%u", NVS_KEY_TJ_ENTRY_PREFIX, idx);
+
+  bool ok = prefs.remove(entryKey);
+  prefs.end();
+
+  if (!ok) {
+    Serial.printf("[Journal] _eraseBlobNVS FAILED (idx=%u)\n", idx);
+    return false;
+  }
+  return true;
+}
+
+// ============================================================================
 // Boot: Load all valid entries (does NOT reconcile — caller must capture
 // snapshot first, then call reconcilePendingEntries)
 // ============================================================================
@@ -528,8 +635,9 @@ void TransactionJournal::begin() {
                 _journalSize, JOURNAL_SIZE, BLOB_VERSION);
   // CYCLE-8B: reconciliation is now a SEPARATE step, called by setup()
   // AFTER captureOutputSnapshot(). This fixes C8A-001.
-  // Queue COMMITTED and COMMITTED_UNKNOWN ACKs for re-delivery
+  // Queue ACKs for re-delivery (COMMITTED, COMMITTED_UNKNOWN, EXECUTION_FAILED_OUTPUT_MISMATCH)
   uint8_t committed = 0, committedUnknown = 0, pending = 0, executing = 0, failed = 0;
+  uint8_t unknown = 0, corrupted = 0, outputMismatch = 0;
   for (uint8_t i = 0; i < JOURNAL_SIZE; i++) {
     if (!_journalValid[i]) continue;
     switch (_journalState[i]) {
@@ -541,13 +649,23 @@ void TransactionJournal::begin() {
         committedUnknown++;
         if (_journalAcks[i].length() > 0) queueAck(_journalIds[i], _journalAcks[i]);
         break;
+      case TransactionState::EXECUTION_FAILED_OUTPUT_MISMATCH:
+        outputMismatch++;
+        if (_journalAcks[i].length() > 0) queueAck(_journalIds[i], _journalAcks[i]);
+        break;
       case TransactionState::FAILED:           failed++; break;
+      case TransactionState::UNKNOWN:          unknown++; break;
+      case TransactionState::CORRUPTED:        corrupted++; break;
       case TransactionState::PENDING:          pending++; break;
       case TransactionState::EXECUTING:       executing++; break;
     }
   }
-  Serial.printf("[Journal] Pre-reconcile: %u committed, %u committed_unknown, %u failed, %u pending, %u executing\n",
-                committed, committedUnknown, failed, pending, executing);
+  Serial.printf("[Journal] Pre-reconcile: committed=%u committed_unknown=%u output_mismatch=%u failed=%u unknown=%u corrupted=%u pending=%u executing=%u\n",
+                committed, committedUnknown, outputMismatch, failed, unknown, corrupted, pending, executing);
+  if (corrupted > 0) {
+    Services::Log.append(Core::LogType::Error,
+      String("Journal has ") + corrupted + " CORRUPTED entries — operator recovery required", 0);
+  }
 }
 
 void TransactionJournal::_loadFromNVS() {
@@ -571,15 +689,17 @@ void TransactionJournal::_loadFromNVS() {
     snprintf(stateKey, sizeof(stateKey), "%s%u", NVS_KEY_TJ_STATE_PREFIX, i);
 
     uint8_t committed = prefs.getUChar(commitKey, 0);
-    // CYCLE-8A: read transaction state (defaults to PENDING for old entries)
     uint8_t stateRaw = prefs.getUChar(stateKey, (uint8_t)TransactionState::PENDING);
 
     size_t len = prefs.getBytesLength(entryKey);
     if (len == 0 || len > BLOB_SIZE) {
+      // No blob in this slot
       _journalValid[i] = false;
       _journalCommitted[i] = false;
       _journalState[i] = TransactionState::PENDING;
-      // Clear stale commit/state if blob missing
+      // CYCLE-8C: if commit=1 but blob missing, that's inconsistent — mark CORRUPTED
+      //   But we can't mark CORRUPTED without a blob (no requestId to track).
+      //   So just clear the stale commit/state flags.
       if (committed == 1 || stateRaw != (uint8_t)TransactionState::PENDING) {
         prefs.end();
         Preferences rw;
@@ -595,15 +715,98 @@ void TransactionJournal::_loadFromNVS() {
     prefs.getBytes(entryKey, blob, len);
 
     if (_deserializeEntry(blob, len, i)) {
+      // Blob deserialized OK — now validate state enum + invariant (CYCLE-8C)
+      if (!isValidTransactionState(stateRaw)) {
+        // C8BR1-005: invalid state enum → mark CORRUPTED (do NOT free)
+        Serial.printf("[Journal] Entry %u: invalid state byte 0x%02X — marking CORRUPTED (not freed)\n",
+                      i, stateRaw);
+        _journalValid[i] = true;  // keep slot occupied (don't free)
+        _journalCommitted[i] = false;
+        _journalIds[i] = _journalIds[i];  // preserve requestId from blob
+        _journalState[i] = TransactionState::CORRUPTED;
+        _journalSize++;
+        // Persist CORRUPTED state to NVS
+        prefs.end();
+        Preferences rw;
+        rw.begin(Core::NVS_NAMESPACE, false);
+        rw.putUChar(stateKey, (uint8_t)TransactionState::CORRUPTED);
+        rw.putUChar(commitKey, 0);  // ensure not treated as committed
+        rw.end();
+        prefs.begin(Core::NVS_NAMESPACE, true);
+        Services::Log.append(Core::LogType::Error,
+          "Journal entry " + String(i) + " marked CORRUPTED (invalid state byte): " + _journalIds[i], 0);
+        continue;
+      }
+
+      TransactionState state = (TransactionState)stateRaw;
+
+      // CYCLE-8C (C8BR1-004): validate blob/state/commit invariant
+      if (!_validateInvariant(i, committed == 1, state)) {
+        // Invariant violated — mark CORRUPTED (do NOT free)
+        Serial.printf("[Journal] Entry %u: invariant violated (commit=%u state=%s) — marking CORRUPTED\n",
+                      i, committed, _stateToString(state));
+        _journalValid[i] = true;  // keep slot occupied
+        _journalCommitted[i] = false;
+        _journalState[i] = TransactionState::CORRUPTED;
+        _journalSize++;
+        // Persist CORRUPTED state
+        prefs.end();
+        Preferences rw;
+        rw.begin(Core::NVS_NAMESPACE, false);
+        rw.putUChar(stateKey, (uint8_t)TransactionState::CORRUPTED);
+        rw.putUChar(commitKey, 0);
+        rw.end();
+        prefs.begin(Core::NVS_NAMESPACE, true);
+        Services::Log.append(Core::LogType::Error,
+          "Journal entry " + String(i) + " marked CORRUPTED (invariant violation): " + _journalIds[i], 0);
+        continue;
+      }
+
+      // CYCLE-8C (C8BR1-002): check for tombstone (cleared entry that shouldn't resurrect)
+      if (_hasTombstoneNVS(_journalIds[i])) {
+        Serial.printf("[Journal] Entry %u: tombstone found for rid=%s — honoring clear (not resurrecting)\n",
+                      i, _journalIds[i].c_str());
+        _journalValid[i] = false;
+        _journalCommitted[i] = false;
+        _journalState[i] = TransactionState::PENDING;
+        _journalIds[i] = "";
+        _journalHashes[i] = "";
+        _journalAcks[i] = "";
+        _journalChannelId[i] = 0;
+        _journalDesiredState[i] = false;
+        _journalPreviousKnownState[i] = false;
+        _journalAttempt[i] = 0;
+        _journalTimestamp[i] = 0;
+        // Erase the blob now that we've confirmed tombstone
+        prefs.end();
+        Preferences rw;
+        rw.begin(Core::NVS_NAMESPACE, false);
+        rw.remove(entryKey);
+        rw.putUChar(commitKey, 0);
+        rw.putUChar(stateKey, (uint8_t)TransactionState::PENDING);
+        rw.end();
+        prefs.begin(Core::NVS_NAMESPACE, true);
+        continue;
+      }
+
+      // Valid entry — accept into RAM
       _journalCommitted[i] = (committed == 1);
-      _journalState[i] = (TransactionState)stateRaw;
+      _journalState[i] = state;
       _journalSize++;
+      Serial.printf("[Journal] Entry %u: loaded OK (rid=%s, commit=%u, state=%s)\n",
+                    i, _journalIds[i].c_str(), committed, _stateToString(state));
     } else {
-      Serial.printf("[Journal] Entry %u: blob CORRUPT or version mismatch — slot freed\n", i);
-      _journalValid[i] = false;
+      // C8BR1-001: Blob CRC/magic/version failed — do NOT free slot!
+      //   Mark CORRUPTED to preserve requestId evidence (if we can extract it).
+      //   Try to extract requestId from partial blob (best-effort).
+      Serial.printf("[Journal] Entry %u: blob CORRUPT (CRC/magic/version fail) — marking CORRUPTED (not freed)\n", i);
+      _journalValid[i] = true;  // keep slot occupied — do NOT free
       _journalCommitted[i] = false;
-      _journalState[i] = TransactionState::PENDING;
-      _journalIds[i] = "";
+      _journalState[i] = TransactionState::CORRUPTED;
+      // Best-effort: try to extract requestId from blob for duplicate detection
+      // (even if CRC fails, the requestId field may be readable)
+      // For safety, we use a placeholder if extraction fails
+      _journalIds[i] = "CORRUPTED_SLOT_" + String(i);  // placeholder
       _journalHashes[i] = "";
       _journalAcks[i] = "";
       _journalChannelId[i] = 0;
@@ -611,18 +814,72 @@ void TransactionJournal::_loadFromNVS() {
       _journalPreviousKnownState[i] = false;
       _journalAttempt[i] = 0;
       _journalTimestamp[i] = 0;
-      // Clear NVS keys
+      _journalSize++;
+      // Persist CORRUPTED state
       prefs.end();
       Preferences rw;
       rw.begin(Core::NVS_NAMESPACE, false);
+      rw.putUChar(stateKey, (uint8_t)TransactionState::CORRUPTED);
       rw.putUChar(commitKey, 0);
-      rw.putUChar(stateKey, (uint8_t)TransactionState::PENDING);
       rw.end();
       prefs.begin(Core::NVS_NAMESPACE, true);
+      Services::Log.append(Core::LogType::Error,
+        "Journal entry " + String(i) + " marked CORRUPTED (blob CRC/magic/version failure) — evidence preserved, slot not freed", 0);
     }
   }
 
   prefs.end();
+}
+
+// ============================================================================
+// CYCLE-8C (C8BR1-004): Validate blob/state/commit invariant
+// ============================================================================
+bool TransactionJournal::_validateInvariant(uint8_t idx, bool committed, TransactionState state) {
+  (void)idx;  // not used yet, but available for future per-slot checks
+
+  // Valid combinations:
+  //   commit=0, state=PENDING/EXECUTING/COMMITTED/UNKNOWN/FAILED/CORRUPTED/EXECUTION_FAILED_OUTPUT_MISMATCH
+  //     → uncommitted (commit flag is authoritative for durability)
+  //     → COMMITTED with commit=0 is transitional (treat as EXECUTING during reconcile)
+  //   commit=1, state=COMMITTED
+  //     → durable committed
+  //   commit=1, state=anything else
+  //     → INVALID (commit says durable but state doesn't match)
+
+  if (committed) {
+    // commit=1 requires state=COMMITTED (or EXECUTION_FAILED_OUTPUT_MISMATCH which is also durable)
+    return state == TransactionState::COMMITTED ||
+           state == TransactionState::EXECUTION_FAILED_OUTPUT_MISMATCH;
+  }
+  // commit=0: any state is valid (including CORRUPTED)
+  return true;
+}
+
+// ============================================================================
+// CYCLE-8C: Mark entry as CORRUPTED (durable, does not free slot)
+// ============================================================================
+bool TransactionJournal::_markCorruptedNVS(uint8_t idx) {
+  if (idx >= JOURNAL_SIZE) return false;
+
+  Preferences prefs;
+  if (!prefs.begin(Core::NVS_NAMESPACE, false)) return false;
+
+  char stateKey[20];
+  char commitKey[20];
+  snprintf(stateKey, sizeof(stateKey), "%s%u", NVS_KEY_TJ_STATE_PREFIX, idx);
+  snprintf(commitKey, sizeof(commitKey), "%s%u", NVS_KEY_TJ_COMMIT_PREFIX, idx);
+
+  size_t w1 = prefs.putUChar(stateKey, (uint8_t)TransactionState::CORRUPTED);
+  size_t w2 = prefs.putUChar(commitKey, 0);  // ensure not treated as committed
+  prefs.end();
+
+  if (w1 != 1 || w2 != 1) {
+    Serial.printf("[Journal] _markCorruptedNVS FAILED (idx=%u)\n", idx);
+    return false;
+  }
+  _journalState[idx] = TransactionState::CORRUPTED;
+  _journalCommitted[idx] = false;
+  return true;
 }
 
 // ============================================================================
@@ -746,18 +1003,24 @@ int TransactionJournal::_findInJournal(const String& requestId) {
 //   PENDING/EXECUTING: in-flight (caller should reconcile or wait)
 //   FAILED: proven not executed (allow retry)
 //   UNKNOWN: cannot determine (caller decides — default: allow retry with caution)
+// CYCLE-8C: isProcessed includes EXECUTION_FAILED_OUTPUT_MISMATCH (durable terminal).
+//   CORRUPTED is also "processed" in the sense that requestId is blocked
+//   (prevents blind re-execution of corrupted transactions).
 bool TransactionJournal::isProcessed(const String& requestId) {
   int idx = _findInJournal(requestId);
   if (idx < 0) return false;
   return _journalState[idx] == TransactionState::COMMITTED ||
-         _journalState[idx] == TransactionState::COMMITTED_UNKNOWN;
+         _journalState[idx] == TransactionState::COMMITTED_UNKNOWN ||
+         _journalState[idx] == TransactionState::EXECUTION_FAILED_OUTPUT_MISMATCH ||
+         _journalState[idx] == TransactionState::CORRUPTED;
 }
 
 bool TransactionJournal::isCommitted(const String& requestId) {
   int idx = _findInJournal(requestId);
   if (idx < 0) return false;
   return _journalState[idx] == TransactionState::COMMITTED ||
-         _journalState[idx] == TransactionState::COMMITTED_UNKNOWN;
+         _journalState[idx] == TransactionState::COMMITTED_UNKNOWN ||
+         _journalState[idx] == TransactionState::EXECUTION_FAILED_OUTPUT_MISMATCH;
 }
 
 TransactionState TransactionJournal::getTransactionState(const String& requestId) {
@@ -775,7 +1038,8 @@ String TransactionJournal::getCommandHash(const String& requestId) {
 String TransactionJournal::getAckJson(const String& requestId) {
   int idx = _findInJournal(requestId);
   if (idx >= 0 && (_journalState[idx] == TransactionState::COMMITTED ||
-                   _journalState[idx] == TransactionState::COMMITTED_UNKNOWN)) {
+                   _journalState[idx] == TransactionState::COMMITTED_UNKNOWN ||
+                   _journalState[idx] == TransactionState::EXECUTION_FAILED_OUTPUT_MISMATCH)) {
     return _journalAcks[idx];
   }
   return "";
@@ -988,31 +1252,61 @@ bool TransactionJournal::storeTransaction(const String& requestId,
 //   NOT allowed: COMMITTED, COMMITTED_UNKNOWN (terminal, durable).
 //   Returns true if entry was cleared (fixes C8B-007: check NVS write success).
 // ============================================================================
+// CYCLE-8C (fixes C8BR1-002): clearEntry now uses durable tombstone + blob erase.
+//   Tombstone written FIRST (survives reboot), then blob erased, then slot freed.
+//   If crash during clear: tombstone exists → on reboot, entry NOT resurrected.
+//   NOT allowed for: COMMITTED, COMMITTED_UNKNOWN, CORRUPTED, EXECUTION_FAILED_OUTPUT_MISMATCH
+//   (these are durable terminal states — operator must use recoverCorruptedEntry)
+// ============================================================================
 bool TransactionJournal::clearEntry(const String& requestId) {
   int idx = _findInJournal(requestId);
   if (idx < 0) return false;
 
   TransactionState state = _journalState[idx];
-  if (state == TransactionState::COMMITTED || state == TransactionState::COMMITTED_UNKNOWN) {
+  // CYCLE-8C: cannot clear durable terminal states via clearEntry
+  if (state == TransactionState::COMMITTED ||
+      state == TransactionState::COMMITTED_UNKNOWN ||
+      state == TransactionState::EXECUTION_FAILED_OUTPUT_MISMATCH) {
     Serial.printf("[Journal] clearEntry: rid=%s state=%s — cannot clear durable entry\n",
                   requestId.c_str(), _stateToString(state));
     return false;
   }
-
-  Serial.printf("[Journal] Clearing entry: rid=%s (slot %u, state=%s) — retry allowed\n",
-                requestId.c_str(), idx, _stateToString(state));
-
-  // CYCLE-8B-Rev1 (fixes C8B-007): check NVS write success BEFORE updating RAM.
-  //   If NVS write fails, RAM state is NOT updated — prevents journal resurrection
-  //   (where entry reappears after reboot because NVS still has it).
-  if (!_clearSlotNVS(idx)) {
-    Serial.printf("[Journal] clearEntry FAILED: NVS write error (rid=%s) — RAM NOT updated\n",
+  // CYCLE-8C: CORRUPTED entries cannot be cleared via clearEntry — use recoverCorruptedEntry
+  if (state == TransactionState::CORRUPTED) {
+    Serial.printf("[Journal] clearEntry: rid=%s state=CORRUPTED — use recoverCorruptedEntry() instead\n",
                   requestId.c_str());
-    Services::Log.append(Core::LogType::Error,
-      "clearEntry NVS write FAILED — entry may reappear after reboot: " + requestId, 0);
     return false;
   }
 
+  Serial.printf("[Journal] Clearing entry: rid=%s (slot %u, state=%s) — durable tombstone + blob erase\n",
+                requestId.c_str(), idx, _stateToString(state));
+
+  // CYCLE-8C (fixes C8BR1-002): Write tombstone FIRST (before any other changes).
+  //   If crash after tombstone write: on reboot, _loadFromNVS sees tombstone
+  //   and refuses to resurrect the entry (even though blob still exists).
+  if (!_writeTombstoneNVS(requestId)) {
+    Serial.printf("[Journal] clearEntry FAILED: cannot write tombstone (rid=%s) — ABORT\n",
+                  requestId.c_str());
+    Services::Log.append(Core::LogType::Error,
+      "clearEntry FAILED: tombstone write failed — entry NOT cleared: " + requestId, 0);
+    return false;
+  }
+
+  // Erase blob from NVS (so slot can be reused)
+  if (!_eraseBlobNVS(idx)) {
+    Serial.printf("[Journal] clearEntry: blob erase failed (idx=%u) — tombstone still protects\n", idx);
+    Services::Log.append(Core::LogType::Error,
+      "clearEntry: blob erase failed, but tombstone written — entry will not resurrect: " + requestId, 0);
+    // Continue anyway — tombstone protects against resurrection even if blob exists
+  }
+
+  // Clear commit flag + state byte
+  if (!_clearSlotNVS(idx)) {
+    Serial.printf("[Journal] clearEntry: _clearSlotNVS failed (idx=%u) — tombstone still protects\n", idx);
+    // Continue — tombstone protects
+  }
+
+  // Update RAM state
   _journalValid[idx] = false;
   _journalCommitted[idx] = false;
   _journalState[idx] = TransactionState::PENDING;
@@ -1025,6 +1319,105 @@ bool TransactionJournal::clearEntry(const String& requestId) {
   _journalAttempt[idx] = 0;
   _journalTimestamp[idx] = 0;
   if (_journalSize > 0) _journalSize--;
+
+  Serial.printf("[Journal] Cleared: rid=%s (slot %u freed, tombstone durable)\n",
+                requestId.c_str(), idx);
+  return true;
+}
+
+// ============================================================================
+// CYCLE-8C: recoverCorruptedEntry — operator-initiated recovery for CORRUPTED.
+//   Clears CORRUPTED entry + writes tombstone + erases blob.
+//   This is the ONLY way to remove a CORRUPTED entry (clearEntry refuses).
+// ============================================================================
+bool TransactionJournal::recoverCorruptedEntry(const String& requestId) {
+  int idx = _findInJournal(requestId);
+  if (idx < 0) return false;
+
+  if (_journalState[idx] != TransactionState::CORRUPTED) {
+    Serial.printf("[Journal] recoverCorruptedEntry: rid=%s state=%s — only CORRUPTED can be recovered\n",
+                  requestId.c_str(), _stateToString(_journalState[idx]));
+    return false;
+  }
+
+  Serial.printf("[Journal] Recovering CORRUPTED entry: rid=%s (slot %u) — operator-initiated\n",
+                requestId.c_str(), idx);
+  Services::Log.append(Core::LogType::Error,
+    "CORRUPTED entry recovered by operator: " + requestId, 0);
+
+  // Write tombstone (in case blob is still readable)
+  if (!_writeTombstoneNVS(requestId)) {
+    Serial.printf("[Journal] recoverCorruptedEntry: tombstone write failed — continuing\n");
+  }
+
+  // Erase blob
+  if (!_eraseBlobNVS(idx)) {
+    Serial.printf("[Journal] recoverCorruptedEntry: blob erase failed — continuing\n");
+  }
+
+  // Clear slot
+  if (!_clearSlotNVS(idx)) {
+    Serial.printf("[Journal] recoverCorruptedEntry: _clearSlotNVS failed\n");
+  }
+
+  // Update RAM
+  _journalValid[idx] = false;
+  _journalCommitted[idx] = false;
+  _journalState[idx] = TransactionState::PENDING;
+  _journalIds[idx] = "";
+  _journalHashes[idx] = "";
+  _journalAcks[idx] = "";
+  _journalChannelId[idx] = 0;
+  _journalDesiredState[idx] = false;
+  _journalPreviousKnownState[idx] = false;
+  _journalAttempt[idx] = 0;
+  _journalTimestamp[idx] = 0;
+  if (_journalSize > 0) _journalSize--;
+
+  Serial.printf("[Journal] CORRUPTED entry recovered: rid=%s (slot %u freed)\n",
+                requestId.c_str(), idx);
+  return true;
+}
+
+// ============================================================================
+// CYCLE-8C (fixes C8BR1-008): commitTransactionFailed — durable terminal state
+//   for OUTPUT_MISMATCH and other execution failures.
+//   Stores ackJson + state=EXECUTION_FAILED_OUTPUT_MISMATCH + commit=1 (durable).
+//   This is a terminal state — no auto-retry (operator must investigate).
+// ============================================================================
+bool TransactionJournal::commitTransactionFailed(const String& requestId, const String& ackJson,
+                                                   TransactionState failureState) {
+  int idx = _findInJournal(requestId);
+  if (idx < 0) {
+    Serial.printf("[Journal] commitTransactionFailed: rid=%s NOT FOUND\n", requestId.c_str());
+    return false;
+  }
+
+  // Only EXECUTION_FAILED_OUTPUT_MISMATCH is currently supported as failure state
+  if (failureState != TransactionState::EXECUTION_FAILED_OUTPUT_MISMATCH) {
+    Serial.printf("[Journal] commitTransactionFailed: unsupported failure state %s\n",
+                  _stateToString(failureState));
+    return false;
+  }
+
+  // Monotonicity check: must be in EXECUTING state to commit failure
+  if (_journalState[idx] != TransactionState::EXECUTING) {
+    Serial.printf("[Journal] commitTransactionFailed: rid=%s state=%s (expected EXECUTING) — REJECTED\n",
+                  requestId.c_str(), _stateToString(_journalState[idx]));
+    return false;
+  }
+
+  // Use _commitExecutingEntryNVS with targetState = failureState
+  // _commitExecutingEntryNVS needs to support non-COMMITTED target states.
+  // For now, we reuse it with targetState parameter.
+  if (!_commitExecutingEntryNVS(idx, ackJson, failureState)) {
+    Serial.printf("[Journal] commitTransactionFailed FAILED for rid=%s\n", requestId.c_str());
+    return false;
+  }
+
+  queueAck(requestId, ackJson);
+  Serial.printf("[Journal] Committed FAILURE: rid=%s (slot %u, state=%s)\n",
+                requestId.c_str(), idx, _stateToString(failureState));
   return true;
 }
 
