@@ -1,34 +1,52 @@
 // =============================================================================
 // Services/TransactionJournal.h — Durable transaction journal for MQTT commands
 // =============================================================================
-// R10G/R10H (audit rounds 10G/10H): NVS-persisted transaction journal.
+// R10G/R10H/R10I (audit rounds 10G/10H/10I): NVS-persisted transaction journal.
 //
-// R10H-1 FIX: NVS atomicity. Previous version did 5 separate NVS writes
-// (3 putString + 2 putUChar). Power loss between writes → partial state.
-// FIX: Serialize entire entry to single blob → putBytes() atomic write.
+// R10H-1: Single blob write (putBytes) instead of 5 separate writes.
+// R10H-2: Journal size 16 → 64 entries.
+// R10H-3: Commit flag (valid byte).
 //
-// R10H-2 FIX: LRU eviction. Previous 16-entry buffer evicted oldest after
-// 16 commands, breaking "permanent dedup" claim. Increased to 64 entries.
-// Documented honestly: beyond 64 commands, oldest entries CAN be re-executed.
+// R10I-1 (CRITICAL): Added magic + version + CRC32 to blob format.
+//   Engineer audit: "valid=1 saja tidak cukup untuk membuktikan blob tidak
+//   korup akibat power-loss."
+//   FIX: Blob now has:
+//     [magic:2] [version:1] [valid:1] [CRC32:4]
+//     [idLen:1] [id:idLen] [hashLen:1] [hash:hashLen]
+//     [ackLen:2] [ack:ackLen]
+//   CRC32 covers everything AFTER the CRC field (payload).
+//   On load: verify magic + version + CRC. If any mismatch → entry is CORRUPT,
+//   skipped, and slot is marked free.
 //
-// R10H-3: Commit-flag pattern. Each entry has a "valid" flag. On boot,
-// entries with flag=false are treated as corrupted (power loss during write)
-// and are NOT loaded. This prevents partial entries from causing false
-// "already processed" results.
+// R10I-2 (CRITICAL): Two-phase commit via valid byte.
+//   Phase 1: Write blob with valid=0 (INCOMPLETE marker).
+//   Phase 2: Overwrite ONLY the valid byte to valid=1 (COMMITTED).
+//   If power loss during Phase 1: valid=0 → entry rejected on boot.
+//   If power loss during Phase 2: valid=0 still → entry rejected on boot.
+//   Only if Phase 2 completes: valid=1 + CRC valid → entry accepted.
+//
+//   NOTE: This is a "best effort" two-phase commit. ESP32 NVS (Preferences)
+//   does not provide true atomic blob writes. The valid-byte flip is a single
+//   small write that is much less likely to be interrupted than a full blob
+//   write. Combined with CRC, this provides strong integrity protection.
+//
+// R10I-3: Check putBytes() return value. If write fails, mark slot as invalid.
+//
+// R10I-4: Slot replacement: before writing new entry to LRU slot, clear old
+//   entry first (write valid=0). This prevents "double valid" scenario where
+//   old + new data both look valid after partial overwrite.
 //
 // DURABILITY BOUNDARY (honest documentation):
-//   The sequence is: execute command → store to NVS → publish ACK.
+//   Sequence: execute command → store to NVS → publish ACK.
 //   If ESP32 crashes AFTER execute but BEFORE store:
-//     - Physical state has changed (relay moved, schedule saved to LittleFS)
+//     - Physical state changed (relay moved, schedule saved to LittleFS)
 //     - Journal does NOT have the entry
 //     - PWA retry → journal miss → RE-EXECUTE
-//   For SET_STATE (relay ON/OFF): idempotent, re-execute produces same result.
-//   For schedule upsert: may create duplicate (but capped at 4 per channel).
+//   For SET_STATE (relay ON/OFF): idempotent, safe.
+//   For schedule upsert: may create duplicate (capped at 4 per channel).
 //   For config/time: idempotent (overwrite).
-//   For OTA: not stored in journal (separate flow with Update library).
-//
-//   This is a FUNDAMENTAL limitation of software-only transaction durability
-//   on ESP32 without hardware transaction support. Accepted as documented risk.
+//   For OTA: not stored in journal (separate flow).
+//   This is FUNDAMENTAL limitation without hardware transaction support.
 // =============================================================================
 #pragma once
 #ifndef TIMER12_SERVICES_TRANSACTION_JOURNAL_H
@@ -53,28 +71,35 @@ public:
   uint8_t getJournalSize() const { return _journalSize; }
 
 private:
-  // R10H-2: Increased from 16 to 64 entries.
-  // At 100 commands/day, oldest entry is ~15 hours old when evicted.
-  // This gives PWA ample retry window (PWA timeout is 5s, retries for ~2min).
-  // Beyond 64 commands, oldest entries CAN be re-executed — documented limitation.
   static const uint8_t JOURNAL_SIZE = 64;
   static const uint8_t MAX_PENDING_ACKS = 8;
   static const uint8_t MAX_ACK_RETRIES = 10;
   static const unsigned long ACK_RETRY_INTERVAL_MS = 2000;
 
-  // R10H-1: Max blob size for NVS write (must fit requestId + hash + ackJson)
-  // requestId: max 64 chars + null = 65
-  // commandHash: 64 hex chars + null = 65
-  // ackJson: max ~1024 chars (relay/schedule/pir/channel ACK all < 500 bytes)
-  // valid flag: 1 byte
-  // Total: ~1156 bytes, round up to 1200
+  // R10I-1: Blob layout:
+  //   [0..1]  magic = 0x54, 0x4A ("TJ")
+  //   [2]     version = 1
+  //   [3]     valid flag (0=incomplete, 1=committed)
+  //   [4..7]  CRC32 of payload (bytes 8..end)
+  //   [8]     requestId length (max 64)
+  //   [9..]   requestId data
+  //   [..]    commandHash length (max 64)
+  //   [..]    commandHash data
+  //   [..]    ackJson length (2 bytes LE, max 1024)
+  //   [..]    ackJson data
+  //
+  // Max size: 8 (header) + 1+64 + 1+64 + 2+1024 = 1164 bytes.
+  // BLOB_SIZE = 1200 (with margin).
+  static const uint16_t BLOB_MAGIC1 = 0x54;  // 'T'
+  static const uint16_t BLOB_MAGIC2 = 0x4A;  // 'J'
+  static const uint8_t BLOB_VERSION = 1;
+  static const uint8_t BLOB_HEADER_SIZE = 8;  // magic(2) + ver(1) + valid(1) + CRC(4)
   static const uint16_t BLOB_SIZE = 1200;
 
-  // RAM cache of NVS journal
   String _journalIds[JOURNAL_SIZE];
   String _journalHashes[JOURNAL_SIZE];
   String _journalAcks[JOURNAL_SIZE];
-  bool _journalValid[JOURNAL_SIZE];  // R10H-3: commit flag
+  bool _journalValid[JOURNAL_SIZE];
   uint8_t _journalSize = 0;
   uint8_t _journalWriteIdx = 0;
 
@@ -88,10 +113,23 @@ private:
   uint8_t _pendingAckCount = 0;
 
   void _loadFromNVS();
-  // R10H-1: Atomic blob write — serializes entry to single buffer, writes once.
-  void _saveEntryToNVSAtomic(uint8_t idx);
-  // R10H-1: Deserialize blob back to fields
+
+  // R10I-2: Two-phase commit
+  // Phase 1: serialize blob with valid=0, write to NVS.
+  // Phase 2: flip valid byte to 1, rewrite blob.
+  // Returns true if both phases succeed.
+  bool _saveEntryToNVSAtomic(uint8_t idx);
+
+  // R10I-4: Clear slot (write valid=0) before new entry
+  void _clearSlotNVS(uint8_t idx);
+
+  // R10I-1: Deserialize + verify magic + version + CRC
+  // Returns true if entry is valid and committed.
   bool _deserializeEntry(const uint8_t* blob, size_t len, uint8_t idx);
+
+  // R10I-1: Compute CRC32 of payload (everything after CRC field)
+  uint32_t _computeCRC(const uint8_t* data, size_t len);
+
   int _findInJournal(const String& requestId);
 };
 
