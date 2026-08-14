@@ -1,3 +1,16 @@
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  Superseded by Rev25 for: MQTT5 claim removal, terminology split,  ║ -->
+<!-- ║  future sender-auth requirements, current implementation status.  ║ -->
+<!-- ║  Refer to:                                                ║ -->
+<!-- ║    - CYCLE-8C-REV25-AUTH-EVIDENCE-NORMALIZATION.md         ║ -->
+<!-- ║  for the authoritative supplement.                          ║ -->
+<!-- ║  Rev24 remains authoritative for cross-product I2 alignment and AUTHENTICATED not firmware-verifiable.  ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
 # CYCLE-8C-Rev24: Transaction Journal v4 — Verification Boundary Closure
 
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
