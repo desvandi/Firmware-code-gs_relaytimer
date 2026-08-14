@@ -191,23 +191,35 @@ private:
 };
 
 // -----------------------------------------------------------------------------
-// AckRecord (Rev26 I3 — durable in NVS, multiple keys)
+// AckRecord (Rev26 I3 — durable in NVS, multiple keys with CRC32 integrity)
 //
-//   P2-1 CORRECTION PASS 3 (auditor P0-A): previous layout used
-//   ACK_RECORD_SIZE=1280 with monolithic tj_ackq blob = 10248 bytes.
-//   This exceeds ESP32 NVS single-page blob limit (~1984 bytes default)
-//   and required 10KB stack buffer (exceeds default 8KB task stack).
+//   P2-1 CORRECTION PASS 3 (auditor P0-A): redesigned to multi-key layout.
+//   P2-1 CORRECTION PASS 4 (auditor CP-1): added real CRC32 integrity.
 //
-//   Corrected: each ACK record is stored as its own NVS key.
-//     tj_ackq_hdr     — 4 bytes (count + reserved)
-//     tj_ackq_rec_0   — ACK_RECORD_SIZE bytes (1280)
-//     tj_ackq_rec_1   — ACK_RECORD_SIZE bytes (1280)
-//     ...             (8 records total)
-//     tj_ackq_rec_7   — ACK_RECORD_SIZE bytes (1280)
-//     tj_ackq_crc     — 4 bytes (CRC32 over header + all records)
+//   Storage model (each key ≤ 1280 bytes, fits ESP32 NVS single-page ~1952B):
+//     tj_ackq_hdr     — 4 bytes (count + reserved + version)
+//     tj_ackq_rec_0   — 1280 bytes (ACK_RECORD_SIZE)
+//     tj_ackq_rec_1   — 1280 bytes
+//     ...             (8 records)
+//     tj_ackq_rec_7   — 1280 bytes
+//     tj_ackq_crc     — 4 bytes (uint32 LE, CRC32 over header + all records)
 //
-//   Each individual blob ≤ 1280 bytes — fits ESP32 NVS single-page limit.
-//   No monolithic blob; no 10KB stack buffer.
+//   CRC32 algorithm: CRC-32/ISO-HDLC (same as JournalRecord CRC).
+//     ~esp_crc32_le(0xFFFFFFFF, header ++ records) & 0xFFFFFFFF
+//
+//   Boot verification:
+//     1. Load header (count + version)
+//     2. Load each record (0..count-1)
+//     3. Compute CRC32 over header + records
+//     4. Load stored CRC from tj_ackq_crc
+//     5. If mismatch → queue CORRUPTED → recovery policy:
+//        - Log warning
+//        - Drop entire queue (do NOT silently sanitize individual records)
+//        - Reconstruct via _mergeAckQueueFromJournal (boot merge)
+//        - Persist reconstructed queue with new CRC
+//
+//   This ensures torn multi-key updates are detected (CRC covers all keys
+//   as a logical snapshot).
 //
 //   AckRecord layout (1280 bytes per record):
 //     [0..1]     ackMagic (0x41, 0x51)
@@ -222,21 +234,21 @@ private:
 //     [139..140] ackLen (uint16 LE, 0..1024)
 //     [141..1164] ackJson (var, padded to 1024 bytes)
 //     [1165..1279] padding (zeros, 115 bytes)
-//
-//   Note: ACK_RECORD_SIZE=1280 itself exceeds single-page blob limit
-//   (~1984 bytes per page, but usable for blob is ~1984-32=1952 bytes).
-//   1280 < 1952, so it fits. P2-3 hardware test must verify actual NVS
-//   accepts 1280-byte blobs in the configured partition.
 // -----------------------------------------------------------------------------
 static const uint16_t ACK_MAGIC1 = 0x41;  // 'A'
 static const uint16_t ACK_MAGIC2 = 0x51;  // 'Q'
 static const uint8_t  ACK_VERSION = 1;
 static const uint16_t ACK_RECORD_SIZE = 1280;  // Single record, fits NVS single-page (~1952 bytes usable)
 static const uint8_t  ACK_QUEUE_CAPACITY = 8;
-// P2-1 CORRECTION PASS 3: no monolithic blob — each record is its own NVS key.
-// ACK_QUEUE_BLOB_SIZE removed (no single blob).
 static const uint8_t  ACK_QUEUE_HDR_SIZE = 4;
-static const uint8_t  ACK_QUEUE_CRC_SIZE = 4;
+static const uint8_t  ACK_QUEUE_CRC_SIZE = 4;  // uint32 LE
+
+// ACK queue state (runtime, derived from CRC verification at boot)
+enum class AckQueueState : uint8_t {
+  ACK_QUEUE_EMPTY      = 0,  // No header key — fresh start
+  ACK_QUEUE_VALID      = 1,  // Header + records loaded, CRC verified
+  ACK_QUEUE_CORRUPTED  = 2,  // CRC mismatch or parse failure → recovery required
+};
 
 struct AckRecord {
   AckDeliveryState deliveryState;
@@ -409,11 +421,12 @@ private:
   bool _snapshotCaptured = false;
 
   // ===========================================================================
-  // ACK queue (Rev26 I3 — in-RAM mirror of tj_ackq blob)
+  // ACK queue (Rev26 I3 — in-RAM mirror of multi-key NVS storage)
   // ===========================================================================
   AckRecord _ackQueue[ACK_QUEUE_CAPACITY];
   uint8_t   _ackQueueCount = 0;
   uint32_t  _ackQueueCRC = 0;
+  AckQueueState _ackQueueState = AckQueueState::ACK_QUEUE_EMPTY;  // CP-1: runtime state
 
   // ===========================================================================
   // Executor + observation state (Rev26 I0 / I0a)

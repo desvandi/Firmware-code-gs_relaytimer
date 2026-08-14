@@ -19,6 +19,7 @@
 #include "TransactionJournal.h"
 #include "Config.h"        // Core::NVS_NAMESPACE (firmware) or shim (host)
 #include <Preferences.h>   // ESP32 NVS API (firmware) or shim (host)
+#include <esp_crc.h>        // esp_crc32_le — ESP-IDF (firmware) or shim (host)
 #include <cstring>
 #include <cstdio>
 
@@ -174,6 +175,7 @@ void TransactionJournal::begin() {
 //   retry. But operator is now alerted via Serial log.
 // =============================================================================
 void TransactionJournal::_mergeAckQueueFromJournal() {
+  _assertMutationAllowed();  // CP-3: merge mutates _ackQueue[] + calls _persistAckQueue
   uint8_t added = 0;
   for (uint8_t i = 0; i < JOURNAL_SIZE; i++) {
     if (!_slots[i].inUse) continue;
@@ -597,6 +599,7 @@ bool TransactionJournal::_repairSlot(uint8_t slotIdx, bool fromCopyA) {
 //   via recoverCorruptedEntry()).
 // =============================================================================
 bool TransactionJournal::_quarantineSlot(uint8_t slotIdx) {
+  _assertMutationAllowed();  // CP-3: enforce I0a — quarantine mutates RAM state
   _slots[slotIdx].durability = SlotDurability::SLOT_QUARANTINED;
   _slots[slotIdx].record.recordState = RecordState::EMPTY;  // RAM-only — NVS untouched
   _slots[slotIdx].record.generation = 0;
@@ -629,11 +632,20 @@ SlotDurability TransactionJournal::_observeSlot(uint8_t slotIdx, SlotDecision& o
   outDecision.needsQuarantine = false;
   outDecision.loadedRecord = JournalRecord();
 
-  // Check if slot is completely empty (no NVS keys for either copy).
-  bool aExists, bExists;
+  // CP-4: Check if slot is completely empty (no NVS keys for either copy).
+  // CRITICAL: prefs.begin() failure must NOT be treated as SLOT_EMPTY.
+  // NVS storage error ≠ empty slot. Fail-closed → treat as CORRUPTED.
+  bool aExists = false, bExists = false;
   {
     Preferences prefs;
-    prefs.begin(Core::NVS_NAMESPACE, true);
+    if (!prefs.begin(Core::NVS_NAMESPACE, true)) {
+      // CP-4: NVS unavailable → fail-closed (quarantine, not empty)
+      Serial.printf("[Journal] _observeSlot: NVS begin FAILED for slot %u — fail-closed (CORRUPTED)\n",
+                    slotIdx);
+      outDecision.durability = SlotDurability::SLOT_QUARANTINED;
+      outDecision.needsQuarantine = true;
+      return SlotDurability::SLOT_QUARANTINED;
+    }
     aExists = prefs.isKey(_slotKeyA(slotIdx).c_str());
     bExists = prefs.isKey(_slotKeyB(slotIdx).c_str());
     prefs.end();
@@ -717,6 +729,7 @@ SlotDurability TransactionJournal::_observeSlot(uint8_t slotIdx, SlotDecision& o
 //   _assertMutationAllowed() is enforced by _repairSlot/_writeCopy/_quarantineSlot.
 // =============================================================================
 bool TransactionJournal::_applySlotDecision(const SlotDecision& dec) {
+  _assertMutationAllowed();  // CP-3: _applySlotDecision mutates _slots[] + calls mutation helpers
   uint8_t i = dec.slotIdx;
 
   if (dec.durability == SlotDurability::SLOT_EMPTY) {
@@ -788,17 +801,39 @@ uint8_t TransactionJournal::_findSlotByRequestId(const String& requestId) const 
 //   where _isEvictionPermitted() returns true. Returns JOURNAL_SIZE if no
 //   slot is evictable (journal full + nothing evictable → caller must reject).
 // =============================================================================
+// =============================================================================
+// Find evictable slot (Rev26 I2 — applies eviction predicate)
+//
+//   P2-1 CORRECTION PASS 4 (auditor CP-2): quarantined slots must NEVER be
+//   auto-reused. Previous version treated `inUse==false` as "empty slot —
+//   no eviction needed", but quarantined slots also have `inUse==false`.
+//   This caused evidence to be overwritten by new commands.
+//
+//   Corrected: a slot is only "truly empty" (reusable without eviction)
+//   if `inUse==false AND durability==SLOT_EMPTY`. Quarantined slots
+//   (durability==SLOT_QUARANTINED) are permanently excluded until
+//   recoverCorruptedSlot() or recoverCorruptedEntry() explicitly clears them.
+// =============================================================================
 uint8_t TransactionJournal::_findEvictableSlot() const {
   for (uint8_t i = 0; i < JOURNAL_SIZE; i++) {
     uint8_t idx = (_journalWriteIdx + i) % JOURNAL_SIZE;
-    if (!_slots[idx].inUse) {
-      return idx;  // Empty slot — no eviction needed
+
+    // CP-2: Quarantined slots are NEVER auto-reusable, even though inUse==false.
+    if (_slots[idx].durability == SlotDurability::SLOT_QUARANTINED) {
+      continue;  // Skip quarantined — evidence preserved for operator recovery
     }
+
+    // Truly empty slot (inUse==false AND not quarantined) — reusable without eviction
+    if (!_slots[idx].inUse) {
+      return idx;
+    }
+
+    // Active slot — check if eviction is permitted per I2a-I2e
     if (_isEvictionPermitted(idx)) {
-      return idx;  // Slot can be evicted per I2a-I2e
+      return idx;
     }
   }
-  return JOURNAL_SIZE;  // Journal full, nothing evictable
+  return JOURNAL_SIZE;  // Journal full, nothing evictable (may have quarantined slots)
 }
 
 // =============================================================================
@@ -1434,6 +1469,7 @@ TransactionState TransactionJournal::reconcileEntry(const String& requestId) {
 // =============================================================================
 bool TransactionJournal::queueAck(const String& requestId, const String& ackJson) {
   _assertExecutorContext();
+  _assertMutationAllowed();  // CP-3: queueAck mutates _ackQueue[] + NVS
 
   // Check if requestId already in queue
   int8_t existing = _findAckInQueue(requestId);
@@ -1508,6 +1544,7 @@ bool TransactionJournal::queueAck(const String& requestId, const String& ackJson
 // =============================================================================
 uint8_t TransactionJournal::processPendingAcks() {
   _assertExecutorContext();
+  _assertMutationAllowed();  // CP-3: processPendingAcks mutates retryCount/deliveryState + NVS
 
   if (!s_publishCallback) return 0;
 
@@ -1573,6 +1610,7 @@ uint8_t TransactionJournal::processPendingAcks() {
 // =============================================================================
 void TransactionJournal::dequeueAck(const String& requestId) {
   _assertExecutorContext();
+  _assertMutationAllowed();  // CP-3: dequeueAck mutates _ackQueue[] + NVS
 
   int8_t idx = _findAckInQueue(requestId);
   if (idx < 0) return;
@@ -1592,6 +1630,7 @@ void TransactionJournal::dequeueAck(const String& requestId) {
 // =============================================================================
 bool TransactionJournal::updateAckDeliveryState(const String& requestId, AckDeliveryState newState) {
   _assertExecutorContext();
+  _assertMutationAllowed();  // CP-3: updateAckDeliveryState mutates deliveryState + NVS
 
   int8_t idx = _findAckInQueue(requestId);
   if (idx < 0) return false;
@@ -1602,110 +1641,166 @@ bool TransactionJournal::updateAckDeliveryState(const String& requestId, AckDeli
 }
 
 // =============================================================================
-// ACK QUEUE NVS — _loadAckQueue (Rev26 I3 — multi-key, no monolithic blob)
+// ACK QUEUE NVS — _loadAckQueue (Rev26 I3 — multi-key with CRC32 verification)
 //
-//   P2-1 CORRECTION PASS 3 (auditor P0-A): previous version loaded entire
-//   10248-byte monolithic blob into stack buffer — exceeded ESP32 task
-//   stack (default 8KB). Corrected: each ACK record is its own NVS key
-//   (tj_ackq_rec_<idx>), loaded one-at-a-time into a 1280-byte buffer.
+//   P2-1 CORRECTION PASS 4 (auditor CP-1): real CRC32 verification.
+//   Previous version used count^0xA5 placeholder — not a real CRC, did not
+//   cover records, did not detect torn multi-key updates.
 //
-//   Keys:
-//     tj_ackq_hdr     — 4 bytes (count + reserved)
-//     tj_ackq_rec_<N> — ACK_RECORD_SIZE bytes (1280) for N=0..7
-//     tj_ackq_crc     — 4 bytes (CRC32 over header + all records)
+//   Corrected:
+//     1. Load header (count + version)
+//     2. Load each record (0..count-1)
+//     3. Compute CRC32 over header ++ records (deterministic serialization)
+//     4. Load stored CRC from tj_ackq_crc (uint32 LE)
+//     5. If mismatch → queue CORRUPTED → drop entire queue, set state,
+//        log warning. Do NOT silently sanitize individual records.
+//     6. _mergeAckQueueFromJournal (called by begin() after this) will
+//        reconstruct queue from journal COMMITTED entries.
 // =============================================================================
 bool TransactionJournal::_loadAckQueue() {
   Preferences prefs;
-  if (!prefs.begin(Core::NVS_NAMESPACE, true)) return false;
+  if (!prefs.begin(Core::NVS_NAMESPACE, true)) {
+    // CP-4: NVS failure → fail closed, NOT empty
+    _ackQueueState = AckQueueState::ACK_QUEUE_CORRUPTED;
+    _ackQueueCount = 0;
+    Serial.printf("[Journal] _loadAckQueue: NVS begin FAILED — queue CORRUPTED (fail-closed)\n");
+    return false;
+  }
 
-  // Load header (count byte + 3 reserved)
+  // Step 1: Load header
   if (!prefs.isKey("tj_ackq_hdr")) {
     prefs.end();
     _ackQueueCount = 0;
+    _ackQueueState = AckQueueState::ACK_QUEUE_EMPTY;
     return true;  // Fresh start — no queue yet
   }
 
   uint8_t hdr[ACK_QUEUE_HDR_SIZE];
   size_t hdrRead = prefs.getBytes("tj_ackq_hdr", hdr, ACK_QUEUE_HDR_SIZE);
-  prefs.end();
 
   if (hdrRead != ACK_QUEUE_HDR_SIZE) {
-    Serial.printf("[Journal] _loadAckQueue: header size mismatch (%u != %u)\n",
-                  (unsigned)hdrRead, (unsigned)ACK_QUEUE_HDR_SIZE);
+    prefs.end();
+    _ackQueueState = AckQueueState::ACK_QUEUE_CORRUPTED;
     _ackQueueCount = 0;
+    Serial.printf("[Journal] _loadAckQueue: header size mismatch (%u != %u) — CORRUPTED\n",
+                  (unsigned)hdrRead, (unsigned)ACK_QUEUE_HDR_SIZE);
     return false;
   }
 
   _ackQueueCount = hdr[0];
   if (_ackQueueCount > ACK_QUEUE_CAPACITY) {
-    Serial.printf("[Journal] _loadAckQueue: count %u exceeds capacity %u — resetting\n",
-                  _ackQueueCount, ACK_QUEUE_CAPACITY);
+    prefs.end();
+    _ackQueueState = AckQueueState::ACK_QUEUE_CORRUPTED;
     _ackQueueCount = 0;
+    Serial.printf("[Journal] _loadAckQueue: count %u exceeds capacity %u — CORRUPTED\n",
+                  _ackQueueCount, ACK_QUEUE_CAPACITY);
     return false;
   }
 
-  // Load each record (one at a time — 1280-byte buffer, safe for stack)
+  // Step 2: Load each record + accumulate CRC incrementally (no 10KB stack buffer)
   uint8_t recBuf[ACK_RECORD_SIZE];
+  bool anyRecFailed = false;
+
+  // Start CRC computation with header
+  uint32_t computedCRC = 0xFFFFFFFF;
+  computedCRC = esp_crc32_le(computedCRC, hdr, ACK_QUEUE_HDR_SIZE);
+
   for (uint8_t i = 0; i < _ackQueueCount; i++) {
     char key[20];
     snprintf(key, sizeof(key), "tj_ackq_rec_%u", i);
 
-    Preferences rprefs;
-    if (!rprefs.begin(Core::NVS_NAMESPACE, true)) continue;
-    if (!rprefs.isKey(key)) {
-      rprefs.end();
-      Serial.printf("[Journal] _loadAckQueue: record %u missing — skipping\n", i);
-      _ackQueue[i] = AckRecord();
+    if (!prefs.isKey(key)) {
+      Serial.printf("[Journal] _loadAckQueue: record %u missing — CORRUPTED\n", i);
+      anyRecFailed = true;
       continue;
     }
-    size_t recRead = rprefs.getBytes(key, recBuf, ACK_RECORD_SIZE);
-    rprefs.end();
 
+    size_t recRead = prefs.getBytes(key, recBuf, ACK_RECORD_SIZE);
     if (recRead != ACK_RECORD_SIZE) {
-      Serial.printf("[Journal] _loadAckQueue: record %u size mismatch (%u != %u) — skipping\n",
+      Serial.printf("[Journal] _loadAckQueue: record %u size mismatch (%u != %u) — CORRUPTED\n",
                     i, (unsigned)recRead, (unsigned)ACK_RECORD_SIZE);
-      _ackQueue[i] = AckRecord();
+      anyRecFailed = true;
       continue;
     }
 
+    // Accumulate CRC over this record
+    computedCRC = esp_crc32_le(computedCRC, recBuf, ACK_RECORD_SIZE);
+
+    // Deserialize into RAM (will be discarded if CRC fails later)
     if (!_deserializeAckRecord(recBuf, _ackQueue[i])) {
-      Serial.printf("[Journal] _loadAckQueue: record %u parse failed — skipping\n", i);
-      _ackQueue[i] = AckRecord();
+      Serial.printf("[Journal] _loadAckQueue: record %u parse failed — CORRUPTED\n", i);
+      anyRecFailed = true;
+      continue;
     }
   }
 
-  // Load CRC (best-effort — P2-1 doesn't enforce CRC on ACK queue;
-  // P2-3 hardware test will add CRC enforcement if needed)
-  Preferences cprefs;
-  if (cprefs.begin(Core::NVS_NAMESPACE, true)) {
-    if (cprefs.isKey("tj_ackq_crc")) {
-      _ackQueueCRC = cprefs.getUChar("tj_ackq_crc", 0);  // Note: getUChar only 1 byte — P2-3 will upgrade
+  // Step 3: Load stored CRC
+  uint32_t storedCRC = 0;
+  if (prefs.isKey("tj_ackq_crc")) {
+    uint8_t crcBuf[ACK_QUEUE_CRC_SIZE];
+    size_t crcRead = prefs.getBytes("tj_ackq_crc", crcBuf, ACK_QUEUE_CRC_SIZE);
+    if (crcRead == ACK_QUEUE_CRC_SIZE) {
+      storedCRC = (uint32_t)crcBuf[0]
+                | ((uint32_t)crcBuf[1] << 8)
+                | ((uint32_t)crcBuf[2] << 16)
+                | ((uint32_t)crcBuf[3] << 24);
     } else {
-      _ackQueueCRC = 0;
+      anyRecFailed = true;  // CRC key exists but wrong size
     }
-    cprefs.end();
+  } else {
+    anyRecFailed = true;  // CRC key missing
   }
 
-  Serial.printf("[Journal] _loadAckQueue: loaded %u ACK records (multi-key)\n", _ackQueueCount);
+  prefs.end();
+
+  // Step 4: If any record failed to load, queue is CORRUPTED
+  if (anyRecFailed) {
+    _ackQueueState = AckQueueState::ACK_QUEUE_CORRUPTED;
+    _ackQueueCount = 0;
+    Serial.printf("[Journal] _loadAckQueue: queue CORRUPTED (record/CRC failure) — will reconstruct via boot merge\n");
+    return false;
+  }
+
+  // Step 5: Finalize computed CRC (complement)
+  computedCRC = ~computedCRC & 0xFFFFFFFF;
+
+  // Step 6: Verify CRC
+  if (computedCRC != storedCRC) {
+    _ackQueueState = AckQueueState::ACK_QUEUE_CORRUPTED;
+    _ackQueueCount = 0;
+    Serial.printf("[Journal] _loadAckQueue: CRC mismatch (stored=%08x, computed=%08x) — CORRUPTED, will reconstruct via boot merge\n",
+                  (unsigned)storedCRC, (unsigned)computedCRC);
+    return false;
+  }
+
+  // Step 7: CRC valid — records already deserialized in step 2
+  _ackQueueCRC = storedCRC;
+  _ackQueueState = AckQueueState::ACK_QUEUE_VALID;
+  Serial.printf("[Journal] _loadAckQueue: loaded %u ACK records (CRC32 verified: %08x)\n",
+                _ackQueueCount, (unsigned)storedCRC);
   return true;
 }
 
 // =============================================================================
-// ACK QUEUE NVS — _persistAckQueue (Rev26 I3 — multi-key, no monolithic blob)
+// ACK QUEUE NVS — _persistAckQueue (Rev26 I3 — multi-key with CRC32)
 //
-//   P2-1 CORRECTION PASS 3 (auditor P0-A): write each record as its own
-//   NVS key (1280 bytes per key). No 10KB stack buffer.
+//   P2-1 CORRECTION PASS 4 (auditor CP-1): real CRC32 computation.
+//   Writes header + records + CRC. CRC covers header ++ all records.
 // =============================================================================
 bool TransactionJournal::_persistAckQueue() {
+  _assertMutationAllowed();  // CP-3: _persistAckQueue writes to NVS (mutation)
   Preferences prefs;
-  if (!prefs.begin(Core::NVS_NAMESPACE, false)) return false;
+  if (!prefs.begin(Core::NVS_NAMESPACE, false)) {
+    Serial.printf("[Journal] _persistAckQueue: NVS begin FAILED\n");
+    return false;
+  }
 
-  // Write header (count byte + 3 reserved)
+  // Write header
   uint8_t hdr[ACK_QUEUE_HDR_SIZE];
   hdr[0] = _ackQueueCount;
-  hdr[1] = 0;
-  hdr[2] = 0;
-  hdr[3] = 0;
+  hdr[1] = 0;  // reserved
+  hdr[2] = 0;  // reserved
+  hdr[3] = ACK_VERSION;  // version for future schema migration
   size_t hdrWritten = prefs.putBytes("tj_ackq_hdr", hdr, ACK_QUEUE_HDR_SIZE);
   if (hdrWritten != ACK_QUEUE_HDR_SIZE) {
     Serial.printf("[Journal] _persistAckQueue: header write short (%u != %u)\n",
@@ -1714,10 +1809,15 @@ bool TransactionJournal::_persistAckQueue() {
     return false;
   }
 
-  // Write each record (1280-byte buffer per record)
+  // Write each record + accumulate CRC
+  uint32_t crc = 0xFFFFFFFF;
+  crc = esp_crc32_le(crc, hdr, ACK_QUEUE_HDR_SIZE);
+
   uint8_t recBuf[ACK_RECORD_SIZE];
   for (uint8_t i = 0; i < _ackQueueCount; i++) {
     _serializeAckRecord(_ackQueue[i], recBuf);
+    crc = esp_crc32_le(crc, recBuf, ACK_RECORD_SIZE);
+
     char key[20];
     snprintf(key, sizeof(key), "tj_ackq_rec_%u", i);
     size_t recWritten = prefs.putBytes(key, recBuf, ACK_RECORD_SIZE);
@@ -1729,7 +1829,7 @@ bool TransactionJournal::_persistAckQueue() {
     }
   }
 
-  // Erase any stale records beyond current count
+  // Erase stale records beyond count
   for (uint8_t i = _ackQueueCount; i < ACK_QUEUE_CAPACITY; i++) {
     char key[20];
     snprintf(key, sizeof(key), "tj_ackq_rec_%u", i);
@@ -1738,22 +1838,53 @@ bool TransactionJournal::_persistAckQueue() {
     }
   }
 
-  // Write CRC (best-effort for P2-1; P2-3 will add full CRC32 enforcement)
-  // For now, use count as simple checksum placeholder.
-  uint8_t crcPlaceholder = (uint8_t)(_ackQueueCount ^ 0xA5);
-  prefs.putUChar("tj_ackq_crc", crcPlaceholder);
-  _ackQueueCRC = crcPlaceholder;
+  // Finalize CRC (complement)
+  crc = ~crc & 0xFFFFFFFF;
+  _ackQueueCRC = crc;
 
+  // Write CRC as uint32 LE
+  uint8_t crcBuf[ACK_QUEUE_CRC_SIZE];
+  crcBuf[0] = crc & 0xFF;
+  crcBuf[1] = (crc >> 8) & 0xFF;
+  crcBuf[2] = (crc >> 16) & 0xFF;
+  crcBuf[3] = (crc >> 24) & 0xFF;
+  size_t crcWritten = prefs.putBytes("tj_ackq_crc", crcBuf, ACK_QUEUE_CRC_SIZE);
   prefs.end();
+
+  if (crcWritten != ACK_QUEUE_CRC_SIZE) {
+    Serial.printf("[Journal] _persistAckQueue: CRC write short (%u != %u)\n",
+                  (unsigned)crcWritten, (unsigned)ACK_QUEUE_CRC_SIZE);
+    return false;
+  }
+
+  _ackQueueState = AckQueueState::ACK_QUEUE_VALID;
   return true;
 }
 
+// =============================================================================
+// _computeAckQueueCRC (Rev26 I3 — CRC32 over header ++ records)
+//
+//   P2-1 CORRECTION PASS 4 (auditor CP-1): real CRC32, not placeholder.
+//   Computes CRC32 over current RAM state (header + all records).
+//   Used for verification and testing.
+// =============================================================================
 uint32_t TransactionJournal::_computeAckQueueCRC() const {
-  // P2-1: simplified — return count-based checksum.
-  // P2-3 will upgrade to full CRC32 over header + all records.
-  // This is acceptable for P2-1 because CRC enforcement is not the primary
-  // durability mechanism (dual-copy JournalRecord CRC is the primary one).
-  return (uint32_t)(_ackQueueCount ^ 0xA5);
+  uint8_t hdr[ACK_QUEUE_HDR_SIZE];
+  hdr[0] = _ackQueueCount;
+  hdr[1] = 0;
+  hdr[2] = 0;
+  hdr[3] = ACK_VERSION;
+
+  uint32_t crc = 0xFFFFFFFF;
+  crc = esp_crc32_le(crc, hdr, ACK_QUEUE_HDR_SIZE);
+
+  uint8_t recBuf[ACK_RECORD_SIZE];
+  for (uint8_t i = 0; i < _ackQueueCount; i++) {
+    const_cast<TransactionJournal*>(this)->_serializeAckRecord(_ackQueue[i], recBuf);
+    crc = esp_crc32_le(crc, recBuf, ACK_RECORD_SIZE);
+  }
+
+  return ~crc & 0xFFFFFFFF;
 }
 
 // =============================================================================

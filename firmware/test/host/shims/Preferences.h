@@ -40,6 +40,7 @@ public:
 
     bool begin(const char* name, bool readOnly = false) {
         if (!name) return false;
+        if (failModeRef()) return false;  // Test hook: simulate NVS failure
         ns_ = std::string(name) + "/";
         started_ = true;
         readOnly_ = readOnly;
@@ -101,6 +102,9 @@ public:
         storage().clear();
     }
 
+    // Test-only: enable/disable NVS failure simulation (CP-4: fail-closed testing)
+    static void setFailMode(bool fail) { failModeRef() = fail; }
+
 private:
     std::string ns_;
     bool started_;
@@ -111,6 +115,11 @@ private:
     static std::unordered_map<std::string, std::vector<uint8_t>>& storage() {
         static std::unordered_map<std::string, std::vector<uint8_t>> s;
         return s;
+    }
+
+    static bool& failModeRef() {
+        static bool fm = false;
+        return fm;
     }
 };
 

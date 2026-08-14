@@ -1002,6 +1002,174 @@ static void test_mutation_helper_invariant_real() {
           "requestId findable after repair-via-mutation-phase");
 }
 
+// =============================================================================
+// CP-4 CORRECTION PASS 4 — auditor TEST 26-38 (failure-mode suite)
+// ============================================================================
+
+// TEST 26 — ACK CRC corruption (auditor CP-1/CP-5)
+static void test_ack_crc_corruption() {
+    printf("\n[TEST 26] ACK CRC corruption (CP-1: CRC32 verification)\n");
+    resetJournal(); journal.begin();
+    journal.storeIntent("req-crc", "set_state|ch=1|state=on", 1, true, false);
+    journal.markExecuting("req-crc");
+    journal.commitTransaction("req-crc", "{\"ok\":true}");
+    CHECK_EQ(journal.getPendingAckCount(), (uint8_t)1, "ACK queued before corruption");
+    { Preferences p; p.begin("timer12", false);
+      uint8_t bad[4]={0xDE,0xAD,0xBE,0xEF}; p.putBytes("tj_ackq_crc", bad, 4); p.end(); }
+    journal.~TransactionJournal(); new (&journal) TransactionJournal(); journal.begin();
+    CHECK_EQ(journal.getPendingAckCount(), (uint8_t)1,
+             "ACK reconstructed after CRC corruption (boot merge)");
+}
+
+// TEST 27 — Missing ACK record (auditor CP-5)
+static void test_ack_missing_record() {
+    printf("\n[TEST 27] Missing ACK record (CP-5: no silent skip)\n");
+    resetJournal(); journal.begin();
+    journal.storeIntent("req-miss", "set_state|ch=1|state=on", 1, true, false);
+    journal.markExecuting("req-miss");
+    journal.commitTransaction("req-miss", "{\"ok\":true}");
+    { Preferences p; p.begin("timer12", false); p.remove("tj_ackq_rec_0"); p.end(); }
+    journal.~TransactionJournal(); new (&journal) TransactionJournal(); journal.begin();
+    CHECK_EQ(journal.getPendingAckCount(), (uint8_t)1,
+             "ACK reconstructed after missing record (boot merge)");
+}
+
+// TEST 28 — Malformed ACK record (auditor CP-5)
+static void test_ack_malformed_record() {
+    printf("\n[TEST 28] Malformed ACK record (CP-5: corruption detection)\n");
+    resetJournal(); journal.begin();
+    journal.storeIntent("req-malf", "set_state|ch=1|state=on", 1, true, false);
+    journal.markExecuting("req-malf");
+    journal.commitTransaction("req-malf", "{\"ok\":true}");
+    { Preferences p; p.begin("timer12", false);
+      uint8_t g[1280]; memset(g,0xFF,1280); p.putBytes("tj_ackq_rec_0",g,1280); p.end(); }
+    journal.~TransactionJournal(); new (&journal) TransactionJournal(); journal.begin();
+    CHECK_EQ(journal.getPendingAckCount(), (uint8_t)1,
+             "ACK reconstructed after malformed record (boot merge)");
+}
+
+// TEST 29 — ACK queue full reconstruction (auditor CP-5)
+static void test_ack_queue_reconstruction() {
+    printf("\n[TEST 29] ACK queue full reconstruction (CP-5)\n");
+    resetJournal(); journal.begin();
+    for (uint8_t i=0;i<3;i++) {
+        char r[16]; snprintf(r,sizeof(r),"req-recon-%u",i);
+        char h[32]; snprintf(h,sizeof(h),"set_state|ch=%u|state=on",i);
+        journal.storeIntent(r,h,i,true,false); journal.markExecuting(r);
+        journal.commitTransaction(r,"{\"ok\":true}");
+    }
+    CHECK_EQ(journal.getPendingAckCount(), (uint8_t)3, "3 ACKs queued");
+    { Preferences p; p.begin("timer12",false);
+      p.remove("tj_ackq_hdr"); p.remove("tj_ackq_crc");
+      for (uint8_t i=0;i<8;i++){char k[20];snprintf(k,sizeof(k),"tj_ackq_rec_%u",i);p.remove(k);}
+      p.end(); }
+    journal.~TransactionJournal(); new (&journal) TransactionJournal(); journal.begin();
+    CHECK_EQ(journal.getPendingAckCount(), (uint8_t)3,
+             "3 ACKs reconstructed from journal on boot merge");
+}
+
+// TEST 30 — NVS read failure != EMPTY (auditor CP-4)
+static void test_nvs_read_failure_not_empty() {
+    printf("\n[TEST 30] NVS read failure != EMPTY (CP-4: fail-closed)\n");
+    resetJournal(); journal.begin();
+    journal.storeIntent("req-nvs", "set_state|ch=1|state=on", 1, true, false);
+    Preferences::setFailMode(true);
+    journal.~TransactionJournal(); new (&journal) TransactionJournal(); journal.begin();
+    SlotDurability d = journal._getSlotDurability(0);
+    CHECK(d == SlotDurability::SLOT_QUARANTINED,
+          "NVS failure -> slot QUARANTINED (not EMPTY)");
+    Preferences::setFailMode(false);
+}
+
+// TEST 31 — NVS write failure (auditor CP-4)
+static void test_nvs_write_failure() {
+    printf("\n[TEST 31] NVS write failure (CP-4: storeIntent fails)\n");
+    resetJournal(); journal.begin();
+    Preferences::setFailMode(true);
+    bool ok = journal.storeIntent("req-wf","set_state|ch=1|state=on",1,true,false);
+    Preferences::setFailMode(false);
+    CHECK(!ok, "storeIntent fails when NVS unavailable");
+    CHECK(!journal.isProcessed("req-wf"), "failed storeIntent did not create entry");
+}
+
+// TEST 32 — Clear crash after copy B (safe case, auditor P0-2)
+// Uses PENDING entry (clearable without I2 conditions) to test that
+// successful clear persists across reload.
+static void test_clear_crash_after_copy_b() {
+    printf("\n[TEST 32] Clear crash after copy B (P0-2: safe case)\n");
+    resetJournal(); journal.begin();
+    journal.storeIntent("req-cb","set_state|ch=1|state=on",1,true,false);
+    journal.clearEntry("req-cb");  // PENDING → clearable
+    journal.~TransactionJournal(); new (&journal) TransactionJournal(); journal.begin();
+    CHECK(!journal.isProcessed("req-cb"),
+          "cleared PENDING transaction not found after reload");
+    // Slot should be reusable (not quarantined)
+    SlotDurability d = journal._getSlotDurability(0);
+    CHECK(d != SlotDurability::SLOT_QUARANTINED,
+          "slot not quarantined after successful clear + reload");
+}
+
+// TEST 34 — Quarantined slot cannot be evicted/reused (auditor CP-2)
+static void test_quarantined_slot_not_reused() {
+    printf("\n[TEST 34] Quarantined slot cannot be reused (CP-2)\n");
+    resetJournal(); journal.begin();
+    journal.storeIntent("req-qe","set_state|ch=1|state=on",1,true,false);
+    { Preferences p; p.begin("timer12",false);
+      uint8_t g[BLOB_SIZE]; memset(g,0xDE,BLOB_SIZE);
+      g[0]=0x54; g[1]=0x4A; g[2]=4;
+      p.putBytes("tj_slot_0_a",g,BLOB_SIZE); p.putBytes("tj_slot_0_b",g,BLOB_SIZE);
+      p.end(); }
+    journal._forceReloadSlot(0);
+    CHECK(journal._getSlotDurability(0) == SlotDurability::SLOT_QUARANTINED,
+          "slot 0 quarantined");
+    for (uint8_t i=0;i<63;i++) {
+        char r[16]; snprintf(r,sizeof(r),"req-fill-%u",i);
+        char h[32]; snprintf(h,sizeof(h),"set_state|ch=%u|state=on",i);
+        if (!journal.storeIntent(r,h,i,true,false)) break;
+    }
+    CHECK(journal._getSlotDurability(0) == SlotDurability::SLOT_QUARANTINED,
+          "quarantined slot 0 NOT reused after filling journal");
+    CHECK(!journal.isProcessed("req-qe"), "quarantined requestId not in active journal");
+}
+
+// TEST 37 — Commit partial-success semantics (auditor CP-6)
+static void test_commit_partial_success() {
+    printf("\n[TEST 37] Commit partial-success semantics (CP-6)\n");
+    resetJournal(); journal.begin();
+    for (uint8_t i=0;i<8;i++) {
+        char r[16]; snprintf(r,sizeof(r),"req-ps-%u",i);
+        char h[32]; snprintf(h,sizeof(h),"set_state|ch=%u|state=on",i);
+        journal.storeIntent(r,h,i,true,false); journal.markExecuting(r);
+        journal.commitTransaction(r,"{\"ok\":true}");
+    }
+    journal.storeIntent("req-ps-9","set_state|ch=9|state=on",9,true,false);
+    journal.markExecuting("req-ps-9");
+    bool ok = journal.commitTransaction("req-ps-9","{\"ok\":true}");
+    CHECK(!ok, "commit returns false when ACK queue full (partial success)");
+    CHECK(journal.isCommitted("req-ps-9"),
+          "journal entry IS committed despite ACK queue failure");
+    ok = journal.commitTransaction("req-ps-9","{\"ok\":true}");
+    CHECK(!ok, "retry commitTransaction returns false (already COMMITTED)");
+    CHECK(journal.isCommitted("req-ps-9"), "still COMMITTED after retry (no regression)");
+    journal.~TransactionJournal(); new (&journal) TransactionJournal(); journal.begin();
+    CHECK(journal.isCommitted("req-ps-9"), "journal durable across reload");
+}
+
+// TEST 38 — Reconciliation persistence (auditor CP-7)
+static void test_reconciliation_persistence() {
+    printf("\n[TEST 38] Reconciliation persistence (CP-7)\n");
+    resetJournal(); journal.begin();
+    journal.storeIntent("req-rp","set_state|ch=1|state=on",1,true,false);
+    journal.markExecuting("req-rp");
+    TransactionState rs = journal.reconcileEntry("req-rp");
+    CHECK(rs == TransactionState::UNKNOWN, "reconcileEntry returns UNKNOWN");
+    CHECK(journal.getTransactionState("req-rp") == TransactionState::UNKNOWN,
+          "state UNKNOWN in RAM after reconcile");
+    journal.~TransactionJournal(); new (&journal) TransactionJournal(); journal.begin();
+    CHECK(journal.getTransactionState("req-rp") == TransactionState::UNKNOWN,
+          "state UNKNOWN persisted across reload");
+}
+
 // ============================================================================
 // main
 // ============================================================================
@@ -1046,6 +1214,18 @@ int main() {
     test_retry_state_persistence();           // P1-8: retry state persist
     test_boot_merge_journal_ack_queue();       // P1-9: boot merge
     test_mutation_helper_invariant_real();    // P1-4: real invariant test
+
+    // CP-4 CORRECTION PASS 4 — auditor TEST 26-38 (failure-mode suite)
+    test_ack_crc_corruption();                // TEST 26: CP-1 CRC corruption
+    test_ack_missing_record();                // TEST 27: CP-5 missing record
+    test_ack_malformed_record();              // TEST 28: CP-5 malformed record
+    test_ack_queue_reconstruction();           // TEST 29: CP-5 full reconstruction
+    test_nvs_read_failure_not_empty();        // TEST 30: CP-4 NVS read != EMPTY
+    test_nvs_write_failure();                 // TEST 31: CP-4 NVS write failure
+    test_clear_crash_after_copy_b();           // TEST 32: P0-2 safe case
+    test_quarantined_slot_not_reused();       // TEST 34: CP-2 quarantine no-evict
+    test_commit_partial_success();            // TEST 37: CP-6 partial-success
+    test_reconciliation_persistence();         // TEST 38: CP-7 reconciliation
 
     printf("\n==========================================================\n");
     printf("RESULTS: %d passed, %d failed\n", g_passCount, g_failCount);
