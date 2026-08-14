@@ -17,7 +17,8 @@ namespace Services {
 TransactionJournal journal;
 
 // NVS keys
-static const char* NVS_KEY_TJ_ENTRY_PREFIX = "tj_entry_";  // tj_entry_0 .. tj_entry_63
+static const char* NVS_KEY_TJ_ENTRY_PREFIX = "tj_entry_";  // tj_entry_0 .. tj_entry_63 (blob data)
+static const char* NVS_KEY_TJ_COMMIT_PREFIX = "tj_commit_"; // R10J: tj_commit_0 .. tj_commit_63 (1 byte each)
 static const char* NVS_KEY_TJ_COUNT = "tj_count";
 static const char* NVS_KEY_TJ_WIDX = "tj_widx";
 
@@ -51,12 +52,12 @@ bool TransactionJournal::_deserializeEntry(const uint8_t* blob, size_t len, uint
     return false;
   }
 
-  // --- R10I-2: Check valid flag (commit marker) ---
-  bool valid = blob[3] != 0;
-  if (!valid) {
-    Serial.printf("[Journal] Entry %u: not committed (valid=0)\n", idx);
-    return false;  // power loss during Phase 1 or Phase 2
-  }
+  // --- R10J: valid byte in blob is always 0 (commit flag is in separate NVS key) ---
+  // We skip checking blob[3] here — the commit flag is checked in _loadFromNVS()
+  // via tj_commit_N key. If we reached _deserializeEntry, commit was already verified.
+  // We still read it for forward compatibility (future versions might use it differently).
+  // bool valid = blob[3] != 0;  // NOT checked — commit is in separate key
+  (void)blob[3];  // suppress unused warning
 
   // --- R10I-1: Extract stored CRC ---
   uint32_t storedCRC = blob[4] | (blob[5] << 8) | (blob[6] << 16) | ((uint32_t)blob[7] << 24);
@@ -102,7 +103,21 @@ bool TransactionJournal::_deserializeEntry(const uint8_t* blob, size_t len, uint
 }
 
 // ============================================================================
-// R10I-2 + R10I-3 + R10I-4: Two-phase atomic commit
+// R10J: Two-phase commit with SEPARATE commit key (true two-phase)
+//
+// BUG FIXED (R10J): Previous Phase 2 rewrote ENTIRE blob via putBytes().
+// Engineer audit: "putBytes() sendiri bukan transaksi multi-step yang bisa
+// kita asumsikan atomic terhadap power failure."
+//
+// FIX: Use SEPARATE NVS key for commit flag:
+//   tj_entry_N: blob data (always valid=0 in blob, never flipped)
+//   tj_commit_N: single byte (0=uncommitted, 1=committed)
+//
+// Phase 1: putBytes(tj_entry_N, blob) — writes full blob with valid=0
+// Phase 2: putUChar(tj_commit_N, 1) — writes SINGLE BYTE (much faster,
+//          much smaller power-loss window than full blob rewrite)
+//
+// On boot: entry is valid ONLY if tj_commit_N == 1 AND CRC matches.
 // ============================================================================
 bool TransactionJournal::_saveEntryToNVSAtomic(uint8_t idx) {
   if (idx >= JOURNAL_SIZE) return false;
@@ -129,11 +144,11 @@ bool TransactionJournal::_saveEntryToNVSAtomic(uint8_t idx) {
   uint8_t blob[BLOB_SIZE];
   memset(blob, 0, BLOB_SIZE);
 
-  // Header
+  // Header (valid byte in blob is ALWAYS 0 — commit flag is in separate key)
   blob[0] = BLOB_MAGIC1;   // 'T'
   blob[1] = BLOB_MAGIC2;   // 'J'
   blob[2] = BLOB_VERSION;   // 1
-  blob[3] = 0;              // R10I-2: valid=0 (INCOMPLETE) for Phase 1
+  blob[3] = 0;              // valid=0 (always — commit is in tj_commit_N)
   // CRC filled after payload
 
   // Payload
@@ -167,62 +182,63 @@ bool TransactionJournal::_saveEntryToNVSAtomic(uint8_t idx) {
     return false;
   }
 
-  char key[20];
-  snprintf(key, sizeof(key), "%s%u", NVS_KEY_TJ_ENTRY_PREFIX, idx);
+  char entryKey[20];
+  char commitKey[20];
+  snprintf(entryKey, sizeof(entryKey), "%s%u", NVS_KEY_TJ_ENTRY_PREFIX, idx);
+  snprintf(commitKey, sizeof(commitKey), "%s%u", NVS_KEY_TJ_COMMIT_PREFIX, idx);
 
-  // --- R10I-4: Phase 0 — Clear old entry (write valid=0 first) ---
-  // This prevents "double valid" if new write is interrupted.
-  uint8_t clearBlob[BLOB_HEADER_SIZE];
-  clearBlob[0] = BLOB_MAGIC1;
-  clearBlob[1] = BLOB_MAGIC2;
-  clearBlob[2] = BLOB_VERSION;
-  clearBlob[3] = 0;  // valid=0 (clearing)
-  clearBlob[4] = 0; clearBlob[5] = 0; clearBlob[6] = 0; clearBlob[7] = 0;  // CRC=0
-  prefs.putBytes(key, clearBlob, BLOB_HEADER_SIZE);
+  // --- R10J Phase 0: Clear commit flag (write 0 FIRST) ---
+  // This ensures old committed entry is invalidated before new data is written.
+  prefs.putUChar(commitKey, 0);
 
-  // --- R10I-2: Phase 1 — Write full blob with valid=0 ---
-  size_t written = prefs.putBytes(key, blob, totalLen);
+  // --- R10J Phase 1: Write blob data (commit flag still 0) ---
+  size_t written = prefs.putBytes(entryKey, blob, totalLen);
   if (written != totalLen) {
-    // R10I-3: Write failed — mark slot invalid
     Serial.printf("[Journal] Phase 1 write FAILED (wrote %u/%u bytes)\n", written, totalLen);
-    prefs.putBytes(key, clearBlob, BLOB_HEADER_SIZE);  // ensure valid=0
     prefs.end();
     _journalValid[idx] = false;
     return false;
   }
 
-  // --- R10I-2: Phase 2 — Flip valid byte to 1 (commit) ---
-  blob[3] = 1;  // valid=1 (COMMITTED)
-  written = prefs.putBytes(key, blob, totalLen);
-  if (written != totalLen) {
-    // R10I-3: Phase 2 write failed — entry remains valid=0 (uncommitted)
-    Serial.printf("[Journal] Phase 2 write FAILED — entry uncommitted\n");
+  // --- R10J Phase 2: Set commit flag (SINGLE BYTE write) ---
+  // This is the commit point. Power loss before this line → entry uncommitted.
+  // Power loss during this line → putUChar is single-byte, very small window.
+  // Power loss after this line → entry is committed + CRC valid.
+  size_t commitWritten = prefs.putUChar(commitKey, 1);
+  if (commitWritten != 1) {
+    Serial.printf("[Journal] Phase 2 commit FAILED — entry uncommitted\n");
     prefs.end();
     _journalValid[idx] = false;
     return false;
   }
 
-  // Update metadata
-  prefs.putUChar(NVS_KEY_TJ_COUNT, _journalSize);
-  prefs.putUChar(NVS_KEY_TJ_WIDX, _journalWriteIdx);
+  // R10J FIX: Write NEXT writeIdx to NVS (not current), so reboot doesn't
+  // overwrite the entry we just wrote.
+  // BUG WAS: previously wrote _journalWriteIdx (current slot) to NVS,
+  // then advanced RAM. On reboot, NVS had current slot → overwrite.
+  // FIX: advance RAM FIRST, then write advanced value to NVS.
+  uint8_t nextWriteIdx = (_journalWriteIdx + 1) % JOURNAL_SIZE;
+  prefs.putUChar(NVS_KEY_TJ_WIDX, nextWriteIdx);
+  prefs.putUChar(NVS_KEY_TJ_COUNT, _journalSize + 1 < JOURNAL_SIZE ? _journalSize + 1 : JOURNAL_SIZE);
 
   prefs.end();
   _journalValid[idx] = true;
+  // R10J: advance RAM pointer to match NVS
+  _journalWriteIdx = nextWriteIdx;
+  if (_journalSize < JOURNAL_SIZE) _journalSize++;
   return true;
 }
 
 // ============================================================================
-// R10I-4: Clear slot — write valid=0 to prevent double-valid on overwrite
+// R10J: Clear slot — clear commit flag (separate key)
 // ============================================================================
 void TransactionJournal::_clearSlotNVS(uint8_t idx) {
   Preferences prefs;
   if (!prefs.begin(Core::NVS_NAMESPACE, false)) return;
 
-  char key[20];
-  snprintf(key, sizeof(key), "%s%u", NVS_KEY_TJ_ENTRY_PREFIX, idx);
-
-  uint8_t clearBlob[BLOB_HEADER_SIZE] = {BLOB_MAGIC1, BLOB_MAGIC2, BLOB_VERSION, 0, 0, 0, 0, 0};
-  prefs.putBytes(key, clearBlob, BLOB_HEADER_SIZE);
+  char commitKey[20];
+  snprintf(commitKey, sizeof(commitKey), "%s%u", NVS_KEY_TJ_COMMIT_PREFIX, idx);
+  prefs.putUChar(commitKey, 0);  // clear commit flag
   prefs.end();
 }
 
@@ -253,29 +269,44 @@ void TransactionJournal::_loadFromNVS() {
   }
 
   _journalSize = 0;
+  // R10J: writeIdx now stores NEXT slot (not current), so it's correct after reboot
   _journalWriteIdx = prefs.getUChar(NVS_KEY_TJ_WIDX, 0);
 
-  char key[20];
+  char entryKey[20];
+  char commitKey[20];
   uint8_t blob[BLOB_SIZE];
 
-  // R10I-1: Load + verify each entry (magic + version + valid + CRC)
+  // R10J: Load + verify each entry
+  // Entry is valid ONLY if:
+  //   1. tj_commit_N == 1 (committed)
+  //   2. tj_entry_N blob passes magic + version + CRC checks
   for (uint8_t i = 0; i < JOURNAL_SIZE; i++) {
-    snprintf(key, sizeof(key), "%s%u", NVS_KEY_TJ_ENTRY_PREFIX, i);
-    size_t len = prefs.getBytesLength(key);
+    snprintf(entryKey, sizeof(entryKey), "%s%u", NVS_KEY_TJ_ENTRY_PREFIX, i);
+    snprintf(commitKey, sizeof(commitKey), "%s%u", NVS_KEY_TJ_COMMIT_PREFIX, i);
 
-    if (len == 0 || len > BLOB_SIZE) {
-      // Empty slot — skip
+    // R10J: Check commit flag FIRST (fast check before loading blob)
+    uint8_t committed = prefs.getUChar(commitKey, 0);
+    if (committed != 1) {
+      // Not committed — skip (power loss during Phase 1 or before Phase 2)
       _journalValid[i] = false;
       continue;
     }
 
-    prefs.getBytes(key, blob, len);
+    // Committed — load blob and verify integrity
+    size_t len = prefs.getBytesLength(entryKey);
+    if (len == 0 || len > BLOB_SIZE) {
+      Serial.printf("[Journal] Entry %u: committed but blob missing/corrupt\n", i);
+      _journalValid[i] = false;
+      continue;
+    }
+
+    prefs.getBytes(entryKey, blob, len);
 
     if (_deserializeEntry(blob, len, i)) {
       _journalSize++;
     } else {
-      // R10I-1: Corrupted/uncommitted entry — mark as invalid
-      Serial.printf("[Journal] Entry %u: INVALID (corrupt/uncommitted) — slot freed\n", i);
+      // R10J: Committed but CRC/magic failed → data corrupted after commit
+      Serial.printf("[Journal] Entry %u: committed but CORRUPT — slot freed\n", i);
       _journalValid[i] = false;
       _journalIds[i] = "";
       _journalHashes[i] = "";
@@ -334,7 +365,9 @@ bool TransactionJournal::storeTransaction(const String& requestId,
   _journalHashes[idx] = commandHash;
   _journalAcks[idx] = ackJson;
 
-  // R10I-2: Atomic two-phase commit (valid=0 → write → valid=1)
+  // R10J: Atomic two-phase commit (valid=0 → write blob → commit=1)
+  // _saveEntryToNVSAtomic now also advances _journalWriteIdx and _journalSize
+  // in both RAM and NVS (fixes LRU consistency bug after reboot).
   if (!_saveEntryToNVSAtomic(idx)) {
     // Write failed — don't advance pointer, don't queue ACK
     // PWA will retry, ESP32 will re-execute (safe for idempotent commands)
@@ -343,9 +376,8 @@ bool TransactionJournal::storeTransaction(const String& requestId,
     return false;
   }
 
-  // Advance LRU pointer
-  _journalWriteIdx = (_journalWriteIdx + 1) % JOURNAL_SIZE;
-  if (_journalSize < JOURNAL_SIZE) _journalSize++;
+  // R10J: _journalWriteIdx and _journalSize already advanced inside
+  // _saveEntryToNVSAtomic() — no need to advance here.
 
   // Queue ACK for delivery
   queueAck(requestId, ackJson);
