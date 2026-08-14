@@ -198,13 +198,19 @@ The PWA login uses these two values. The MQTT password is embedded in the topic 
 ### 1. MQTT Remote Mode (`MqttClient.cpp`)
 
 - **Outbound connection** to broker (works behind CGNAT/MiFi — no port forwarding needed)
-- **Topic format**: `timer12/<mac>/<mqttPass>/<subtopic>` — password in topic path provides basic auth
-- **TLS support**: if broker port is 8883, uses `WiFiClientSecure` (with `setInsecure()` — for self-hosted broker with valid certs, replace with `setCACert()`)
-- **ACK transaction layer**: every command from PWA includes a `requestId` (UUID). Firmware:
-  1. Deduplicates `requestId` via ring buffer of last 16 (re-ACKs duplicates, does NOT re-execute)
-  2. Executes command (SET_STATE only — no TOGGLE, for idempotency)
-  3. Publishes ACK to `timer12/<mac>/<mqttPass>/ack` with: `{requestId, success, channelId, state, source, modeAuto}`
-  4. PWA waits for ACK with 5s timeout, deep-validates schema, updates React Query cache deterministically
+- **Topic format**: `timer12/<mac>/<subtopic>` (R10C-3: password removed from topic)
+- **Authentication**: via broker credentials (username/password in MQTT CONNECT)
+- **Authorization**: via broker ACL (per-device topic restrictions)
+- **TLS support**: if broker port is 8883/8884, uses `WiFiClientSecure` with `setCACert(MQTT_ROOT_CA)`. **Fail-closed**: if `MQTT_ROOT_CA` is empty in production mode, firmware refuses to connect (no `setInsecure()` fallback).
+- **Production guard** (R10A-5): port 8883/8884 requires ALL of: `MQTT_BROKER_USERNAME`, `MQTT_BROKER_PASSWORD`, `MQTT_ROOT_CA`. Missing any → hard fail.
+- **ACK transaction layer** (R10E-1: atomic publish+store):
+  - Every command includes `requestId` (UUID)
+  - Validation order (R10E-2): parse → validate type → validate fields (whitelist) → compute hash → dedup check → execute → ACK
+  - Dedup buffer: 64 entries + 15min TTL (R10E-3)
+  - On duplicate: replay ORIGINAL ACK JSON (not reconstructed — R10D-2/R10E-1)
+  - requestId reuse with different command → rejected (R10A-3)
+  - Unknown fields → rejected (R10D-3)
+  - SET_STATE only (no TOGGLE, for idempotency)
 - **LWT** (Last Will & Testament): publishes `0` to `online` topic on disconnect → PWA shows offline status
 - **Status publishing**: every 5s, publishes full SystemStatus JSON to `status` topic (retained=false, QoS 1)
 
@@ -375,13 +381,13 @@ This firmware has been through 8 rounds of security audit by an external enginee
 - ✅ **CRC validation on PZEM Modbus**: corrupt frames dropped silently
 - ✅ **Boot glitch fix**: relay pins pulled HIGH during boot (active-LOW relays stay OFF until explicitly driven)
 
-### Known Limitations (Audit Round 8 — not yet fixed)
+### Known Limitations (updated Round 10E)
 
-- ⚠️ **MQTT broker**: HiveMQ public broker is used by default — fine for MVP, but for production 220V relay control, deploy a self-hosted broker (Mosquitto/EMQX) with TLS + ACL + per-device credentials. Configurable via `Config.h` `MQTT_BROKER_*` constants.
-- ⚠️ **MQTT password in topic**: anyone who knows the MAC + MQTT password can subscribe/publish. This is a basic auth mechanism — for production, use broker-side ACL + username/password auth (`MQTT_BROKER_USERNAME`/`MQTT_BROKER_PASSWORD` in `Config.h`).
-- ⚠️ **OTA via MQTT**: not yet implemented as a transaction (no ACK). Use REST `/api/ota` upload for now.
-- ⚠️ **TLS cert validation**: `setInsecure()` is used for MQTT TLS. For production, bundle a CA cert and use `setCACert()`.
-- ⚠️ **CORS**: `Access-Control-Allow-Origin: *` is sent. For production, restrict to your PWA's Vercel URL in `HttpServer.cpp`.
+- ⚠️ **MQTT broker**: HiveMQ public broker (port 1883, anonymous) is the DEFAULT for development only. For production 220V relay control, deploy self-hosted Mosquitto with TLS (port 8883) + ACL + per-device credentials. Set `MQTT_BROKER_HOST`, `MQTT_BROKER_PORT=8883`, `MQTT_BROKER_USERNAME`, `MQTT_BROKER_PASSWORD`, `MQTT_ROOT_CA` in `Config.h`. Firmware will hard-fail if any is missing in production mode (R10A-5).
+- ⚠️ **Ed25519 build verification**: PSA Crypto API identifiers are correct (R10D-1), but actual build + known-answer test on Arduino IDE 2.3.8 + ESP32 core 3.3.7 has NOT been verified by the developer. If `PSA_ECC_FAMILY_TWISTED_EDWARDS` is not defined, enable via menuconfig → mbedTLS → Elliptic Curve DH/DSA.
+- ⚠️ **CORS**: `ALLOWED_CORS_ORIGINS = "*"` is the DEFAULT (development). For production, set to your PWA's Vercel URL in `Config.h`.
+- ⚠️ **OTA signing**: `OTA_ED25519_PUBLIC_KEY_HEX` and `OTA_HTTPS_ROOT_CA` are empty by default. OTA will hard-fail until these are configured. Generate keypair with `scripts/sign_firmware.py --gen-keys`.
+- ⚠️ **MQTT topic password**: REMOVED from topic in R10C-3. Auth is now via broker credentials. The `mqttPass` value from Serial Monitor is kept for backward compat but NOT used in topic path.
 
 See `firmware/CONTRACT_VERIFICATION.md` (not included in this repo — ask the project owner) for the full audit trail.
 

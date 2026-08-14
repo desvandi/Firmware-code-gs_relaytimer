@@ -330,44 +330,31 @@ void MqttClient::publishLog(Core::LogType type, const String& message, int8_t ch
   _mqtt.publish(_topicLog.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
 }
 
-// R10D-2: Helper that publishes ACK JSON to MQTT + stores it in dedup buffer
-// for duplicate replay. Called by all ACK publishers after constructing the JSON.
-void MqttClient::_publishAndStoreAck(const String& requestId, const String& ackJson,
-                                      const String& commandHash) {
-  if (!_mqtt.connected() || requestId.length() == 0) return;
-  _mqtt.publish(_topicAck.c_str(), (const uint8_t*)ackJson.c_str(),
-                ackJson.length(), false);
-  // Store for duplicate replay (R10D-2)
-  if (commandHash.length() > 0) {
-    _addProcessed(requestId, commandHash, ackJson);
-  }
-  Serial.printf("[MQTT ACK] %s: published + stored (%d bytes)\n",
-                requestId.c_str(), ackJson.length());
-}
+// =============================================================================
+// R10E-1 (audit round 10E): ATOMIC ACK transaction pattern.
+//
+// BUG FIXED: Previous design (R10D-2) had ordering bug:
+//   _addProcessed(requestId, commandHash);  // ← _lastAckJson still empty here!
+//   _publishRelayAck(...);                   // ← sets _lastAckJson AFTER store
+// This caused _lastAckJson to capture the PREVIOUS command's ACK, not current.
+//
+// NEW DESIGN: Each ACK publisher accepts `commandHash` parameter and performs
+// atomic transaction in this exact order:
+//   1. Construct ACK JSON
+//   2. Publish to MQTT
+//   3. Store {requestId, commandHash, ackJson} in dedup buffer
+// No separate _addProcessed() calls from _handleCommand anymore.
+//
+// For FAILURE ACKs (success=false): pass commandHash="" → NOT stored in dedup
+// (failed commands can be retried with same requestId).
+// =============================================================================
 
-// ---------------------------------------------------------------------------
-// Publish command ACK — ESP32 confirms command was received and executed.
-// PWA subscribes to ack topic and waits for confirmation.
-//
-// P0 #1 (audit round 9): requestId is only added to dedup buffer AFTER
-// successful execution. Invalid/failed commands are NOT deduplicated, so
-// retries have a chance to succeed.
-//
-// P0 #2 (audit round 9): Duplicate ACKs now include actual relay state
-// (channelId, state, source, modeAuto) via _publishRelayAck().
-//
-// P1 #11 (audit round 9): ALL mutation types now send ACK with type-specific
-// data. PWA transaction layer can update cache deterministically for every
-// mutation, not just relay.
-//
-// R10D-2 (audit round 10D): ACK JSON is now stored in dedup buffer for
-// verbatim replay on duplicate commands (instead of reconstructing from
-// command params, which lost actual results like scheduleId).
-// ---------------------------------------------------------------------------
+// Generic ACK — used for failures and generic successes.
+// If commandHash is non-empty AND success=true → store in dedup buffer.
 void MqttClient::_publishAck(const String& requestId, bool success, const char* message,
-                              const String& dataJson) {
+                              const String& dataJson, const String& commandHash) {
   if (!_mqtt.connected()) return;
-  if (requestId.length() == 0) return;  // no requestId = no ACK needed
+  if (requestId.length() == 0) return;
 
   StaticJsonDocument<512> doc;
   doc["requestId"] = requestId;
@@ -375,7 +362,6 @@ void MqttClient::_publishAck(const String& requestId, bool success, const char* 
   doc["message"] = message;
   doc["timestamp"] = (uint64_t)Drivers::rtc.getUnixTime() * 1000ULL;
 
-  // Parse dataJson if provided, embed as data object
   if (dataJson.length() > 0) {
     JsonObject data = doc.createNestedObject("data");
     StaticJsonDocument<256> dataDoc;
@@ -389,15 +375,20 @@ void MqttClient::_publishAck(const String& requestId, bool success, const char* 
 
   String json;
   serializeJson(doc, json);
-  _lastAckJson = json;  // R10D-2: store for dedup replay
+
+  // R10E-1: Atomic publish + store
   _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-  Serial.printf("[MQTT ACK] %s: %s\n", requestId.c_str(), success ? "OK" : "FAIL");
+  if (success && commandHash.length() > 0) {
+    _addProcessed(requestId, commandHash, json);
+  }
+  Serial.printf("[MQTT ACK] %s: %s%s\n", requestId.c_str(),
+                success ? "OK" : "FAIL",
+                commandHash.length() > 0 ? " (stored)" : "");
 }
 
-// Relay-specific ACK: includes actual relay state (P0 #2 — audit round 9).
-// Used for both first-execution AND duplicate ACKs so PWA always gets real state.
+// Relay ACK: includes actual relay state.
 void MqttClient::_publishRelayAck(const String& requestId, bool success, const char* message,
-                                   uint8_t channelId) {
+                                   uint8_t channelId, const String& commandHash) {
   if (requestId.length() == 0) return;
 
   StaticJsonDocument<256> doc;
@@ -421,15 +412,20 @@ void MqttClient::_publishRelayAck(const String& requestId, bool success, const c
 
   String json;
   serializeJson(doc, json);
-  _lastAckJson = json;  // R10D-2: store for dedup replay
+
+  // R10E-1: Atomic publish + store
   _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-  Serial.printf("[MQTT ACK] %s: %s (relay CH%d)\n", requestId.c_str(),
-                success ? "OK" : "FAIL", channelId);
+  if (success && commandHash.length() > 0) {
+    _addProcessed(requestId, commandHash, json);
+  }
+  Serial.printf("[MQTT ACK] %s: %s (relay CH%d)%s\n", requestId.c_str(),
+                success ? "OK" : "FAIL", channelId,
+                commandHash.length() > 0 ? " (stored)" : "");
 }
 
 // Schedule ACK: includes the schedule ID that was upserted/deleted.
 void MqttClient::_publishScheduleAck(const String& requestId, bool success, const char* message,
-                                     int channelId, int scheduleId) {
+                                     int channelId, int scheduleId, const String& commandHash) {
   if (requestId.length() == 0) return;
 
   StaticJsonDocument<256> doc;
@@ -446,15 +442,20 @@ void MqttClient::_publishScheduleAck(const String& requestId, bool success, cons
 
   String json;
   serializeJson(doc, json);
-  _lastAckJson = json;  // R10D-2: store for dedup replay
+
+  // R10E-1: Atomic publish + store
   _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-  Serial.printf("[MQTT ACK] %s: %s (schedule CH%d id=%d)\n", requestId.c_str(),
-                success ? "OK" : "FAIL", channelId, scheduleId);
+  if (success && commandHash.length() > 0) {
+    _addProcessed(requestId, commandHash, json);
+  }
+  Serial.printf("[MQTT ACK] %s: %s (schedule CH%d id=%d)%s\n", requestId.c_str(),
+                success ? "OK" : "FAIL", channelId, scheduleId,
+                commandHash.length() > 0 ? " (stored)" : "");
 }
 
 // PIR ACK: includes PIR state after config/test.
 void MqttClient::_publishPirAck(const String& requestId, bool success, const char* message,
-                                uint8_t pirId) {
+                                uint8_t pirId, const String& commandHash) {
   if (requestId.length() == 0) return;
 
   StaticJsonDocument<256> doc;
@@ -476,15 +477,20 @@ void MqttClient::_publishPirAck(const String& requestId, bool success, const cha
 
   String json;
   serializeJson(doc, json);
-  _lastAckJson = json;  // R10D-2: store for dedup replay
+
+  // R10E-1: Atomic publish + store
   _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-  Serial.printf("[MQTT ACK] %s: %s (pir %d)\n", requestId.c_str(),
-                success ? "OK" : "FAIL", pirId);
+  if (success && commandHash.length() > 0) {
+    _addProcessed(requestId, commandHash, json);
+  }
+  Serial.printf("[MQTT ACK] %s: %s (pir %d)%s\n", requestId.c_str(),
+                success ? "OK" : "FAIL", pirId,
+                commandHash.length() > 0 ? " (stored)" : "");
 }
 
 // Channel ACK: includes the renamed channel.
 void MqttClient::_publishChannelAck(const String& requestId, bool success, const char* message,
-                                    uint8_t channelId) {
+                                    uint8_t channelId, const String& commandHash) {
   if (requestId.length() == 0) return;
 
   StaticJsonDocument<256> doc;
@@ -502,16 +508,21 @@ void MqttClient::_publishChannelAck(const String& requestId, bool success, const
 
   String json;
   serializeJson(doc, json);
-  _lastAckJson = json;  // R10D-2: store for dedup replay
+
+  // R10E-1: Atomic publish + store
   _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-  Serial.printf("[MQTT ACK] %s: %s (channel CH%d)\n", requestId.c_str(),
-                success ? "OK" : "FAIL", channelId);
+  if (success && commandHash.length() > 0) {
+    _addProcessed(requestId, commandHash, json);
+  }
+  Serial.printf("[MQTT ACK] %s: %s (channel CH%d)%s\n", requestId.c_str(),
+                success ? "OK" : "FAIL", channelId,
+                commandHash.length() > 0 ? " (stored)" : "");
 }
 
-// Generic ACK for time/system/config mutations (no type-specific data needed).
+// Generic ACK for time/system/config mutations.
 void MqttClient::_publishGenericAck(const String& requestId, bool success, const char* message,
-                                    const String& dataJson) {
-  _publishAck(requestId, success, message, dataJson);
+                                    const String& dataJson, const String& commandHash) {
+  _publishAck(requestId, success, message, dataJson, commandHash);
 }
 
 void MqttClient::publishOnline() {
@@ -553,45 +564,12 @@ void MqttClient::_handleCommand(const String& json) {
   const char* action = doc["action"] | "";
   String requestId = doc["requestId"] | "";
 
-  // R10A-3 (audit round 10): Compute command fingerprint for idempotency binding.
-  // Same requestId + same hash → re-ACK original result (true duplicate).
-  // Same requestId + DIFFERENT hash → reject "requestId reuse with different command".
-  String commandHash = _computeCommandHash(doc);
+  // R10E-2 (audit round 10E): Validation ordering fixed.
+  // Previous order: parse → computeHash → dedup → validate type → validate fields
+  // This allowed duplicate handler to replay ACK BEFORE validating unknown fields.
+  // NEW order: parse → validate type → validate fields → computeHash → dedup → execute
 
-  // P0 #1 / R10A-3: Dedup check — verify requestId was not used before,
-  // AND if it was used, verify the command matches.
-  if (requestId.length() > 0 && _isDuplicate(requestId)) {
-    String previousHash = _getHashForRequestId(requestId);
-    if (previousHash.length() > 0 && previousHash != commandHash) {
-      // requestId reuse with DIFFERENT command — security violation
-      Serial.printf("[MQTT] SECURITY: requestId reuse with different command! rid=%s\n", requestId.c_str());
-      Services::Log.append(Core::LogType::AuthFail,
-        "SECURITY: requestId reuse with different command: " + requestId, 0);
-      _publishAck(requestId, false, "requestId reuse with different command — rejected");
-      return;
-    }
-
-    // True duplicate — re-ACK with ORIGINAL result (R10D-2 fix).
-    // R10D-2: Instead of reconstructing ACK from command params (which lost
-    // actual execution results like scheduleId), replay the ORIGINAL ACK JSON
-    // that was stored when the command first executed successfully.
-    Serial.printf("[MQTT] Duplicate command detected: %s — replaying original ACK\n", requestId.c_str());
-
-    String originalAckJson = _getAckResultForRequestId(requestId);
-    if (originalAckJson.length() > 0) {
-      // Replay the exact ACK JSON that was sent originally
-      _mqtt.publish(_topicAck.c_str(), (const uint8_t*)originalAckJson.c_str(),
-                    originalAckJson.length(), false);
-      Serial.printf("[MQTT ACK] %s: replayed original ACK (%d bytes)\n",
-                    requestId.c_str(), originalAckJson.length());
-    } else {
-      // Fallback: if original ACK not found (shouldn't happen), send generic
-      _publishAck(requestId, true, "Duplicate command (already executed)");
-    }
-    return;
-  }
-
-  // Validate type (P0 #1: invalid type returns success:false, not silently ignored)
+  // Step 1: Validate type (must be one of known types)
   if (strcmp(type, "relay") != 0 && strcmp(type, "schedule") != 0 &&
       strcmp(type, "pir") != 0 && strcmp(type, "channel") != 0 &&
       strcmp(type, "time") != 0 && strcmp(type, "system") != 0 &&
@@ -603,11 +581,9 @@ void MqttClient::_handleCommand(const String& json) {
     return;
   }
 
-  // R10D-3 (audit round 10D): Unknown-field rejection.
+  // Step 2: R10D-3 — Unknown-field rejection (BEFORE dedup check).
   // Each command type has a FIXED set of allowed fields. Any field outside
   // this whitelist → command REJECTED (not silently ignored).
-  // This prevents attacker from injecting extra fields that might affect
-  // execution but don't appear in commandHash.
   {
     JsonObject obj = doc.as<JsonObject>();
     bool hasUnknownField = false;
@@ -617,11 +593,9 @@ void MqttClient::_handleCommand(const String& json) {
       String key = kv.key().c_str();
       bool allowed = false;
 
-      // Common allowed fields (all command types)
       if (key == "type" || key == "action" || key == "requestId") {
         allowed = true;
       }
-      // Per-type allowed fields
       else if (strcmp(type, "relay") == 0) {
         if (key == "channelId" || key == "mode" || key == "manualState") allowed = true;
       }
@@ -660,9 +634,39 @@ void MqttClient::_handleCommand(const String& json) {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, msg.c_str());
       }
-      return;  // no _addProcessed — command rejected
+      return;
     }
   }
+
+  // Step 3: Compute command fingerprint (AFTER validation passes).
+  String commandHash = _computeCommandHash(doc);
+
+  // Step 4: Dedup check (AFTER validation, BEFORE execution).
+  if (requestId.length() > 0 && _isDuplicate(requestId)) {
+    String previousHash = _getHashForRequestId(requestId);
+    if (previousHash.length() > 0 && previousHash != commandHash) {
+      Serial.printf("[MQTT] SECURITY: requestId reuse with different command! rid=%s\n", requestId.c_str());
+      Services::Log.append(Core::LogType::AuthFail,
+        "SECURITY: requestId reuse with different command: " + requestId, 0);
+      _publishAck(requestId, false, "requestId reuse with different command — rejected");
+      return;
+    }
+
+    // True duplicate — replay ORIGINAL ACK (R10E-1: stored atomically).
+    Serial.printf("[MQTT] Duplicate command detected: %s — replaying original ACK\n", requestId.c_str());
+
+    String originalAckJson = _getAckResultForRequestId(requestId);
+    if (originalAckJson.length() > 0) {
+      _mqtt.publish(_topicAck.c_str(), (const uint8_t*)originalAckJson.c_str(),
+                    originalAckJson.length(), false);
+      Serial.printf("[MQTT ACK] %s: replayed original ACK (%d bytes)\n",
+                    requestId.c_str(), originalAckJson.length());
+    } else {
+      _publishAck(requestId, true, "Duplicate command (already executed)");
+    }
+    return;
+  }
+
 
   // ===========================================================================
   // RELAY COMMANDS
@@ -708,11 +712,10 @@ void MqttClient::_handleCommand(const String& json) {
     }
 
     // Execution succeeded → add to dedup buffer (P0 #1 fix)
-    if (requestId.length() > 0) _addProcessed(requestId, commandHash);
 
     publishStatus();  // immediate status update after command
     // P0 #2 + P1 #11: Send ACK with actual relay state
-    _publishRelayAck(requestId, true, "Relay command executed", channelId);
+    _publishRelayAck(requestId, true, "Relay command executed", channelId, commandHash);
   }
 
   // ===========================================================================
@@ -784,9 +787,8 @@ void MqttClient::_handleCommand(const String& json) {
       Services::Log.append(Core::LogType::ConfigChange,
         "Schedule saved via MQTT for CH" + String(channelId), channelId);
 
-      if (requestId.length() > 0) _addProcessed(requestId, commandHash);
       publishStatus();
-      _publishScheduleAck(requestId, true, "Schedule saved", channelId, savedId);
+      _publishScheduleAck(requestId, true, "Schedule saved", channelId, savedId, commandHash);
 
     } else if (strcmp(action, "delete") == 0) {
       int id = doc["id"] | 0;
@@ -811,9 +813,8 @@ void MqttClient::_handleCommand(const String& json) {
       Services::Log.append(Core::LogType::ConfigChange,
         "Schedule " + String(id) + " deleted via MQTT from CH" + String(channelId), channelId);
 
-      if (requestId.length() > 0) _addProcessed(requestId, commandHash);
       publishStatus();
-      _publishScheduleAck(requestId, true, "Schedule deleted", channelId, id);
+      _publishScheduleAck(requestId, true, "Schedule deleted", channelId, id, commandHash);
 
     } else {
       if (requestId.length() > 0) {
@@ -864,9 +865,8 @@ void MqttClient::_handleCommand(const String& json) {
       return;  // no _addProcessed
     }
 
-    if (requestId.length() > 0) _addProcessed(requestId, commandHash);
     publishStatus();
-    _publishPirAck(requestId, true, "PIR command executed", id);
+    _publishPirAck(requestId, true, "PIR command executed", id, commandHash);
   }
 
   // ===========================================================================
@@ -893,9 +893,8 @@ void MqttClient::_handleCommand(const String& json) {
       Services::Log.append(Core::LogType::ConfigChange,
         "CH" + String(channelId) + " renamed via MQTT: " + String(name), channelId);
 
-      if (requestId.length() > 0) _addProcessed(requestId, commandHash);
       publishStatus();
-      _publishChannelAck(requestId, true, "Channel renamed", channelId);
+      _publishChannelAck(requestId, true, "Channel renamed", channelId, commandHash);
     } else {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, "Invalid channel action (use rename)");
@@ -926,8 +925,7 @@ void MqttClient::_handleCommand(const String& json) {
       Drivers::rtc.adjust(y, m, d, h, mi, s);
       Services::Log.append(Core::LogType::TimeSync, "RTC set via MQTT", 0);
 
-      if (requestId.length() > 0) _addProcessed(requestId, commandHash);
-      _publishGenericAck(requestId, true, "RTC time set");
+      _publishGenericAck(requestId, true, "RTC time set", commandHash);
     } else {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, "Invalid time action (use set)");
@@ -943,16 +941,14 @@ void MqttClient::_handleCommand(const String& json) {
     if (strcmp(action, "reboot") == 0) {
       Services::Log.append(Core::LogType::Restart, "Reboot via MQTT", 0);
       if (requestId.length() > 0) {
-        _addProcessed(requestId, commandHash);
-        _publishGenericAck(requestId, true, "Rebooting");
+        _publishGenericAck(requestId, true, "Rebooting", commandHash);
       }
       delay(500);
       ESP.restart();
     } else if (strcmp(action, "getStatus") == 0) {
       publishStatus();
       if (requestId.length() > 0) {
-        _addProcessed(requestId, commandHash);
-        _publishGenericAck(requestId, true, "Status published");
+        _publishGenericAck(requestId, true, "Status published", commandHash);
       }
     } else if (strcmp(action, "resetEnergyStats") == 0) {
       for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
@@ -963,17 +959,15 @@ void MqttClient::_handleCommand(const String& json) {
         Drivers::pzem.resetEnergy();
       }
       Services::Log.append(Core::LogType::ConfigChange, "Energy stats reset via MQTT", 0);
-      if (requestId.length() > 0) _addProcessed(requestId, commandHash);
       publishStatus();
-      _publishGenericAck(requestId, true, "Energy stats reset");
+      _publishGenericAck(requestId, true, "Energy stats reset", commandHash);
     } else if (strcmp(action, "resetDailyStats") == 0) {
       if (Drivers::pzem.isAvailable()) {
         Drivers::pzem.resetDailyStats();
       }
       Services::Log.append(Core::LogType::ConfigChange, "Daily stats reset via MQTT", 0);
-      if (requestId.length() > 0) _addProcessed(requestId, commandHash);
       publishStatus();
-      _publishGenericAck(requestId, true, "Daily stats reset");
+      _publishGenericAck(requestId, true, "Daily stats reset", commandHash);
     } else {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, "Invalid system action (use reboot/getStatus/resetEnergyStats/resetDailyStats)");
@@ -1012,9 +1006,8 @@ void MqttClient::_handleCommand(const String& json) {
       }
       Storage::config.saveDeviceConfig();
       Services::Log.append(Core::LogType::ConfigChange, "Device config updated via MQTT", 0);
-      if (requestId.length() > 0) _addProcessed(requestId, commandHash);
       publishStatus();
-      _publishGenericAck(requestId, true, "Device config updated");
+      _publishGenericAck(requestId, true, "Device config updated", commandHash);
     } else {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, "Invalid config action (use setDevice)");
@@ -1200,8 +1193,7 @@ void MqttClient::_handleOta(const String& json) {
 
   if (success) {
     if (requestId.length() > 0) {
-      _addProcessed(requestId, commandHash);
-      _publishGenericAck(requestId, true, "OTA success — rebooting");
+      _publishGenericAck(requestId, true, "OTA success — rebooting", commandHash);
     }
     String doneJson = "{\"otaStatus\":\"done\",\"progress\":100,\"newVersion\":\"" + String(version) + "\"}";
     _mqtt.publish(_topicStatus.c_str(), (const uint8_t*)doneJson.c_str(), doneJson.length(), false);
@@ -1385,30 +1377,42 @@ bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
 
 // ---------------------------------------------------------------------------
 // Request deduplication — prevent double-execution of retried commands
-// Uses a ring buffer of last 64 requestIds + commandHashes + ACK results.
+// Uses a ring buffer of last 64 requestIds + commandHashes + ACK results + timestamps.
 //
-// R10A-3 / R10C-4 / R10D-2 (audit round 10D):
+// R10A-3 / R10C-4 / R10D-2 / R10E-3 (audit round 10E):
 //   - Buffer size: 64 (increased from 16 in R10C-4)
-//   - Stores: requestId, commandHash, commandType, ackResultJson
+//   - Stores: requestId, commandHash, ackResultJson, timestamp
+//   - R10E-3: TTL-based expiry (15 minutes). Entries older than TTL are
+//     treated as "not found" — allows replay after TTL expires (acceptable
+//     for non-critical commands; broker ACL prevents attacker from publishing).
 //   - On duplicate:
-//     - Same requestId + same commandHash → re-publish ORIGINAL ACK result
-//       (not reconstructed — preserves actual execution result like scheduleId)
+//     - Same requestId + same commandHash + within TTL → replay original ACK
 //     - Same requestId + DIFFERENT commandHash → reject "requestId reuse"
+//     - Same requestId + expired TTL → treat as new command (execute)
 //
-// R10D-2 FIX: Previous code reconstructed duplicate ACK from command params,
-// which lost the actual execution result (e.g., schedule upsert returned
-// scheduleId=0 on duplicate instead of the real saved scheduleId).
-// Now we store the full ACK JSON and replay it verbatim on duplicate.
+// R10D-2 FIX: Stores original ACK JSON for verbatim replay (not reconstructed).
+// R10E-1 FIX: Atomic publish+store (no ordering bug).
 // ---------------------------------------------------------------------------
 #define DEDUP_BUFFER_SIZE 64
+#define DEDUP_TTL_MS (15UL * 60UL * 1000UL)  // 15 minutes
+
 static String _processedIds[DEDUP_BUFFER_SIZE];
 static String _processedHashes[DEDUP_BUFFER_SIZE];
-static String _processedAckResults[DEDUP_BUFFER_SIZE];  // R10D-2: original ACK JSON
+static String _processedAckResults[DEDUP_BUFFER_SIZE];
+static unsigned long _processedTimestamps[DEDUP_BUFFER_SIZE];  // R10E-3: millis() when stored
 static uint8_t _dedupIdx = 0;
 
+// R10E-3: Check if requestId is duplicate AND still within TTL.
 bool MqttClient::_isDuplicate(const String& requestId) {
+  unsigned long now = millis();
   for (uint8_t i = 0; i < DEDUP_BUFFER_SIZE; i++) {
-    if (_processedIds[i] == requestId) return true;
+    if (_processedIds[i] == requestId) {
+      // R10E-3: Check TTL — if expired, treat as not-duplicate (allow re-execute)
+      if (now - _processedTimestamps[i] > DEDUP_TTL_MS) {
+        return false;  // expired — treat as new command
+      }
+      return true;
+    }
   }
   return false;
 }
@@ -1422,7 +1426,6 @@ String _getHashForRequestId(const String& requestId) {
 }
 
 // R10D-2: Get the ORIGINAL ACK result JSON for a previously-processed requestId.
-// Returns empty string if not found.
 String _getAckResultForRequestId(const String& requestId) {
   for (uint8_t i = 0; i < DEDUP_BUFFER_SIZE; i++) {
     if (_processedIds[i] == requestId) return _processedAckResults[i];
@@ -1430,20 +1433,18 @@ String _getAckResultForRequestId(const String& requestId) {
   return "";
 }
 
-// R10D-2: _addProcessed now also stores the ACK result JSON.
-// If ackResultJson is empty, uses _lastAckJson (set by ACK publishers).
-// Called AFTER successful execution + AFTER ACK is published.
+// R10E-1: _addProcessed is now ONLY called from ACK publishers (atomic).
+// Stores {requestId, commandHash, ackResultJson, timestamp} for duplicate replay.
+// ackResultJson is the EXACT JSON that was published to PWA — on duplicate,
+// we replay this verbatim instead of reconstructing from command params.
+// R10E-3: Also stores timestamp for TTL-based expiry.
 void MqttClient::_addProcessed(const String& requestId, const String& commandHash,
                                 const String& ackResultJson) {
-  String ackJson = ackResultJson;
-  if (ackJson.length() == 0) {
-    ackJson = _lastAckJson;  // R10D-2: use last published ACK JSON
-  }
   _processedIds[_dedupIdx] = requestId;
   _processedHashes[_dedupIdx] = commandHash;
-  _processedAckResults[_dedupIdx] = ackJson;
+  _processedAckResults[_dedupIdx] = ackResultJson;
+  _processedTimestamps[_dedupIdx] = millis();  // R10E-3: for TTL check
   _dedupIdx = (_dedupIdx + 1) % DEDUP_BUFFER_SIZE;
-  _lastAckJson = "";  // clear for next command
 }
 
 // R10A-3 / R10C-1 (audit round 10C): Compute a deterministic command fingerprint.

@@ -58,49 +58,46 @@ private:
   unsigned long _lastPublishMs = 0;
   unsigned long _lastReconnectMs = 0;
   bool _initialized = false;
-  // R10D-2: Last ACK JSON published (stored for dedup buffer replay).
-  // Set by ACK publishers before _addProcessed is called.
-  String _lastAckJson;
 
   bool _connect();
   void _onMessage(char* topic, byte* payload, unsigned int length);
   void _handleCommand(const String& json);
   void _handleOta(const String& json);
 
-  // Generic ACK publisher — accepts optional data JSON string.
+  // R10E-1 (audit round 10E): ACK publishers now accept commandHash and
+  // perform ATOMIC transaction: construct JSON → publish → store in dedup buffer.
+  // This eliminates the ordering bug where _addProcessed() was called BEFORE
+  // the ACK was published (causing _lastAckJson to be empty/stale).
+  //
+  // For FAILURE ACKs (success=false), commandHash is "" — failure ACKs are
+  // NOT stored in dedup buffer (failed commands can be retried).
+
+  // Generic ACK — failure ACKs (no commandHash = not stored for replay)
   void _publishAck(const String& requestId, bool success, const char* message,
-                   const String& dataJson = "");
+                   const String& dataJson = "", const String& commandHash = "");
 
-  // Relay-specific ACK: looks up actual state and includes it in data.
+  // Success ACKs with type-specific data — all accept commandHash for atomic store
   void _publishRelayAck(const String& requestId, bool success, const char* message,
-                        uint8_t channelId);
+                        uint8_t channelId, const String& commandHash = "");
 
-  // Schedule ACK
   void _publishScheduleAck(const String& requestId, bool success, const char* message,
-                           int channelId, int scheduleId);
+                           int channelId, int scheduleId, const String& commandHash = "");
 
-  // PIR ACK
   void _publishPirAck(const String& requestId, bool success, const char* message,
-                      uint8_t pirId);
+                      uint8_t pirId, const String& commandHash = "");
 
-  // Channel ACK
   void _publishChannelAck(const String& requestId, bool success, const char* message,
-                          uint8_t channelId);
+                          uint8_t channelId, const String& commandHash = "");
 
-  // Generic config ACK (time set, device config, system reboot, etc.)
   void _publishGenericAck(const String& requestId, bool success, const char* message,
-                          const String& dataJson = "");
+                          const String& dataJson = "", const String& commandHash = "");
 
   void _buildTopics();
   bool _isDuplicate(const String& requestId);
-  // R10D-2: _addProcessed now stores ackResultJson for duplicate replay.
-  void _addProcessed(const String& requestId, const String& commandHash = "",
-                     const String& ackResultJson = "");
-
-  // R10D-2: Helper that publishes ACK to MQTT + stores it for duplicate replay.
-  // All ACK publishers should call this instead of publishing directly.
-  void _publishAndStoreAck(const String& requestId, const String& ackJson,
-                           const String& commandHash);
+  // R10E-1: _addProcessed is now ONLY called from ACK publishers (atomic).
+  // Not called separately from _handleCommand anymore.
+  void _addProcessed(const String& requestId, const String& commandHash,
+                     const String& ackResultJson);
 
   // OTA helpers (R10A-2: Ed25519 signature verification via Utils::ed25519VerifyHash)
   bool _downloadAndVerifyOta(const String& url, size_t expectedSize,
