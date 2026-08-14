@@ -19,9 +19,40 @@ namespace Services {
 
 // ============================================================================
 // Serialize: JournalRecord → blob[BLOB_SIZE]
-// Returns: actualPayloadEnd (offset after ackJson, before padding)
+// Returns: actualPayloadEnd (offset after ackJson, before padding) on success.
+//          0 on FAILURE (over-limit input or insufficient blob size).
+//
+// P1-1 CLOSURE (Auditor Rev26 Phase-1 review):
+//   This serializer is STRICT. It NEVER silently truncates canonical fields.
+//   If any variable-length field exceeds its declared MAX, the call returns 0
+//   and the blob is NOT modified. Callers MUST treat 0 as failure and MUST
+//   NOT write the resulting blob to NVS.
+//
+//   Why strict: Rev14 §4 declares MAX_REQUEST_ID_LEN / MAX_COMMAND_HASH_LEN /
+//   MAX_ACK_JSON_LEN as part of the canonical format. A parser rejects over-
+//   limit values as PARSE_INVALID, so a serializer that silently truncates
+//   would produce a record whose canonical bytes differ from the caller's
+//   intent — breaking the round-trip identity property and causing silent
+//   command-identity drift in the journal.
+//
+//   Sentinel choice: 0 is safe as failure because the minimum successful
+//   actualPayloadEnd is BLOB_HEADER_SIZE + 1 (recordState) + 1 (requestIdLen)
+//   + 1 (commandHashLen) + 1 (channelId) + 1 (desiredState) + 1 (previousKnownState)
+//   + 1 (attempt) + 4 (timestamp) + 2 (ackLen) = 22. Therefore 0 unambiguously
+//   signals failure and can never collide with a valid offset.
 // ============================================================================
 uint16_t serializeRecord(const JournalRecord& rec, uint8_t* blob, uint16_t blobSize) {
+    // --- Pre-flight: REJECT over-limit input. Never truncate. (P1-1) ---
+    if (rec.requestId.length() > MAX_REQUEST_ID_LEN) {
+        return 0;
+    }
+    if (rec.commandHash.length() > MAX_COMMAND_HASH_LEN) {
+        return 0;
+    }
+    if (rec.ackJson.length() > MAX_ACK_JSON_LEN) {
+        return 0;
+    }
+
     if (blobSize < BLOB_SIZE) return 0;
 
     memset(blob, 0, blobSize);  // zero-fill (padding convention)
@@ -47,7 +78,8 @@ uint16_t serializeRecord(const JournalRecord& rec, uint8_t* blob, uint16_t blobS
     blob[offset++] = (uint8_t)rec.recordState;
 
     // requestIdLen + requestId
-    uint8_t reqIdLen = min((unsigned)rec.requestId.length(), (unsigned)MAX_REQUEST_ID_LEN);
+    // (length already validated ≤ MAX_REQUEST_ID_LEN above — no truncation here)
+    uint8_t reqIdLen = (uint8_t)rec.requestId.length();
     blob[offset++] = reqIdLen;
     if (reqIdLen > 0) {
         memcpy(&blob[offset], rec.requestId.c_str(), reqIdLen);
@@ -55,7 +87,8 @@ uint16_t serializeRecord(const JournalRecord& rec, uint8_t* blob, uint16_t blobS
     }
 
     // commandHashLen + commandHash
-    uint8_t hashLen = min((unsigned)rec.commandHash.length(), (unsigned)MAX_COMMAND_HASH_LEN);
+    // (length already validated ≤ MAX_COMMAND_HASH_LEN above — no truncation here)
+    uint8_t hashLen = (uint8_t)rec.commandHash.length();
     blob[offset++] = hashLen;
     if (hashLen > 0) {
         memcpy(&blob[offset], rec.commandHash.c_str(), hashLen);
@@ -81,7 +114,8 @@ uint16_t serializeRecord(const JournalRecord& rec, uint8_t* blob, uint16_t blobS
     blob[offset++] = (rec.timestamp >> 24) & 0xFF;
 
     // ackLen (2 bytes, uint16 LE)
-    uint16_t ackLen = min((unsigned)rec.ackJson.length(), (unsigned)MAX_ACK_JSON_LEN);
+    // (length already validated ≤ MAX_ACK_JSON_LEN above — no truncation here)
+    uint16_t ackLen = (uint16_t)rec.ackJson.length();
     blob[offset++] = ackLen & 0xFF;
     blob[offset++] = (ackLen >> 8) & 0xFF;
 

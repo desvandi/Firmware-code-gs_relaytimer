@@ -140,9 +140,24 @@ struct JournalRecord {
 // =============================================================================
 
 // Serialize record to blob (BLOB_SIZE bytes).
-// Returns actual payload length (bytes 11..end, excluding padding).
-// Blob must be at least BLOB_SIZE bytes.
-// Padding is zeroed (convention, not semantic requirement per Rev14 padding semantics).
+//
+// RETURNS:
+//   actualPayloadEnd (offset after ackJson, before padding) on success.
+//   0 on FAILURE — caller MUST NOT write the blob to NVS.
+//
+// FAILURE CONDITIONS (P1-1 closure — STRICT, never silently truncate):
+//   1. blobSize < BLOB_SIZE
+//   2. rec.requestId.length()   > MAX_REQUEST_ID_LEN     (64)
+//   3. rec.commandHash.length() > MAX_COMMAND_HASH_LEN   (64)
+//   4. rec.ackJson.length()     > MAX_ACK_JSON_LEN       (1024)
+//
+// On failure, the blob is left unmodified and 0 is returned.
+//
+// The minimum successful actualPayloadEnd is BLOB_HEADER_SIZE + 11 = 22
+// (recordState + reqIdLen + hashLen + channelId + desiredState + prev +
+//  attempt + timestamp(4) + ackLen(2)), so 0 unambiguously signals failure.
+//
+// Padding is zeroed on success (convention, not semantic per Rev14).
 uint16_t serializeRecord(const JournalRecord& rec, uint8_t* blob, uint16_t blobSize);
 
 // Deserialize blob to record.
