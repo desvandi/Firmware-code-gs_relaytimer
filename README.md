@@ -20,12 +20,26 @@ This repo holds the **device-side code** for the Timer Digital Relay v4.0 system
 | Item | Value |
 |------|-------|
 | Audited branch | `engineering-cycle-8c-rev26-final-predicate` |
-| Audited commit (Phase 1 documentation closure) | `9fd7473` — Closure-C/D/E/F + Phase 2/3 scope contracts |
-| Phase 1 implementation baseline (parent of audited commit) | `c506c80` — P1-1 (strict serializer) + P1-2 (host test harness, 102/102 PASS) |
-| Phase 1 initial implementation (grandparent) | `2e4de87` — Phase 1 JournalRecord implementation |
+| **Current audited artifact** (submitted for final Phase-1 gate) | `589e9a1` — Closure-F traceability fix + TOC cleanup + Closure-G (this commit) |
+| Immediate parent (Phase 1 documentation closure) | `9fd7473` — Closure-C/D/E/F + Phase 2/3 scope contracts |
+| Phase 1 implementation baseline (P1-1 strict serializer + P1-2 host test harness) | `c506c80` — 102/102 host tests PASS |
+| Phase 1 initial implementation | `2e4de87` — JournalRecord implementation per Rev26 |
 | Normative design contract | [`docs/CYCLE-8C-REV26-FINAL-PREDICATE.md`](docs/CYCLE-8C-REV26-FINAL-PREDICATE.md) |
 | Foundational record contract | [`docs/CYCLE-8C-REV14-MUTATION-CONSOLIDATION.md`](docs/CYCLE-8C-REV14-MUTATION-CONSOLIDATION.md) (consolidated by Rev26) |
 | Phase 2 scope contract | [`docs/PHASE-2-SCOPE.md`](docs/PHASE-2-SCOPE.md) — **not yet authorized to start** |
+
+> **Traceability model (Closure-G, auditor 2026-08-14):**
+> The current audited artifact is `589e9a1`. Its immediate parent `9fd7473`
+> is the Phase 1 documentation closure (Closure-C/D/E/F). `c506c80` is the
+> Phase 1 implementation baseline (P1-1 + P1-2 — the strict serializer fix
+> + host test harness that achieved 102/102 PASS). `2e4de87` is the Phase 1
+> initial JournalRecord implementation.
+>
+> Every commit in this chain may be referenced as a historical artefact
+> (parent, baseline, prior audit submission), but only `589e9a1` is the
+> current audited artefact. Any approval issued against `589e9a1` does NOT
+> transitively apply to other commits in the chain unless explicitly
+> re-scoped by the auditor.
 
 ### Phase gate status (as of 2026-08-14)
 
@@ -960,7 +974,8 @@ All 12 tests must PASS on actual ESP32 hardware before 220V production deploymen
 | Cycle 8C-Rev26 | Final eviction predicate (I2a–I2e + auth gate), DEPLOYMENT_AUTH_CONFIGURED vs AUTH_EVIDENCE_AUTHENTICATED separation, complete drive-out predicate | **CURRENT NORMATIVE DESIGN — Phase 1 implementation target** |
 | Phase 1 — initial implementation (`2e4de87`) | JournalRecord implementation: serialize/deserialize, CRC-32/ISO-HDLC, canonicalEqual, classifyGeneration | Phase 1 code baseline |
 | Phase 1 — closure (`c506c80`) | P1-1 (strict serializer — reject over-limit input) + P1-2 (host test harness, 102/102 PASS) | Phase 1 implementation baseline |
-| Phase 1 — documentation closure (`9fd7473`) | Closure-C/D/E/F + Phase 2/3 scope contracts (this commit) | **CURRENTLY UNDER AUDITOR RE-REVIEW** |
+| Phase 1 — documentation closure (`9fd7473`) | Closure-C/D/E/F + Phase 2/3 scope contracts | Phase 1 documentation closure (immediate parent of current audited artifact) |
+| Phase 1 — traceability closure (`589e9a1`) | Closure-F traceability fix + TOC cleanup + Closure-G (this commit) | **CURRENT AUDITED ARTEFACT — submitted for final Phase-1 gate** |
 | Phase 2 | TransactionJournal Rev26 rewrite + command integration + recovery semantics | **NOT AUTHORIZED** — see [`docs/PHASE-2-SCOPE.md`](docs/PHASE-2-SCOPE.md) |
 | Phase 3 | 16-channel migration (I/O expander architecture TBD) | **NOT AUTHORIZED** |
 | 220V production | Hardware acceptance: 12 power-loss tests + Ed25519 runtime verification | **NOT AUTHORIZED** |
@@ -970,10 +985,11 @@ All 12 tests must PASS on actual ESP32 hardware before 220V production deploymen
 ## Known Limitations (as of Rev26 Phase 1 audit — 2026-08-14)
 
 > **Closure-E (auditor Rev26 Phase-1 review).** These are limitations of the
-> audited firmware as of commit `9fd7473` on branch
-> `engineering-cycle-8c-rev26-final-predicate` (Phase 1 implementation
-> baseline `c506c80` — initial implementation `2e4de87`). They are stated
-> explicitly (not disguised as features) per auditor requirement.
+> audited firmware as of current audited artefact `589e9a1` on branch
+> `engineering-cycle-8c-rev26-final-predicate` (immediate parent:
+> `9fd7473` Phase 1 documentation closure; Phase 1 implementation baseline
+> `c506c80`; initial implementation `2e4de87`). They are stated explicitly
+> (not disguised as features) per auditor requirement.
 
 1. **Browser credential exposure (P1 — accepted tradeoff, NOT a secret from
    the browser user):** `NEXT_PUBLIC_MQTT_PASSWORD` is exposed to the PWA
