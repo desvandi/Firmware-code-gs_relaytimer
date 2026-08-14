@@ -29,13 +29,20 @@
 //   was defined at the bottom of the file but called from _handleCommand() and
 //   _handleOta() above. Must be placed AFTER ArduinoJson.h include so that
 //   DynamicJsonDocument is visible in the signature.
-static String _computeCommandHash(const DynamicJsonDocument& doc);
+//
+// CYCLE-7 FIX (pre-existing bug): the forward declaration was OUTSIDE
+//   `namespace Services` but the definition was INSIDE. This caused a linker
+//   error (undefined reference). Moved the forward declaration INSIDE the
+//   namespace below so it matches the definition's scope.
 #include "ConfigStore.h"
 #include <mbedtls/sha256.h>
 #include <algorithm>
 #include <vector>
 
 namespace Services {
+
+// Forward declaration of static helper (defined at bottom of file).
+static String _computeCommandHash(const DynamicJsonDocument& doc);
 
 MqttClient mqtt;
 
@@ -418,11 +425,77 @@ void MqttClient::publishLog(Core::LogType type, const String& message, int8_t ch
 // journal (failed commands can be retried with same requestId).
 // =============================================================================
 
+// ============================================================================
+// CYCLE-7 (fixes F-001 + F-002 + F-006): _finalizeAndPublishAck helper.
+//
+// Replaces the duplicated storeTransaction() + publish() pattern in each ACK
+// publisher. Now all ACK publishers build their JSON, then delegate here for:
+//   1. Commit transaction (PENDING → COMMITTED) — checked return value (F-002).
+//   2. Immediate publish on success.
+//   3. Dequeue ACK on immediate publish success (F-006).
+//   4. Publish FAILURE ACK with DURABILITY_FAILURE message if commit fails.
+// ============================================================================
+void MqttClient::_finalizeAndPublishAck(const String& requestId, bool success,
+                                         const String& preBuiltJson, const String& commandHash) {
+  if (!_mqtt.connected()) {
+    Serial.printf("[MQTT ACK] %s: MQTT not connected — ACK queued for retry\n", requestId.c_str());
+    // For success ACKs, the journal's queueAck() (called by commitTransaction)
+    // will retry delivery. For failure ACKs, we lose them (acceptable — PWA retries).
+    return;
+  }
+
+  // FAILURE ACKs: publish directly, do NOT commit (command can be retried).
+  if (!success || commandHash.length() == 0) {
+    _mqtt.publish(_topicAck.c_str(), (const uint8_t*)preBuiltJson.c_str(),
+                  preBuiltJson.length(), false);
+    Serial.printf("[MQTT ACK] %s: %s (not committed — retryable)\n",
+                  requestId.c_str(), success ? "OK" : "FAIL");
+    return;
+  }
+
+  // SUCCESS ACK with commandHash: must commit to journal first.
+  // CYCLE-7 fix for F-002: CHECK return value. If commit fails, do NOT claim success.
+  bool committed = Services::journal.commitTransaction(requestId, preBuiltJson);
+  if (!committed) {
+    // Commit failed — NVS write error, journal full, or other durability failure.
+    // Do NOT publish the success ACK (would falsely claim durable success).
+    // Publish a FAILURE ACK so PWA knows to retry.
+    Serial.printf("[MQTT ACK] %s: COMMIT FAILED — publishing DURABILITY_FAILURE\n",
+                  requestId.c_str());
+    Services::Log.append(Core::LogType::Error,
+      "Transaction commit FAILED for " + requestId + " — publishing DURABILITY_FAILURE", 0);
+
+    StaticJsonDocument<512> failDoc;
+    failDoc["requestId"] = requestId;
+    failDoc["success"] = false;
+    failDoc["message"] = "DURABILITY_FAILURE: transaction could not be committed to NVS journal — please retry";
+    failDoc["timestamp"] = (uint64_t)Drivers::rtc.getUnixTime() * 1000ULL;
+    String failJson;
+    serializeJson(failDoc, failJson);
+    _mqtt.publish(_topicAck.c_str(), (const uint8_t*)failJson.c_str(),
+                  failJson.length(), false);
+    return;
+  }
+
+  // Commit succeeded — ACK is durable. Now publish immediately for low latency.
+  // commitTransaction() already called queueAck() — so ACK is also in retry queue.
+  bool published = _mqtt.publish(_topicAck.c_str(), (const uint8_t*)preBuiltJson.c_str(),
+                                 preBuiltJson.length(), false);
+  if (published) {
+    // CYCLE-7 fix for F-006: immediate publish succeeded — dequeue to prevent
+    // processPendingAcks() from publishing duplicate ACK.
+    Services::journal.dequeueAck(requestId);
+    Serial.printf("[MQTT ACK] %s: OK (committed + published)\n", requestId.c_str());
+  } else {
+    // Immediate publish failed — ACK stays in queue. processPendingAcks() retries.
+    Serial.printf("[MQTT ACK] %s: committed, publish pending retry\n", requestId.c_str());
+  }
+}
+
 // Generic ACK — used for failures and generic successes.
 // If commandHash is non-empty AND success=true → store in NVS journal.
 void MqttClient::_publishAck(const String& requestId, bool success, const char* message,
                               const String& dataJson, const String& commandHash) {
-  if (!_mqtt.connected()) return;
   if (requestId.length() == 0) return;
 
   StaticJsonDocument<512> doc;
@@ -445,37 +518,8 @@ void MqttClient::_publishAck(const String& requestId, bool success, const char* 
   String json;
   serializeJson(doc, json);
 
-  // R10G-1/R10G-2: Atomic transaction with durable journal.
-  // For SUCCESS ACKs: store in NVS journal → journal queues ACK for delivery.
-  //   - First delivery attempt: publish immediately below.
-  //   - If publish fails OR PWA misses it: processPendingAcks() in loop() retries.
-  //   - Journal entry is PERMANENT (no TTL) — survives reboot.
-  // For FAILURE ACKs: publish directly (not stored — command can be retried).
-  if (success && commandHash.length() > 0) {
-    // Store in journal FIRST (before publish) — ensures durability even if
-    // publish fails or ESP32 crashes between store and publish.
-    Services::journal.storeTransaction(requestId, commandHash, json);
-    // journal.storeTransaction() already called queueAck() — ACK will be
-    // delivered by processPendingAcks(). But try immediate delivery too
-    // for lower latency (don't wait 2s for first retry).
-    bool published = _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-    if (published) {
-      // Immediate publish succeeded — ACK is delivered. Journal has it
-      // stored permanently in case PWA retries (will replay from journal).
-      Serial.printf("[MQTT ACK] %s: OK (stored in journal + published)\n", requestId.c_str());
-    } else {
-      // Immediate publish failed — ACK is queued in journal.
-      // processPendingAcks() will retry every 2s until delivered.
-      Serial.printf("[MQTT ACK] %s: stored in journal, publish pending retry\n", requestId.c_str());
-    }
-  } else {
-    // Failure ACK — not stored (command can be retried with same requestId)
-    _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-    Serial.printf("[MQTT ACK] %s: %s (failure, not stored)\n", requestId.c_str(), success ? "OK" : "FAIL");
-  }
-  Serial.printf("[MQTT ACK] %s: %s%s\n", requestId.c_str(),
-                success ? "OK" : "FAIL",
-                commandHash.length() > 0 ? " (stored)" : "");
+  // CYCLE-7: delegate to _finalizeAndPublishAck for commit + publish + dequeue.
+  _finalizeAndPublishAck(requestId, success, json, commandHash);
 }
 
 // Relay ACK: includes actual relay state.
@@ -505,37 +549,11 @@ void MqttClient::_publishRelayAck(const String& requestId, bool success, const c
   String json;
   serializeJson(doc, json);
 
-  // R10G-1/R10G-2: Atomic transaction with durable journal.
-  // For SUCCESS ACKs: store in NVS journal → journal queues ACK for delivery.
-  //   - First delivery attempt: publish immediately below.
-  //   - If publish fails OR PWA misses it: processPendingAcks() in loop() retries.
-  //   - Journal entry is PERMANENT (no TTL) — survives reboot.
-  // For FAILURE ACKs: publish directly (not stored — command can be retried).
-  if (success && commandHash.length() > 0) {
-    // Store in journal FIRST (before publish) — ensures durability even if
-    // publish fails or ESP32 crashes between store and publish.
-    Services::journal.storeTransaction(requestId, commandHash, json);
-    // journal.storeTransaction() already called queueAck() — ACK will be
-    // delivered by processPendingAcks(). But try immediate delivery too
-    // for lower latency (don't wait 2s for first retry).
-    bool published = _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-    if (published) {
-      // Immediate publish succeeded — ACK is delivered. Journal has it
-      // stored permanently in case PWA retries (will replay from journal).
-      Serial.printf("[MQTT ACK] %s: OK (stored in journal + published)\n", requestId.c_str());
-    } else {
-      // Immediate publish failed — ACK is queued in journal.
-      // processPendingAcks() will retry every 2s until delivered.
-      Serial.printf("[MQTT ACK] %s: stored in journal, publish pending retry\n", requestId.c_str());
-    }
-  } else {
-    // Failure ACK — not stored (command can be retried with same requestId)
-    _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-    Serial.printf("[MQTT ACK] %s: %s (failure, not stored)\n", requestId.c_str(), success ? "OK" : "FAIL");
-  }
+  // CYCLE-7: delegate to _finalizeAndPublishAck for commit + publish + dequeue.
+  _finalizeAndPublishAck(requestId, success, json, commandHash);
   Serial.printf("[MQTT ACK] %s: %s (relay CH%d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", channelId,
-                commandHash.length() > 0 ? " (stored)" : "");
+                commandHash.length() > 0 ? " (committed)" : "");
 }
 
 // Schedule ACK: includes the schedule ID that was upserted/deleted.
@@ -558,37 +576,11 @@ void MqttClient::_publishScheduleAck(const String& requestId, bool success, cons
   String json;
   serializeJson(doc, json);
 
-  // R10G-1/R10G-2: Atomic transaction with durable journal.
-  // For SUCCESS ACKs: store in NVS journal → journal queues ACK for delivery.
-  //   - First delivery attempt: publish immediately below.
-  //   - If publish fails OR PWA misses it: processPendingAcks() in loop() retries.
-  //   - Journal entry is PERMANENT (no TTL) — survives reboot.
-  // For FAILURE ACKs: publish directly (not stored — command can be retried).
-  if (success && commandHash.length() > 0) {
-    // Store in journal FIRST (before publish) — ensures durability even if
-    // publish fails or ESP32 crashes between store and publish.
-    Services::journal.storeTransaction(requestId, commandHash, json);
-    // journal.storeTransaction() already called queueAck() — ACK will be
-    // delivered by processPendingAcks(). But try immediate delivery too
-    // for lower latency (don't wait 2s for first retry).
-    bool published = _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-    if (published) {
-      // Immediate publish succeeded — ACK is delivered. Journal has it
-      // stored permanently in case PWA retries (will replay from journal).
-      Serial.printf("[MQTT ACK] %s: OK (stored in journal + published)\n", requestId.c_str());
-    } else {
-      // Immediate publish failed — ACK is queued in journal.
-      // processPendingAcks() will retry every 2s until delivered.
-      Serial.printf("[MQTT ACK] %s: stored in journal, publish pending retry\n", requestId.c_str());
-    }
-  } else {
-    // Failure ACK — not stored (command can be retried with same requestId)
-    _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-    Serial.printf("[MQTT ACK] %s: %s (failure, not stored)\n", requestId.c_str(), success ? "OK" : "FAIL");
-  }
+  // CYCLE-7: delegate to _finalizeAndPublishAck for commit + publish + dequeue.
+  _finalizeAndPublishAck(requestId, success, json, commandHash);
   Serial.printf("[MQTT ACK] %s: %s (schedule CH%d id=%d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", channelId, scheduleId,
-                commandHash.length() > 0 ? " (stored)" : "");
+                commandHash.length() > 0 ? " (committed)" : "");
 }
 
 // PIR ACK: includes PIR state after config/test.
@@ -616,37 +608,11 @@ void MqttClient::_publishPirAck(const String& requestId, bool success, const cha
   String json;
   serializeJson(doc, json);
 
-  // R10G-1/R10G-2: Atomic transaction with durable journal.
-  // For SUCCESS ACKs: store in NVS journal → journal queues ACK for delivery.
-  //   - First delivery attempt: publish immediately below.
-  //   - If publish fails OR PWA misses it: processPendingAcks() in loop() retries.
-  //   - Journal entry is PERMANENT (no TTL) — survives reboot.
-  // For FAILURE ACKs: publish directly (not stored — command can be retried).
-  if (success && commandHash.length() > 0) {
-    // Store in journal FIRST (before publish) — ensures durability even if
-    // publish fails or ESP32 crashes between store and publish.
-    Services::journal.storeTransaction(requestId, commandHash, json);
-    // journal.storeTransaction() already called queueAck() — ACK will be
-    // delivered by processPendingAcks(). But try immediate delivery too
-    // for lower latency (don't wait 2s for first retry).
-    bool published = _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-    if (published) {
-      // Immediate publish succeeded — ACK is delivered. Journal has it
-      // stored permanently in case PWA retries (will replay from journal).
-      Serial.printf("[MQTT ACK] %s: OK (stored in journal + published)\n", requestId.c_str());
-    } else {
-      // Immediate publish failed — ACK is queued in journal.
-      // processPendingAcks() will retry every 2s until delivered.
-      Serial.printf("[MQTT ACK] %s: stored in journal, publish pending retry\n", requestId.c_str());
-    }
-  } else {
-    // Failure ACK — not stored (command can be retried with same requestId)
-    _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-    Serial.printf("[MQTT ACK] %s: %s (failure, not stored)\n", requestId.c_str(), success ? "OK" : "FAIL");
-  }
+  // CYCLE-7: delegate to _finalizeAndPublishAck for commit + publish + dequeue.
+  _finalizeAndPublishAck(requestId, success, json, commandHash);
   Serial.printf("[MQTT ACK] %s: %s (pir %d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", pirId,
-                commandHash.length() > 0 ? " (stored)" : "");
+                commandHash.length() > 0 ? " (committed)" : "");
 }
 
 // Channel ACK: includes the renamed channel.
@@ -670,37 +636,11 @@ void MqttClient::_publishChannelAck(const String& requestId, bool success, const
   String json;
   serializeJson(doc, json);
 
-  // R10G-1/R10G-2: Atomic transaction with durable journal.
-  // For SUCCESS ACKs: store in NVS journal → journal queues ACK for delivery.
-  //   - First delivery attempt: publish immediately below.
-  //   - If publish fails OR PWA misses it: processPendingAcks() in loop() retries.
-  //   - Journal entry is PERMANENT (no TTL) — survives reboot.
-  // For FAILURE ACKs: publish directly (not stored — command can be retried).
-  if (success && commandHash.length() > 0) {
-    // Store in journal FIRST (before publish) — ensures durability even if
-    // publish fails or ESP32 crashes between store and publish.
-    Services::journal.storeTransaction(requestId, commandHash, json);
-    // journal.storeTransaction() already called queueAck() — ACK will be
-    // delivered by processPendingAcks(). But try immediate delivery too
-    // for lower latency (don't wait 2s for first retry).
-    bool published = _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-    if (published) {
-      // Immediate publish succeeded — ACK is delivered. Journal has it
-      // stored permanently in case PWA retries (will replay from journal).
-      Serial.printf("[MQTT ACK] %s: OK (stored in journal + published)\n", requestId.c_str());
-    } else {
-      // Immediate publish failed — ACK is queued in journal.
-      // processPendingAcks() will retry every 2s until delivered.
-      Serial.printf("[MQTT ACK] %s: stored in journal, publish pending retry\n", requestId.c_str());
-    }
-  } else {
-    // Failure ACK — not stored (command can be retried with same requestId)
-    _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-    Serial.printf("[MQTT ACK] %s: %s (failure, not stored)\n", requestId.c_str(), success ? "OK" : "FAIL");
-  }
+  // CYCLE-7: delegate to _finalizeAndPublishAck for commit + publish + dequeue.
+  _finalizeAndPublishAck(requestId, success, json, commandHash);
   Serial.printf("[MQTT ACK] %s: %s (channel CH%d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", channelId,
-                commandHash.length() > 0 ? " (stored)" : "");
+                commandHash.length() > 0 ? " (committed)" : "");
 }
 
 // Generic ACK for time/system/config mutations.
@@ -850,9 +790,15 @@ void MqttClient::_handleCommand(const String& json) {
   String commandHash = _computeCommandHash(doc);
 
   // Step 4: R10G-1 — Transaction Journal lookup (NVS-persisted, survives reboot).
-  // CRITICAL CONTRACT: If requestId is in journal → command was already executed.
-  // Firmware MUST NOT re-execute. Always replay stored ackJson.
-  // NO TTL expiry — requestId is permanent once stored.
+  // CYCLE-7: isProcessed() now returns true for BOTH PENDING (intent stored, not
+  //   yet executed/committed) and COMMITTED (fully executed + ACK stored) entries.
+  //
+  // Duplicate handling:
+  //   - Hash mismatch → security rejection (requestId reuse with different command).
+  //   - Hash match + COMMITTED → replay stored ACK (true duplicate, already done).
+  //   - Hash match + PENDING → command was in-flight when crash happened. Return
+  //     "in-progress" ACK so PWA knows to wait. Do NOT re-execute (intent-first
+  //     pattern: PENDING blocks re-execution; physical state may already be changed).
   if (Services::journal.isProcessed(requestId)) {
     String previousHash = Services::journal.getCommandHash(requestId);
     if (previousHash.length() > 0 && previousHash != commandHash) {
@@ -863,20 +809,39 @@ void MqttClient::_handleCommand(const String& json) {
       return;
     }
 
-    // True duplicate — replay ORIGINAL ACK via journal (R10G-2: queued for retry).
-    Serial.printf("[MQTT] Duplicate command detected: %s — queuing original ACK for delivery\n", requestId.c_str());
-
-    String originalAckJson = Services::journal.getAckJson(requestId);
-    if (originalAckJson.length() > 0) {
-      // R10G-2: Queue ACK for delivery (not fire-and-forget). If publish fails,
-      // processPendingAcks() in loop() will retry.
-      Services::journal.queueAck(requestId, originalAckJson);
-      Serial.printf("[MQTT ACK] %s: queued original ACK for delivery (%d bytes)\n",
-                    requestId.c_str(), originalAckJson.length());
+    if (Services::journal.isCommitted(requestId)) {
+      // True duplicate — replay ORIGINAL ACK via journal.
+      Serial.printf("[MQTT] Duplicate (COMMITTED): %s — replaying original ACK\n", requestId.c_str());
+      String originalAckJson = Services::journal.getAckJson(requestId);
+      if (originalAckJson.length() > 0) {
+        Services::journal.queueAck(requestId, originalAckJson);
+        Serial.printf("[MQTT ACK] %s: queued original ACK for delivery (%d bytes)\n",
+                      requestId.c_str(), originalAckJson.length());
+      } else {
+        _publishAck(requestId, true, "Duplicate command (already executed)");
+      }
     } else {
-      // Shouldn't happen — journal entry exists but no ACK JSON
-      _publishAck(requestId, true, "Duplicate command (already executed)");
+      // PENDING — command was in-flight during crash. Don't re-execute.
+      Serial.printf("[MQTT] Duplicate (PENDING): %s — command was in-flight, returning in-progress ACK\n",
+                    requestId.c_str());
+      Services::Log.append(Core::LogType::Error,
+        "PENDING transaction re-encountered (crash during execute): " + requestId, 0);
+      _publishAck(requestId, true, "Command already received (in-progress). Wait and retry if needed.");
     }
+    return;
+  }
+
+  // CYCLE-7 (fixes F-001): Store durable INTENT record BEFORE execute.
+  // If storeIntent fails (NVS write error, journal full), do NOT execute.
+  // This closes the execute→store gap: PWA retry will see PENDING entry and
+  // know not to re-execute (returns in-progress ACK on duplicate).
+  if (!Services::journal.storeIntent(requestId, commandHash)) {
+    Serial.printf("[MQTT] FATAL: storeIntent failed for rid=%s — refusing to execute (durability not guaranteed)\n",
+                  requestId.c_str());
+    Services::Log.append(Core::LogType::Error,
+      "storeIntent FAILED — command rejected (durability not guaranteed): " + requestId, 0);
+    _publishAck(requestId, false,
+      "DURABILITY_FAILURE: cannot store transaction intent — please retry");
     return;
   }
 

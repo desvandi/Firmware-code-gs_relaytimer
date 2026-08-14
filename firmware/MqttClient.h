@@ -98,6 +98,26 @@ private:
   void _publishGenericAck(const String& requestId, bool success, const char* message,
                           const String& dataJson = "", const String& commandHash = "");
 
+  // CYCLE-7 (fixes F-001 + F-002 + F-006): Finalize + publish ACK with proper
+  // transaction semantics.
+  //
+  // preBuiltJson: the fully-constructed ACK JSON to publish.
+  // success:      whether the command succeeded (controls commit/publish behavior).
+  // commandHash:  non-empty for success ACKs of idempotent commands.
+  //
+  // Flow:
+  //   For FAILURE ACKs (success=false OR commandHash empty):
+  //     - Publish immediately (no commit, command can be retried with same requestId).
+  //   For SUCCESS ACKs (success=true AND commandHash non-empty):
+  //     - Call journal.commitTransaction(requestId, ackJson) — flips PENDING → COMMITTED.
+  //     - If commit FAILS: publish FAILURE ACK with DURABILITY_FAILURE message
+  //       (do NOT claim success — fixes F-002).
+  //     - If commit succeeds: publish ACK immediately.
+  //     - If immediate publish succeeds: dequeueAck() to prevent duplicate (fixes F-006).
+  //     - If immediate publish fails: leave in queue (processPendingAcks retries).
+  void _finalizeAndPublishAck(const String& requestId, bool success,
+                               const String& preBuiltJson, const String& commandHash);
+
   void _buildTopics();
   // audit-fixes: removed _isDuplicate() and _addProcessed() declarations.
   //   The in-memory dedup ring buffer was dead code (never called from
