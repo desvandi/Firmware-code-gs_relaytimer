@@ -1,3 +1,16 @@
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  Superseded by Rev23 for: authz boundary (device-scoped ACL),  ║ -->
+<!-- ║  STEP 5/7 consistency (auth after eligibility), evidence lifetime.  ║ -->
+<!-- ║  Refer to:                                                ║ -->
+<!-- ║    - CYCLE-8C-REV23-AUTHZ-BOUNDARY.md                       ║ -->
+<!-- ║  for the authoritative supplement.                          ║ -->
+<!-- ║  Rev22 remains authoritative for re-auth mechanism and per-requestId map.  ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
 # CYCLE-8C-Rev22: Transaction Journal v4 — Re-Authentication & Evidence Binding
 
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
