@@ -1,3 +1,16 @@
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  Superseded by Rev20 for: auth gate restoration, cross-product correction,  ║ -->
+<!-- ║  lastAttemptTs deterministic timing, expanded cross-product sweep.  ║ -->
+<!-- ║  Refer to:                                                ║ -->
+<!-- ║    - CYCLE-8C-REV20-AUTH-REGRESSION-CLOSURE.md             ║ -->
+<!-- ║  for the authoritative supplement.                          ║ -->
+<!-- ║  Rev19 remains authoritative for cleanup≠eviction and publish≠PUBACK.  ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
 # CYCLE-8C-Rev19: Transaction Journal v4 — Semantic Boundary Closure
 
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
