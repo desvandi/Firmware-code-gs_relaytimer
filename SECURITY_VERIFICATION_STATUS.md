@@ -21,20 +21,27 @@
 
 ---
 
-## Status Matrix (as of `engineering-cycle-8c-rev26-final-predicate` branch, current audited artefact `589e9a1`; immediate parent `9fd7473` Phase 1 documentation closure; Phase 1 implementation baseline `c506c80`)
+## Status Matrix (audit target: `origin/engineering-cycle-8c-rev26-final-predicate` — SHA resolved externally by auditor per "Audit Traceability Rule" in README.md)
 
 > **Closure-C / Closure-G update (auditor Rev26 Phase-1 review, 2026-08-14):**
 > This matrix reflects the pre-Rev26 security audit (R9–R10K). The Cycle 8C
 > design series (Rev1 → Rev26) supersedes R10G–R10K findings that touch
 > the transaction journal. Phase 1 (`JournalRecord` foundation, implementation
 > baseline `c506c80`) is implemented and host-tested (102/102 PASS) but
-> NOT YET APPROVED by auditor. Documentation closure (commit `9fd7473`)
-> added Closure-C/D/E/F + Phase 2/3 scope contracts; traceability closure
-> (commit `589e9a1`, the current audited artefact) added Closure-F fix +
-> Closure-G final audit identity. `589e9a1` is currently under auditor
-> final Phase-1 gate re-review. Phase 2 (`TransactionJournal` Rev26 rewrite)
-> is NOT AUTHORIZED. See [`README.md`](README.md) for the authoritative
-> phase gate status.
+> NOT YET APPROVED by auditor.
+>
+> Documentation closure history:
+>   - `9fd7473` — Closure-C/D/E/F + Phase 2/3 scope contracts (historical).
+>   - `589e9a1` — Closure-F traceability fix + TOC cleanup (rejected by
+>     auditor: self-referential SHA claim).
+>   - `8bfb036` — Closure-G attempt 2 (rejected by auditor: still
+>     self-referential).
+>   - Final traceability correction (this commit series) — adopted Option A
+>     model: audit target = branch ref, not embedded SHA. See "Audit
+>     Traceability Rule" in [`README.md`](README.md).
+>
+> Phase 2 (`TransactionJournal` Rev26 rewrite) is NOT AUTHORIZED. See
+> [`README.md`](README.md) for the authoritative phase gate status.
 
 ### 🔴 P0 Findings
 

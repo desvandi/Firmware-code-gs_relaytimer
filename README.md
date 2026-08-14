@@ -11,41 +11,79 @@ This repo holds the **device-side code** for the Timer Digital Relay v4.0 system
 
 ---
 
-## Branch / Commit Identity (for audit traceability)
+## Audit Traceability
 
-> **This section is normative for audit purposes.** All audit claims in this README
-> are scoped to the branch and commit listed here. Any other branch/commit must
-> be re-audited independently.
+> **This section is normative for audit purposes.**
+
+### Audit target
+
+The audit target is the exact repository state obtained by resolving the
+remote branch:
+
+```
+origin/engineering-cycle-8c-rev26-final-predicate
+```
+
+at the moment the auditor begins the audit.
+
+The auditor MUST independently resolve and record the commit SHA, for
+example:
+
+```
+git fetch origin
+git rev-parse origin/engineering-cycle-8c-rev26-final-predicate
+git show --no-patch --format=fuller <resolved-sha>
+```
+
+This document intentionally does not embed its own commit SHA. The
+authoritative identity of the current audit target is the branch ref
+above; the SHA at audit time is recorded by the auditor in the audit
+disposition, not by the repository itself.
+
+### Audit Traceability Rule
+
+> The audit target MUST NOT be represented by embedding the SHA of the
+> current commit inside that same commit.
+>
+> The authoritative identity of the current audit target is:
+>
+>     origin/engineering-cycle-8c-rev26-final-predicate
+>
+> The auditor independently resolves the branch to an immutable commit SHA
+> before beginning the audit and records that SHA in the audit disposition.
+>
+> Any SHA embedded in repository documentation refers only to historical
+> commits whose identity was already known when the documentation was
+> created. No SHA in this repository is a self-reference.
+
+### Traceability chain (historical)
 
 | Item | Value |
 |------|-------|
-| Audited branch | `engineering-cycle-8c-rev26-final-predicate` |
-| **Current audited artifact** (submitted for final Phase-1 gate) | `589e9a1` — Closure-F traceability fix + TOC cleanup + Closure-G (this commit) |
-| Immediate parent (Phase 1 documentation closure) | `9fd7473` — Closure-C/D/E/F + Phase 2/3 scope contracts |
-| Phase 1 implementation baseline (P1-1 strict serializer + P1-2 host test harness) | `c506c80` — 102/102 host tests PASS |
+| Designated audit branch | `engineering-cycle-8c-rev26-final-predicate` |
+| Current audit target (resolved externally) | HEAD of `origin/engineering-cycle-8c-rev26-final-predicate` — see rule above |
+| Phase 1 traceability closure attempt (previous HEAD) | `8bfb036` — Closure-F fix + TOC cleanup + Closure-G attempt 2 (rejected by auditor: still self-referential) |
+| Phase 1 traceability closure attempt (earlier) | `589e9a1` — Closure-F traceability fix + TOC cleanup (rejected by auditor: claimed `9fd7473` as current while being `589e9a1`) |
+| Phase 1 documentation closure | `9fd7473` — Closure-C/D/E/F + Phase 2/3 scope contracts |
+| Phase 1 implementation baseline (P1-1 strict serializer + P1-2 host test harness, 102/102 PASS) | `c506c80` |
 | Phase 1 initial implementation | `2e4de87` — JournalRecord implementation per Rev26 |
 | Normative design contract | [`docs/CYCLE-8C-REV26-FINAL-PREDICATE.md`](docs/CYCLE-8C-REV26-FINAL-PREDICATE.md) |
 | Foundational record contract | [`docs/CYCLE-8C-REV14-MUTATION-CONSOLIDATION.md`](docs/CYCLE-8C-REV14-MUTATION-CONSOLIDATION.md) (consolidated by Rev26) |
 | Phase 2 scope contract | [`docs/PHASE-2-SCOPE.md`](docs/PHASE-2-SCOPE.md) — **not yet authorized to start** |
 
-> **Traceability model (Closure-G, auditor 2026-08-14):**
-> The current audited artifact is `589e9a1`. Its immediate parent `9fd7473`
-> is the Phase 1 documentation closure (Closure-C/D/E/F). `c506c80` is the
-> Phase 1 implementation baseline (P1-1 + P1-2 — the strict serializer fix
-> + host test harness that achieved 102/102 PASS). `2e4de87` is the Phase 1
-> initial JournalRecord implementation.
->
-> Every commit in this chain may be referenced as a historical artefact
-> (parent, baseline, prior audit submission), but only `589e9a1` is the
-> current audited artefact. Any approval issued against `589e9a1` does NOT
-> transitively apply to other commits in the chain unless explicitly
-> re-scoped by the auditor.
+Every commit in this chain may be referenced as a historical artefact
+(parent, baseline, prior audit submission, prior rejected attempt), but
+none of them is "the current audit target." The current audit target is
+defined operationally as the resolved HEAD of the designated branch at
+audit time. Any approval issued against that resolved SHA does NOT
+transitively apply to other commits in the chain unless explicitly
+re-scoped by the auditor.
 
 ### Phase gate status (as of 2026-08-14)
 
 | Phase | Status | Notes |
 |-------|--------|-------|
-| Phase 1 — JournalRecord foundation | 🟡 **NOT YET APPROVED** | Implementation reviewed + host test 102/102 PASS. Auditor returned NO-GO pending Closure-C/D/E/F (documentation alignment, channel architecture statement, known-limitations disclosure, branch/commit traceability). |
+| Phase 1 — JournalRecord foundation | 🟡 **NOT YET APPROVED** | Implementation reviewed + host test 102/102 PASS. Auditor returned NO-GO pending Closure-C/D/E/F (documentation alignment, channel architecture statement, known-limitations disclosure, audit traceability). |
 | Phase 2 — TransactionJournal Rev26 + command integration + recovery | 🔴 **NO-GO / NOT AUTHORIZED** | Scope document exists ([`docs/PHASE-2-SCOPE.md`](docs/PHASE-2-SCOPE.md)). Engineering may not start until Phase 1 is approved AND auditor explicitly authorizes Phase 2. |
 | Phase 3 — 16-channel hardware/architecture migration | 🔴 **NOT AUTHORIZED** | Deferred until Phase 2 done + audited. I/O expander architecture = TBD (no device committed — see "Channel Architecture" below). |
 | 220V production | 🔴 **NOT AUTHORIZED** | Requires: Phase 2 done + audited; Phase 3 done + audited; 12 power-loss tests PASS on actual 16-channel ESP32 hardware; Ed25519 PSA runtime verification. |
@@ -974,8 +1012,10 @@ All 12 tests must PASS on actual ESP32 hardware before 220V production deploymen
 | Cycle 8C-Rev26 | Final eviction predicate (I2a–I2e + auth gate), DEPLOYMENT_AUTH_CONFIGURED vs AUTH_EVIDENCE_AUTHENTICATED separation, complete drive-out predicate | **CURRENT NORMATIVE DESIGN — Phase 1 implementation target** |
 | Phase 1 — initial implementation (`2e4de87`) | JournalRecord implementation: serialize/deserialize, CRC-32/ISO-HDLC, canonicalEqual, classifyGeneration | Phase 1 code baseline |
 | Phase 1 — closure (`c506c80`) | P1-1 (strict serializer — reject over-limit input) + P1-2 (host test harness, 102/102 PASS) | Phase 1 implementation baseline |
-| Phase 1 — documentation closure (`9fd7473`) | Closure-C/D/E/F + Phase 2/3 scope contracts | Phase 1 documentation closure (immediate parent of current audited artifact) |
-| Phase 1 — traceability closure (`589e9a1`) | Closure-F traceability fix + TOC cleanup + Closure-G (this commit) | **CURRENT AUDITED ARTEFACT — submitted for final Phase-1 gate** |
+| Phase 1 — documentation closure (`9fd7473`) | Closure-C/D/E/F + Phase 2/3 scope contracts | Phase 1 documentation closure (historical) |
+| Phase 1 — traceability closure attempt (`589e9a1`) | Closure-F traceability fix + TOC cleanup | Rejected by auditor: claimed `9fd7473` as current while being `589e9a1` (self-referential defect) |
+| Phase 1 — traceability closure attempt (`8bfb036`) | Closure-G attempt 2 | Rejected by auditor: still self-referential (claimed `589e9a1` while being `8bfb036`) |
+| Phase 1 — final traceability correction | Adopted Option A model (audit target = branch ref, not embedded SHA). See "Audit Traceability Rule" above. | Submitted for final Phase-1 gate — SHA resolved externally by auditor |
 | Phase 2 | TransactionJournal Rev26 rewrite + command integration + recovery semantics | **NOT AUTHORIZED** — see [`docs/PHASE-2-SCOPE.md`](docs/PHASE-2-SCOPE.md) |
 | Phase 3 | 16-channel migration (I/O expander architecture TBD) | **NOT AUTHORIZED** |
 | 220V production | Hardware acceptance: 12 power-loss tests + Ed25519 runtime verification | **NOT AUTHORIZED** |
@@ -985,11 +1025,12 @@ All 12 tests must PASS on actual ESP32 hardware before 220V production deploymen
 ## Known Limitations (as of Rev26 Phase 1 audit — 2026-08-14)
 
 > **Closure-E (auditor Rev26 Phase-1 review).** These are limitations of the
-> audited firmware as of current audited artefact `589e9a1` on branch
-> `engineering-cycle-8c-rev26-final-predicate` (immediate parent:
-> `9fd7473` Phase 1 documentation closure; Phase 1 implementation baseline
-> `c506c80`; initial implementation `2e4de87`). They are stated explicitly
-> (not disguised as features) per auditor requirement.
+> audited firmware at the resolved HEAD of branch
+> `engineering-cycle-8c-rev26-final-predicate` (audit target identity is
+> resolved externally by the auditor per the "Audit Traceability Rule"
+> above; historical chain: documentation closure `9fd7473`, implementation
+> baseline `c506c80`, initial implementation `2e4de87`). They are stated
+> explicitly (not disguised as features) per auditor requirement.
 
 1. **Browser credential exposure (P1 — accepted tradeoff, NOT a secret from
    the browser user):** `NEXT_PUBLIC_MQTT_PASSWORD` is exposed to the PWA
