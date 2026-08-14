@@ -1,3 +1,15 @@
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  Superseded by Rev24 for: cross-product I2 alignment, AUTHENTICATED verifiability.  ║ -->
+<!-- ║  Refer to:                                                ║ -->
+<!-- ║    - CYCLE-8C-REV24-VERIFICATION-BOUNDARY.md               ║ -->
+<!-- ║  for the authoritative supplement.                          ║ -->
+<!-- ║  Rev23 remains authoritative for step ordering and evidence lifetime.  ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
 # CYCLE-8C-Rev23: Transaction Journal v4 — Authorization Boundary & Step Consistency
 
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
