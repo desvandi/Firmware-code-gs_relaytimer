@@ -245,13 +245,26 @@ void WifiManager::_runConfigPortal() {
   Serial.println("[WiFi] Starting Config Portal...");
   _mode = WifiMode::AP_CONFIG;
 
+  // audit-fixes (auditor #2 P0): Config Portal was open AP (password = "").
+  //   Anyone within WiFi range during the first-boot window could connect and
+  //   hijack the device's WiFi creds. Now uses the same random AP password
+  //   generated in generateApPassword(). The owner reads the password from
+  //   Serial (dev) or provisioning sheet (prod) — same pattern as fallback AP.
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(Core::WIFI_CONFIG_PORTAL_SSID, Core::WIFI_CONFIG_PORTAL_PASSWORD);
+  // _apPassword is the random CSPRNG-generated password (set in begin()).
+  // WIFI_CONFIG_PORTAL_PASSWORD is intentionally ignored — it was "" by default.
+  WiFi.softAP(Core::WIFI_CONFIG_PORTAL_SSID, _apPassword, Core::WIFI_CHANNEL,
+              Core::WIFI_HIDDEN, Core::WIFI_MAX_CLIENTS);
 
   IPAddress apIP = WiFi.softAPIP();
   Serial.printf("[WiFi] Config Portal AP: %s\n", Core::WIFI_CONFIG_PORTAL_SSID);
   Serial.printf("[WiFi] Portal IP: %s\n", apIP.toString().c_str());
   Serial.printf("[WiFi] Open http://%s in browser to configure\n", apIP.toString().c_str());
+#ifdef PRODUCTION_BUILD
+  Serial.println("[WiFi] AP Password: [REDACTED in PRODUCTION_BUILD — see provisioning sheet]");
+#else
+  Serial.printf("[WiFi] AP Password: %s\n", _apPassword);
+#endif
 
   WebServer configServer(80);
 
