@@ -1,13 +1,85 @@
 # Timer Digital Relay v4.0 — Firmware + Google Apps Script
 
-> ESP32-WROOM-32 firmware for 12-channel relay control + 4 PIR sensors + DS3231 RTC + PZEM-004T v3.0 power meter, with NVS-persisted transaction journal, Ed25519-signed OTA, and Google Apps Script AI insights pipeline.
+> ESP32-WROOM-32 firmware for **12-channel** relay control + 4 PIR sensors + DS3231 RTC + PZEM-004T v3.0 power meter, with NVS-persisted transaction journal, Ed25519-signed OTA, and Google Apps Script AI insights pipeline.
 
 [![Firmware Version](https://img.shields.io/badge/firmware-v4.0.0-blue)](#)
-[![Security Audit](https://img.shields.io/badge/audit-round%2010K-brightgreen)](#security-audit-history)
+[![Security Audit](https://img.shields.io/badge/audit-Cycle%208C%20Rev26-blue)](#security-audit-history)
 [![ESP32 Core](https://img.shields.io/badge/ESP32%20core-3.3.7-green)](#)
 [![License](https://img.shields.io/badge/license-proprietary-lightgrey)](#)
 
 This repo holds the **device-side code** for the Timer Digital Relay v4.0 system. The companion PWA dashboard lives in a separate repo: **[desvandi/Remote-Relay](https://github.com/desvandi/Remote-Relay)**.
+
+---
+
+## Branch / Commit Identity (for audit traceability)
+
+> **This section is normative for audit purposes.** All audit claims in this README
+> are scoped to the branch and commit listed here. Any other branch/commit must
+> be re-audited independently.
+
+| Item | Value |
+|------|-------|
+| Audited branch | `engineering-cycle-8c-rev26-final-predicate` |
+| Audited commit (Phase 1 closure) | `c506c80` — P1-1 (strict serializer) + P1-2 (host test harness, 102/102 PASS) |
+| Parent commit (Phase 1 initial) | `2e4de87` — Phase 1 JournalRecord implementation |
+| Normative design contract | [`docs/CYCLE-8C-REV26-FINAL-PREDICATE.md`](docs/CYCLE-8C-REV26-FINAL-PREDICATE.md) |
+| Foundational record contract | [`docs/CYCLE-8C-REV14-MUTATION-CONSOLIDATION.md`](docs/CYCLE-8C-REV14-MUTATION-CONSOLIDATION.md) (consolidated by Rev26) |
+| Phase 2 scope contract | [`docs/PHASE-2-SCOPE.md`](docs/PHASE-2-SCOPE.md) — **not yet authorized to start** |
+
+### Phase gate status (as of 2026-08-14)
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| Phase 1 — JournalRecord foundation | 🟡 **NOT YET APPROVED** | Implementation reviewed + host test 102/102 PASS. Auditor returned NO-GO pending Closure-C/D/E/F (documentation alignment, channel architecture statement, known-limitations disclosure, branch/commit traceability). |
+| Phase 2 — TransactionJournal Rev26 + command integration + recovery | 🔴 **NO-GO / NOT AUTHORIZED** | Scope document exists ([`docs/PHASE-2-SCOPE.md`](docs/PHASE-2-SCOPE.md)). Engineering may not start until Phase 1 is approved AND auditor explicitly authorizes Phase 2. |
+| Phase 3 — 16-channel hardware/architecture migration | 🔴 **NOT AUTHORIZED** | Deferred until Phase 2 done + audited. I/O expander architecture = TBD (no device committed — see "Channel Architecture" below). |
+| 220V production | 🔴 **NOT AUTHORIZED** | Requires: Phase 2 done + audited; Phase 3 done + audited; 12 power-loss tests PASS on actual 16-channel ESP32 hardware; Ed25519 PSA runtime verification. |
+
+> **Auditor principle (formalized 2026-08-14):** Approval is granted only after
+> artefacts themselves demonstrate that requirements are met — not after
+> engineering states that work "has been done". This applies to every gate below.
+
+---
+
+## Channel Architecture: Current vs Target
+
+> **Closure-D (auditor Rev26 Phase-1 review).** This section exists to remove
+> implicit ambiguity about channel count. The audited firmware is 12-channel;
+> the production target is 16-channel; these are NOT the same artifact.
+
+**Current audited firmware (branch `engineering-cycle-8c-rev26-final-predicate`):**
+- `NUM_CHANNELS = 12` (see `firmware/Config.h` line 20)
+- `RELAY_PINS[12]` = `{13, 14, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27}` (direct GPIO drive, active-LOW)
+- 4 PIR sensors on input-only GPIOs (34, 35, 36, 39)
+- DS3231 RTC on I2C (SDA=32, SCL=33)
+- PZEM-004T v3.0 on UART2 (GPIO 4/5)
+- **No I/O expander** — all 12 relays are driven directly by ESP32 GPIOs
+
+**Production target (NOT YET IMPLEMENTED — Phase 3):**
+- 16-channel relay
+- Requires I/O expander (4 additional channels beyond ESP32's direct-drive capability)
+- **I/O expansion architecture: TBD / requires engineering decision and hardware review.**
+  No specific device (PCF8575, MCP23017, or other) is committed. The choice
+  must be justified against:
+  - output state at boot (default HIGH/LOW, fail-safe)
+  - failure behavior on bus loss
+  - reset behavior (does expander retain state across ESP32 reset?)
+  - address configuration (I2C address conflicts)
+  - electrical compatibility (3.3V vs 5V logic, sink/source current)
+  - relay-driver interface (active-LOW/active-HIGH, opto-isolation)
+  - fail-safe requirement (relay must default to OFF when expander is unresponsive)
+- Requires `RelayDriver.cpp` migration — no work started
+- Requires `Config.h` `NUM_CHANNELS = 16` + `RELAY_PINS[16]` update
+- Requires PWA channel mapping update — no work started
+- Requires auditor approval for "Phase 3 — 16-channel migration" before work begins
+
+**Implication for audit:**
+- Phase 1 (JournalRecord) is channel-agnostic — `channelId` is a single byte
+  in the canonical payload and is not interpreted by the record layer.
+- The current audited artifact is a **12-channel firmware**.
+- Any 220V production deployment must use the **16-channel target**, which
+  does not exist yet. Therefore 220V production is BLOCKED until Phase 3
+  (16-channel migration) is complete and separately audited.
 
 ---
 
@@ -45,9 +117,12 @@ Firmware-code-gs_relaytimer/
 │   ├── platformio.ini                  ← PlatformIO config (optional)
 │   ├── Config.h                        ← ALL compile-time constants (edit this!)
 │   │
-│   ├── ── Transaction Layer (R10G-R10K) ──
-│   ├── TransactionJournal.h            ← NVS-persisted transaction journal
-│   ├── TransactionJournal.cpp          ← CRC32 + magic + two-phase commit
+│   ├── ── Transaction Layer (Cycle 8C — Rev26 foundation) ──
+│   ├── JournalRecord.h                ← Record struct + serialization API (Phase 1)
+│   ├── JournalRecord.cpp              ← serialize/deserialize/CRC/canonicalEqual/classifyGeneration
+│   ├── JournalRecordTest.cpp (test/host/) ← host test harness (102/102 PASS, compiles real JournalRecord.cpp)
+│   ├── TransactionJournal.h           ← NVS-persisted journal (PRE-Rev26 — will be rewritten in Phase 2)
+│   ├── TransactionJournal.cpp         ← Pre-Rev26 two-phase commit (tj_entry_N + tj_commit_N) — DO NOT USE as Rev26 reference
 │   │
 │   ├── ── Network ──
 │   ├── MqttClient.h                    ← MQTT client + ACK transaction + dedup
@@ -114,9 +189,10 @@ The firmware uses a **flat layout** (all `.cpp`/`.h` files at root of `firmware/
                           ┌─────────────────────────────────────────┐
                           │     ESP32-WROOM-32 (this repo)           │
                           │                                         │
-   PIR 1-4 ─── GPIO 34-39 │  TransactionJournal (NVS, CRC32, 2PC)  │
-   DS3231 ──── I2C (32,33) │  MqttClient (TLS, ACK, Ed25519 OTA)    │
-   PZEM-004T ─ UART2 (4,5) │  AuthManager (JWT 15min + refresh 7d)  │
+   PIR 1-4 ─── GPIO 34-39 │  JournalRecord (Phase 1 — Rev26 foundation) │
+   DS3231 ──── I2C (32,33) │  TransactionJournal (PRE-Rev26, Phase 2 will rewrite) │
+   PZEM-004T ─ UART2 (4,5) │  MqttClient (TLS, ACK, Ed25519 OTA)    │
+                          │  AuthManager (JWT 15min + refresh 7d)  │
                           │  RelayEngine (Manual>PIR>Schedule>Off)  │
                           │  PzemDriver (Modbus-RTU, self-contained) │
                           │  Advisor (GAS HMAC → Gemini)            │
@@ -142,19 +218,136 @@ The firmware uses a **flat layout** (all `.cpp`/`.h` files at root of `firmware/
 
 ---
 
-## Security Architecture (Rounds 9–10K)
+## Security Architecture (Cycle 8C — Rev26 normative)
 
-This firmware has been through **12 rounds of security audit** by an external engineer. Key hardening applied:
+> **Closure-C (auditor Rev26 Phase-1 review).** The previous version of this
+> section described a pre-Rev26 architecture (`two-phase commit` +
+> `tj_entry_N`/`tj_commit_N` flag pairs, `[magic:2][version:1][valid:1][CRC32:4][payload]`
+> byte layout, "12 rounds of security audit"). That description was
+> inconsistent with the actual Rev26 implementation in
+> `firmware/JournalRecord.h` and the normative design contract
+> `docs/CYCLE-8C-REV26-FINAL-PREDICATE.md`.
+>
+> This section is now the **single source of truth** for the audited firmware's
+> security architecture. Anywhere a stale description appears elsewhere in the
+> repository (e.g. historical `docs/CYCLE-*` superseded banners, code comments
+> referencing `R10G-R10K`), Rev26 + this section take precedence.
 
-### Transaction Layer (R10G–R10K)
+This firmware has been through **12 rounds of security audit (R9 → R10K) +
+the Cycle 8C design series (Rev1 → Rev26, 26 design revisions)** by an external
+auditor. The Cycle 8C series is normative; R9–R10K findings are subsumed by
+Rev26 where they touch the transaction journal.
 
-- **NVS-persisted transaction journal**: `{requestId, commandHash, ackJson}` stored in flash. Survives reboot. Same requestId → NEVER re-execute → always replay original ACK.
-- **Two-phase commit**: `tj_entry_N` (blob data) + `tj_commit_N` (1-byte commit flag). writeIdx persisted BEFORE commit flag. All 3 failure scenarios verified safe.
-- **CRC32 + magic + version**: Every blob has `[magic:2][version:1][valid:1][CRC32:4][payload]`. CRC mismatch → entry rejected, slot freed.
-- **64-entry LRU journal**: At 100 commands/day, oldest entry is ~15 hours old when evicted. PWA retry window is ~2 minutes. 15h >> 2min.
-- **ACK retry queue**: Pending ACKs retried every 2s (max 10 attempts). On boot: all stored ACKs re-queued from NVS.
+### Transaction Journal Architecture (Rev26 normative)
 
-### MQTT Security (R10A–R10F)
+The transaction journal is in the middle of a phased migration:
+
+| Phase | Status | What it implements |
+|-------|--------|--------------------|
+| **Phase 1 — `JournalRecord` foundation** | 🟡 Implemented + host-tested (102/102 PASS), auditor re-review pending | Record primitive: serialize/deserialize, CRC-32/ISO-HDLC, canonical equivalence, generation ordering. Channel-agnostic — `channelId` is an opaque byte. |
+| **Phase 2 — `TransactionJournal` Rev26** | 🔴 NOT YET STARTED — see [`docs/PHASE-2-SCOPE.md`](docs/PHASE-2-SCOPE.md) | Dual-copy persistence, ObservationGuard, mutation enforcement, 9-row recovery table, ACK lifecycle separation, command execution integration. |
+| **Phase 3 — 16-channel migration** | 🔴 NOT YET STARTED | I/O expander, RelayDriver migration, channel architecture. |
+
+**IMPORTANT:** The current `firmware/TransactionJournal.cpp` is a **pre-Rev26
+implementation** (still uses the old `tj_entry_N` + `tj_commit_N` two-phase
+commit model with a 1-byte commit flag). It is **NOT** the Rev26 dual-copy
+architecture. It will be rewritten in Phase 2. Until Phase 2 is complete and
+audited, the journal layer is NOT considered production-safe.
+
+#### JournalRecord byte layout (Rev26 normative — single source of truth)
+
+```
+Offset  Field              Size  Description
+------  ----------------   ----  ------------------------------------------
+0       magic              2     0x54, 0x4A ("TJ")
+2       schemaVersion      1     4 (JOURNAL_SCHEMA_VERSION)
+3       generation         4     uint32 LE, wrap-safe serial number
+7       recordCRC          4     CRC-32/ISO-HDLC over bytes 0..6 + bytes 11..end
+--- CANONICAL PAYLOAD (byte 11 onward) ---
+11      recordState        1     EMPTY/PENDING/EXECUTING/COMMITTED/...
+12      requestIdLen       1     0..64
+13..    requestId          var
+..      commandHashLen     1     0..64
+..      commandHash        var
+..      channelId          1     0=N/A, 1..NUM_CHANNELS
+..      desiredState       1     0=OFF, 1=ON, 0xFF=N/A
+..      previousKnownState 1     0=OFF, 1=ON
+..      attempt            1
+..      timestamp          4     uint32 LE
+..      ackLen             2     uint16 LE, 0..1024
+..      ackJson            var
+..      (padding to BLOB_SIZE=1200, zeros, NO semantic meaning)
+```
+
+Header size = **11 bytes** (`BLOB_HEADER_SIZE`). The previous README
+description of `[magic:2][version:1][valid:1][CRC32:4][payload]` (8-byte
+header with a 1-byte `valid` flag) is **OBSOLETE** — it describes a pre-Rev26
+concept that was replaced by `schemaVersion` + `generation` (5 bytes
+combined) to support wrap-safe serial arithmetic and canonical equivalence.
+
+The implementation lives in:
+- `firmware/JournalRecord.h` — record struct + API contract
+- `firmware/JournalRecord.cpp` — serialize/deserialize/CRC/canonicalEqual/classifyGeneration
+- `firmware/test/host/JournalRecordTest.cpp` — host-side Phase 1 verification (102/102 PASS)
+
+#### CRC contract (Rev26 normative)
+
+- **Algorithm:** CRC-32/ISO-HDLC (reflected, poly 0xEDB88320, init 0xFFFFFFFF, final XOR 0xFFFFFFFF)
+- **API:** `~esp_crc32_le(0xFFFFFFFF, data, len) & 0xFFFFFFFF`
+- **CRC INPUT:** bytes `[0..6]` (header) concatenated with bytes `[11..actualPayloadEnd]` (canonical payload)
+- **CRC does NOT cover:** bytes `[7..10]` (the CRC field itself), padding bytes
+- **Test vector:** `"123456789"` → `0xCBF43926` (mandatory KAT, verified by host test)
+
+#### Canonical equivalence (Rev26 normative)
+
+`canonicalEqual(A, B)` ≡
+1. `A.schemaVersion == B.schemaVersion`
+2. `AND A.canonicalLength == B.canonicalLength`
+3. `AND memcmp(A.canonicalBytes, B.canonicalBytes, A.canonicalLength) == 0`
+
+Where `canonicalBytes` = bytes starting at `recordState` (byte 11), and
+`canonicalLength` = actual payload length derived from safe parse (excludes
+padding). Schema version is checked separately because it lives in the
+header, not the canonical payload.
+
+#### Generation ordering (Rev26 normative, wrap-safe serial arithmetic)
+
+```
+distAB = (uint32_t)(genB - genA)    // forward distance A→B
+distBA = (uint32_t)(genA - genB)    // forward distance B→A
+
+if genA == genB                    → GEN_EQUAL    (verify canonicalEqual)
+else if distAB == 1                → GEN_NEWER_B  (B is 1 newer than A)
+else if distBA == 1                → GEN_NEWER_A  (A is 1 newer than B)
+else if distAB == 0x80000000       → GEN_AMBIGUOUS → CORRUPTED
+else                               → GEN_INVALID  → CORRUPTED
+```
+
+#### Phase 2 will add (NOT YET IMPLEMENTED)
+
+When Phase 2 is authorized, `TransactionJournal.cpp` will be rewritten to
+implement the Rev26 normative contract:
+
+- **Dual-copy persistence** — each journal slot stores two copies of the
+  record; recovery uses the 9-row decision table (see
+  `docs/CYCLE-8C-REV14-MUTATION-CONSOLIDATION.md` §I1 "Recovery Decision
+  Table") to pick authoritative copy or quarantine.
+- **ObservationGuard** (RAII) + `_assertMutationAllowed()` — observation
+  and mutation are mutually exclusive (runtime-enforced, panic on violation).
+- **Mutation enforcement** — every mutation API calls `_assertExecutorContext()`
+  + `_assertMutationAllowed()` at entry.
+- **9-row recovery decision table** — recovery picks VALID copy, repairs
+  INVALID copy bitwise, or quarantines slot when both INVALID.
+- **ACK lifecycle separation** — transaction lifecycle independent of ACK
+  delivery lifecycle; ACK queue (`tj_ackq`) persists separately and survives
+  eviction of the originating journal entry.
+- **Eviction safety (I2)** — 5 conjunctive predicates (I2a–I2e); default
+  is RETAIN when any check is uncertain.
+- **Generation construction** — protocol produces distance 0 (same/repair)
+  or 1 (adjacent mutation); loader validates distance is 0 or 1, else
+  CORRUPTED.
+
+### MQTT Security (R10A–R10F — still in force, not superseded by Rev26)
 
 - **TLS mandatory** in production (port 8883/8884). `setCACert(MQTT_ROOT_CA)`. No `setInsecure()` fallback.
 - **PRODUCTION_BUILD flag**: When defined, enforces TLS + username + password + CA + CORS + OTA pubkey + OTA CA. Hard-fail if any missing.
@@ -756,29 +949,90 @@ All 12 tests must PASS on actual ESP32 hardware before 220V production deploymen
 | R10D | PSA Ed25519 correct API, dedup replay original, unknown-field reject, strict SemVer | 4 fixes |
 | R10E | Atomic ACK transaction, validation reorder, dedup TTL | 4 fixes |
 | R10F | Publish failure handling, expired dedup cleanup, PRODUCTION_BUILD flag | 5 fixes |
-| R10G | NVS transaction journal, ACK retry queue, strict requestId | Architectural shift |
-| R10H | NVS atomicity (blob write), LRU 64 entries, commit flag | 4 fixes |
-| R10I | CRC32 + magic + version | Integrity protection |
-| R10J | Separate commit key (true two-phase) | Power-loss safety |
-| R10K | writeIdx-before-commit ordering fix | Failure ordering fix |
+| R10G–R10K | Pre-Rev26 transaction journal (tj_entry_N + tj_commit_N two-phase commit) | **SUPERSEDED by Cycle 8C** — pre-Rev26 `TransactionJournal.cpp` is still in repo but will be rewritten in Phase 2 |
+| Cycle 8A | Transaction recovery (TransactionState state machine, GPIO readback reconciliation) | Pre-Rev26 transaction recovery |
+| Cycle 8B | Boot recovery phase (PRE_INIT→SAFE_INIT→SNAPSHOT→RECONCILING→RESTORING→RUNNING) | Pre-Rev26 boot recovery |
+| Cycle 8B-Rev1 | `_createPendingEntryNVS()` + `_commitExecutingEntryNVS()` split + monotonicity validator | Pre-Rev26 monotonicity |
+| Cycle 8C-Rev1 → Rev13 | Dual-copy design, canonical equivalence, formal invariants, ACK lifecycle, recovery observation | Iterative design |
+| Cycle 8C-Rev14 | Mutation enforcement + full consolidation (SOLE normative document for JournalRecord byte layout, CRC contract, canonical equivalence, generation ordering, recovery decision table, ACK lifecycle, eviction matrix) | **Foundation contract for Phase 1 implementation** |
+| Cycle 8C-Rev15 → Rev25 | ACK transition, auth regression, auth evidence lifetime, authz boundary, verification boundary, auth evidence normalization | Iterative design refinement |
+| Cycle 8C-Rev26 | Final eviction predicate (I2a–I2e + auth gate), DEPLOYMENT_AUTH_CONFIGURED vs AUTH_EVIDENCE_AUTHENTICATED separation, complete drive-out predicate | **CURRENT NORMATIVE DESIGN — Phase 1 implementation target** |
+| Phase 1 (commit `c506c80`) | JournalRecord implementation: serialize/deserialize, CRC-32/ISO-HDLC, canonicalEqual, classifyGeneration + host test harness (102/102 PASS) | **NOT YET APPROVED** — auditor re-review pending Closure-C/D/E/F |
+| Phase 2 | TransactionJournal Rev26 rewrite + command integration + recovery semantics | **NOT AUTHORIZED** — see [`docs/PHASE-2-SCOPE.md`](docs/PHASE-2-SCOPE.md) |
+| Phase 3 | 16-channel migration (I/O expander architecture TBD) | **NOT AUTHORIZED** |
+| 220V production | Hardware acceptance: 12 power-loss tests + Ed25519 runtime verification | **NOT AUTHORIZED** |
 
 ---
 
-## Known Limitations
+## Known Limitations (as of Rev26 Phase 1 audit — 2026-08-14)
 
-1. **LRU eviction**: After 64 commands, oldest entry is evicted. At 100 commands/day, oldest is ~15h old. PWA retry window is ~2min. If PWA retries after 15h, command may re-execute. **Accepted risk** for IoT device.
+> **Closure-E (auditor Rev26 Phase-1 review).** These are limitations of the
+> audited firmware as of commit `c506c80` on branch
+> `engineering-cycle-8c-rev26-final-predicate`. They are stated explicitly
+> (not disguised as features) per auditor requirement.
 
-2. **Execute→store gap**: If ESP32 crashes between executing a command and storing to NVS journal, the command will be re-executed on PWA retry. For SET_STATE (relay ON/OFF): idempotent, safe. For schedule upsert: may create duplicate (capped at 4/channel). **Fundamental limitation** without hardware transaction support.
+1. **Browser credential exposure (P1 — accepted tradeoff, NOT a secret from
+   the browser user):** `NEXT_PUBLIC_MQTT_PASSWORD` is exposed to the PWA
+   browser. Compromise of a single device's browser credential = compromise
+   of THAT device only (broker ACL scopes to `timer12/<mac>/#`).
+   This is an accepted tradeoff of the threat model. The browser user can
+   technically extract the credential from their own client — it is NOT a
+   secret from them. For multi-tenant deployments with mutually-distrusting
+   users, per-browser credentials (or broker-issued JWT tokens) would be
+   required — this is OUT OF SCOPE and must be flagged as a separate
+   security phase if needed.
 
-3. **Ed25519 build verification**: PSA Crypto API identifiers are correct per spec, but actual build + known-answer test on Arduino IDE 2.3.8 + ESP32 core 3.3.7 has NOT been verified. If `PSA_ECC_FAMILY_TWISTED_EDWARDS` is not defined, enable via menuconfig → mbedTLS → Elliptic Curve DH/DSA.
+2. **LRU journal = 64 entries**: After eviction, old requestIds can be
+   re-executed. At 100 commands/day, oldest entry is ~15 hours old when
+   evicted (PWA retry window is ~2 min, so 15h ≫ 2min). Non-idempotent
+   commands (OTA, factory reset, future precharge) must rely on additional
+   guards (version monotonicity, signature, etc.), NOT journal retention
+   alone. **Rev26 eviction safety (I2a–I2e) governs eviction decisions —
+   implemented in Phase 2.**
 
-4. **NVS wear**: 64 entries × ~5 NVS writes per transaction = ~320 writes per full journal cycle. At 100 commands/day: ~3-5 year flash lifetime. Acceptable for IoT device.
+3. **Execute→store gap (acknowledged, partially closed by Rev26 design):**
+   Cycle-7 finding I-004 documents that OTA commands bypass the
+   intent-first journal pattern. Rev26's intent-first design (storeIntent →
+   execute → commitTransaction) closes this for relay commands in Phase 2.
+   OTA path migration to intent-first is **Phase 2 work**, not yet started.
 
-5. **Development default**: Repository ships with insecure defaults (HiveMQ public, port 1883, no auth, CORS `*`). This is for development only. **Use PRODUCTION_BUILD flag for real deployment.**
+4. **Ed25519 PSA Crypto verification status**: Not yet verified on
+   Arduino IDE 2.3.8 + ESP32 core 3.3.7 combination. The
+   `-DMBEDTLS_ED25519_SUPPORTED` flag is documented in `platformio.ini` but
+   requires a framework rebuild with
+   `CONFIG_MBEDTLS_ECP_DP_ED25519_ENABLED=y` in sdkconfig. Without it,
+   `ed25519VerifyHash()` returns false (fail-closed) and MQTT OTA is
+   rejected. **Status: verified only at compile-time, not at runtime.**
+   Phase 3+ hardware acceptance must include Ed25519 KAT on actual ESP32.
 
-6. **No Flash Encryption / Secure Boot**: NVS data (JWT secret, refresh tokens, MQTT password, GAS secret) is stored as plaintext in flash. An attacker with physical access (UART, flash dump) can extract these secrets. **For high-security deployments, enable ESP32 Flash Encryption + Secure Boot** (see [Physical Security Hardening](#physical-security-hardening-flash-encryption--secure-boot) below).
+5. **NVS wear**: Estimated 3–5 years at 100 commands/day (64 entries ×
+   ~5 NVS writes per transaction = ~320 writes per full journal cycle).
+   After that, NVS page compaction may begin to fail. Rev14 recommends
+   LittleFS migration for large blobs — NOT YET IMPLEMENTED.
+   **Status: documented estimate, not measured.**
 
-7. **Ed25519 PSA Crypto not in default framework**: The default prebuilt `arduino-esp32` framework does NOT include Ed25519 curve support. The code is guarded with `#if defined(MBEDTLS_ED25519_SUPPORTED)` and falls back to fail-closed (OTA rejected) when not compiled in. To enable Ed25519 OTA verification, rebuild the ESP32 framework with `CONFIG_MBEDTLS_ECP_DP_ED25519_ENABLED=y` in sdkconfig and add `-DMBEDTLS_ED25519_SUPPORTED` to `build_flags` in `platformio.ini`.
+6. **12-channel vs 16-channel**: See "Channel Architecture" section above.
+   Current audited firmware is **12-channel**. 16-channel migration is
+   **Phase 3**, requiring separate audit. I/O expansion architecture is
+   **TBD** — no device committed.
+
+7. **Default development build is insecure**: HiveMQ public broker, no
+   auth, CORS `*`. NEVER flash development build to a device controlling
+   220V mains. Production build (`-DPRODUCTION_BUILD`) is mandatory for
+   any real deployment.
+
+8. **No Flash Encryption / Secure Boot**: NVS data (JWT secret, refresh
+   tokens, MQTT password, GAS secret) is stored as plaintext in flash.
+   An attacker with physical access (UART, flash dump) can extract these
+   secrets. For high-security deployments, enable ESP32 Flash Encryption +
+   Secure Boot (see [Physical Security Hardening](#physical-security-hardening-flash-encryption--secure-boot) below).
+
+9. **Pre-Rev26 TransactionJournal.cpp still active**: The current
+   `firmware/TransactionJournal.cpp` uses the old `tj_entry_N` +
+   `tj_commit_N` two-phase commit model, NOT the Rev26 dual-copy
+   architecture. It will be rewritten in Phase 2. Until then, the journal
+   layer is **NOT considered production-safe** — only `JournalRecord`
+   (the Phase 1 foundation) has been audited.
 
 ---
 

@@ -2,6 +2,29 @@
 
 > **Acceptance criterion**: Tidak ada keadaan recovery di mana sebuah command yang sudah dieksekusi dapat dieksekusi kedua kali karena journal kehilangkan committed record.
 
+> **STATUS (Closure-C, auditor Rev26 Phase-1 review, 2026-08-14):** This test
+> plan targets the PRE-Rev26 `TransactionJournal.cpp` (two-phase commit with
+> `tj_entry_N` + `tj_commit_N` flags). It is **NOT valid** for the Rev26
+> dual-copy architecture, which has not yet been implemented (Phase 2).
+>
+> When Phase 2 is complete, this test plan MUST be rewritten to cover:
+> - dual-copy crash scenarios (copy A torn write, copy B torn write, both torn)
+> - generation ordering recovery (NEWER_A, NEWER_B, EQUAL+canonicalEqual, AMBIGUOUS, INVALID)
+> - 9-row recovery decision table (per `docs/CYCLE-8C-REV14-MUTATION-CONSOLIDATION.md` §I1)
+> - canonical equivalence on repair
+> - ObservationGuard / mutation enforcement (panic on violation)
+> - ACK lifecycle separation (tj_ackq persistence)
+> - Eviction safety (I2a–I2e)
+>
+> Until then, ALL 12 tests below remain ⏳ Pending — running them against the
+> pre-Rev26 TransactionJournal.cpp would test code that is about to be
+> rewritten, which is wasted effort. The 12-test plan will be re-baselined
+> on the Rev26 implementation in Phase 2.
+>
+> Additionally, the test plan currently assumes 12-channel hardware. The
+> production target is 16-channel (see README "Channel Architecture" section).
+> The final power-loss acceptance must run on 16-channel hardware (Phase 3).
+
 ## Prerequisites
 
 - ESP32-WROOM-32 dev board

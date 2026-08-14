@@ -21,7 +21,15 @@
 
 ---
 
-## Status Matrix (as of `main` after PR #3 merge)
+## Status Matrix (as of `engineering-cycle-8c-rev26-final-predicate` branch, commit `c506c80`)
+
+> **Closure-C update (auditor Rev26 Phase-1 review, 2026-08-14):** This matrix
+> reflects the pre-Rev26 security audit (R9–R10K). The Cycle 8C design series
+> (Rev1 → Rev26) supersedes R10G–R10K findings that touch the transaction
+> journal. Phase 1 (`JournalRecord` foundation) is implemented and host-tested
+> (102/102 PASS) but NOT YET APPROVED by auditor. Phase 2 (`TransactionJournal`
+> Rev26 rewrite) is NOT AUTHORIZED. See [`README.md`](README.md) for the
+> authoritative phase gate status.
 
 ### 🔴 P0 Findings
 
@@ -66,7 +74,7 @@ These areas passed static review across all 6 auditors. Do not refactor them "fo
 - **MQTT topic contract**: `timer12/<deviceId>/{command,status,ack,log,online,ota}` — PWA ↔ firmware consistent, no password in topic
 - **MQTT ACK transaction**: requestId + timeout + ACK validation + pending cleanup
 - **MQTT command validation pipeline**: parse → type → unknown-field rejection → requestId → hash → journal lookup → execute
-- **TransactionJournal**: 64-entry ring + CRC32 + magic + two-phase commit + ACK retry queue
+- **TransactionJournal**: 64-entry ring + CRC32 + magic + two-phase commit + ACK retry queue — **NOTE**: This describes the PRE-Rev26 `TransactionJournal.cpp` still in the repo. The Rev26 normative design (`docs/CYCLE-8C-REV26-FINAL-PREDICATE.md`) replaces two-phase commit with dual-copy + generation ordering + canonical equivalence. Rev26 implementation is Phase 2 work (NOT YET STARTED — see [`docs/PHASE-2-SCOPE.md`](docs/PHASE-2-SCOPE.md)). Phase 1 `JournalRecord` foundation is implemented + host-tested (102/102 PASS).
 - **MQTT TLS production guard**: fail-closed on TLS/auth/CA/CORS/OTA pubkey
 - **MQTT OTA cryptographic chain**: HTTPS → CA → host allowlist → size → SHA-256 → Ed25519 → anti-downgrade → install → rollback
 - **Code.gs HMAC**: LockService + nonce + timestamp + constant-time comparison

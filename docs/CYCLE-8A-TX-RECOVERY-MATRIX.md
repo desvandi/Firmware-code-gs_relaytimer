@@ -1,5 +1,21 @@
 # CYCLE-8A: Transaction Recovery State Machine — T0-T10 Crash Matrix
 
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  HISTORICAL DOCUMENT — DESIGN CONTEXT ONLY             ║ -->
+<!-- ║  This document is part of the pre-Rev26 Cycle 8A design     ║ -->
+<!-- ║  series. It describes the OLD transaction recovery model   ║ -->
+<!-- ║  (TransactionState + 2PC commit flag flip).                 ║ -->
+<!-- ║                                                              ║ -->
+<!-- ║  The CURRENT normative design is:                            ║ -->
+<!-- ║    docs/CYCLE-8C-REV26-FINAL-PREDICATE.md                    ║ -->
+<!-- ║                                                              ║ -->
+<!-- ║  References to "Phase 2" in this document refer to the 2PC   ║ -->
+<!-- ║  commit-flag-flip phase, NOT to the Phase 2 Rev26 migration  ║ -->
+<!-- ║  scope (see docs/PHASE-2-SCOPE.md). Do not confuse the two.  ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
 This document defines the behavior of the transaction recovery state machine
 at each of the 10 critical time points (T0-T10) during command processing.
 For each time point, we describe: what happens on crash, what state the journal
