@@ -1,3 +1,16 @@
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  Superseded by Rev21 for: auth evidence lifetime, event vs decision time,  ║ -->
+<!-- ║  terminology separation (deliveryState vs authEvidence).  ║ -->
+<!-- ║  Refer to:                                                ║ -->
+<!-- ║    - CYCLE-8C-REV21-AUTH-EVIDENCE-LIFETIME.md              ║ -->
+<!-- ║  for the authoritative supplement.                          ║ -->
+<!-- ║  Rev20 remains authoritative for auth gate restoration and cross-product correction.  ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
 # CYCLE-8C-Rev20: Transaction Journal v4 — Auth Regression & Cross-Product Correction
 
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
