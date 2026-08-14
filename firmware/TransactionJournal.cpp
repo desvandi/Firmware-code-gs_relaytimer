@@ -200,30 +200,64 @@ bool TransactionJournal::_saveEntryToNVSAtomic(uint8_t idx) {
     return false;
   }
 
-  // --- R10J Phase 2: Set commit flag (SINGLE BYTE write) ---
-  // This is the commit point. Power loss before this line → entry uncommitted.
-  // Power loss during this line → putUChar is single-byte, very small window.
-  // Power loss after this line → entry is committed + CRC valid.
-  size_t commitWritten = prefs.putUChar(commitKey, 1);
-  if (commitWritten != 1) {
-    Serial.printf("[Journal] Phase 2 commit FAILED — entry uncommitted\n");
+  // --- R10K: Phase 1b — Persist writeIdx BEFORE commit flag ---
+  //
+  // Engineer audit R10J found critical failure ordering:
+  //   If commit flag = SUCCESS but writeIdx persist = FAIL:
+  //   → Entry is committed but writeIdx is old value
+  //   → On reboot, next write goes to SAME slot → OVERWRITES committed entry
+  //
+  // FIX R10K: writeIdx is persisted BEFORE commit flag.
+  // Ordering: Phase 0 (clear commit) → Phase 1 (write blob) → Phase 1b (writeIdx) → Phase 2 (commit)
+  //
+  // Failure scenarios:
+  //   - Phase 1b fails (writeIdx not persisted):
+  //     → commit flag still 0 → entry NOT committed → return false
+  //     → On reboot: entry rejected, writeIdx is old → next write to same slot is safe
+  //       (old entry was never committed, so overwriting it loses nothing)
+  //
+  //   - Phase 1b succeeds but Phase 2 fails (commit not set):
+  //     → writeIdx is advanced in NVS, but entry is uncommitted
+  //     → On reboot: writeIdx points to NEXT slot (skips uncommitted entry)
+  //     → Uncommitted entry's slot is "wasted" until LRU wraps around
+  //     → SAFE: no committed data lost, no overwrite
+  //
+  //   - Phase 2 succeeds (commit set):
+  //     → Entry is committed AND writeIdx is advanced
+  //     → On reboot: entry loaded, writeIdx points to next slot
+  //     → SAFE: no overwrite of committed entries
+  uint8_t nextWriteIdx = (_journalWriteIdx + 1) % JOURNAL_SIZE;
+  size_t widxWritten = prefs.putUChar(NVS_KEY_TJ_WIDX, nextWriteIdx);
+  if (widxWritten != 1) {
+    Serial.printf("[Journal] Phase 1b writeIdx persist FAILED — entry left uncommitted\n");
     prefs.end();
     _journalValid[idx] = false;
     return false;
   }
 
-  // R10J FIX: Write NEXT writeIdx to NVS (not current), so reboot doesn't
-  // overwrite the entry we just wrote.
-  // BUG WAS: previously wrote _journalWriteIdx (current slot) to NVS,
-  // then advanced RAM. On reboot, NVS had current slot → overwrite.
-  // FIX: advance RAM FIRST, then write advanced value to NVS.
-  uint8_t nextWriteIdx = (_journalWriteIdx + 1) % JOURNAL_SIZE;
-  prefs.putUChar(NVS_KEY_TJ_WIDX, nextWriteIdx);
+  // --- R10K: Phase 2 — Set commit flag (SINGLE BYTE write) ---
+  // This is the commit point. After this line, entry is durable.
+  // Power loss before this line → entry uncommitted (writeIdx may be advanced,
+  //   but that's safe — slot is skipped on boot)
+  // Power loss during this line → putUChar is single-byte, very small window
+  // Power loss after this line → entry is committed + writeIdx advanced + CRC valid
+  size_t commitWritten = prefs.putUChar(commitKey, 1);
+  if (commitWritten != 1) {
+    Serial.printf("[Journal] Phase 2 commit FAILED — writeIdx advanced but entry uncommitted\n");
+    prefs.end();
+    _journalValid[idx] = false;
+    // R10K: Don't revert writeIdx in RAM — NVS already has advanced value.
+    // On reboot, writeIdx will be the advanced value, which skips this slot.
+    // This is safe: the uncommitted slot is wasted but no committed data is lost.
+    _journalWriteIdx = nextWriteIdx;  // keep RAM in sync with NVS
+    return false;
+  }
+
+  // R10K: Update count (non-critical metadata)
   prefs.putUChar(NVS_KEY_TJ_COUNT, _journalSize + 1 < JOURNAL_SIZE ? _journalSize + 1 : JOURNAL_SIZE);
 
   prefs.end();
   _journalValid[idx] = true;
-  // R10J: advance RAM pointer to match NVS
   _journalWriteIdx = nextWriteIdx;
   if (_journalSize < JOURNAL_SIZE) _journalSize++;
   return true;
