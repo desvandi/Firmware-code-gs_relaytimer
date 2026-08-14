@@ -1,3 +1,16 @@
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  Superseded by Rev22 for: re-authentication after reboot (step ordering),  ║ -->
+<!-- ║  authenticationEvidence binding to requestId.  ║ -->
+<!-- ║  Refer to:                                                ║ -->
+<!-- ║    - CYCLE-8C-REV22-REAUTH-AND-BINDING.md                  ║ -->
+<!-- ║  for the authoritative supplement.                          ║ -->
+<!-- ║  Rev21 remains authoritative for evidence loss → RETAIN and event-time semantics.  ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
 # CYCLE-8C-Rev21: Transaction Journal v4 — Authentication Evidence Lifetime
 
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
