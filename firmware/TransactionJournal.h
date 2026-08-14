@@ -160,22 +160,36 @@ private:
 };
 
 // -----------------------------------------------------------------------------
-// AckRecord (Rev26 I3 — durable in tj_ackq blob, 256 bytes per record)
+// AckRecord (Rev26 I3 — durable in tj_ackq blob)
 //
-//   Layout (256 bytes total):
-//     [ackMagic:2] [ackVersion:1] [deliveryState:1]
-//     [requestIdLen:1] [requestId:var (max 64)]
-//     [commandHashLen:1] [commandHash:var (max 64)]
-//     [retryCount:1] [lastAttemptTs:4]
-//     [ackLen:2] [ackJson:var (max 1024)]
-//     [padding to 256 bytes]
+//   P2-1 CORRECTION (auditor P0-1): previous layout had ACK_RECORD_SIZE=256
+//   with ACK JSON starting at offset 141, leaving only 115 bytes for ACK
+//   JSON — but MAX_ACK_JSON_LEN=1024. This caused buffer overflow when ACK
+//   JSON exceeded 115 bytes (memcpy would write past buf[256]).
+//
+//   Corrected layout: ACK_RECORD_SIZE = 1280 bytes
+//     [0..1]     ackMagic (0x41, 0x51)
+//     [2]        ackVersion (1)
+//     [3]        deliveryState
+//     [4]        requestIdLen (0..64)
+//     [5..68]    requestId (var, padded to 64 bytes)
+//     [69]       commandHashLen (0..64)
+//     [70..133]  commandHash (var, padded to 64 bytes)
+//     [134]      retryCount
+//     [135..138] lastAttemptTs (uint32 LE)
+//     [139..140] ackLen (uint16 LE, 0..1024)
+//     [141..1164] ackJson (var, padded to 1024 bytes)
+//     [1165..1279] padding (zeros, 115 bytes)
+//
+//   ACK_QUEUE_BLOB_SIZE = 4 + (1280 * 8) + 4 = 10248 bytes
+//   Fits within ESP32 NVS blob limit (~50KB).
 // -----------------------------------------------------------------------------
 static const uint16_t ACK_MAGIC1 = 0x41;  // 'A'
 static const uint16_t ACK_MAGIC2 = 0x51;  // 'Q'
 static const uint8_t  ACK_VERSION = 1;
-static const uint16_t ACK_RECORD_SIZE = 256;
+static const uint16_t ACK_RECORD_SIZE = 1280;  // P2-1 correction: was 256, now fits MAX_ACK_JSON_LEN=1024
 static const uint8_t  ACK_QUEUE_CAPACITY = 8;
-static const uint16_t ACK_QUEUE_BLOB_SIZE = 4 + (ACK_RECORD_SIZE * ACK_QUEUE_CAPACITY) + 4;  // 2056 bytes
+static const uint16_t ACK_QUEUE_BLOB_SIZE = 4 + (ACK_RECORD_SIZE * ACK_QUEUE_CAPACITY) + 4;  // 10248 bytes
 
 struct AckRecord {
   AckDeliveryState deliveryState;
@@ -248,7 +262,17 @@ public:
 
   // recoverCorruptedEntry(): operator-initiated recovery for CORRUPTED slots.
   // Writes EMPTY(gen=0) to both copies unconditionally.
+  // Looks up by requestId — scans ALL slots (including quarantined ones with
+  // inUse=false but requestId preserved in NVS).
+  // Returns false if no slot with matching requestId found.
   bool recoverCorruptedEntry(const String& requestId);
+
+  // P2-1 CORRECTION (auditor P1-5): Added slot-idx-based recovery API.
+  // Direct slot-idx access — use when operator knows which slot is quarantined
+  // (e.g., from serial output "slot N QUARANTINED").
+  // Writes EMPTY(gen=0) to both copies unconditionally.
+  // Returns false if slotIdx >= JOURNAL_SIZE or NVS write fails.
+  bool recoverCorruptedSlot(uint8_t slotIdx);
 
   // ===========================================================================
   // Lookup helpers (observation — read-only, no mutation)
@@ -270,14 +294,23 @@ public:
 
   // ===========================================================================
   // ACK delivery queue (Rev26 I3 — durable in tj_ackq blob)
+  //
+  //   P2-1 CORRECTION (auditor P1-6, P1-7): queueAck now returns bool — false
+  //   means ACK could not be queued (queue full with no droppable ACK).
+  //   commitTransaction() must check this return value and propagate failure.
   // ===========================================================================
-  void queueAck(const String& requestId, const String& ackJson);
+  bool queueAck(const String& requestId, const String& ackJson);
   uint8_t processPendingAcks();
   uint8_t getPendingAckCount() const { return _ackQueueCount; }
   void dequeueAck(const String& requestId);
 
   // Update ACK delivery state (called by MQTT client on PUBACK / PWA ack_confirm)
   bool updateAckDeliveryState(const String& requestId, AckDeliveryState newState);
+
+  // P2-1 CORRECTION (auditor P1-9): Boot merge — add missing ACK entries from
+  // journal COMMITTED slots to ACK queue. Called internally by begin() after
+  // _loadFromNVS + _loadAckQueue.
+  void _mergeAckQueueFromJournal();
 
   // ===========================================================================
   // Test/introspection helpers (for host test harness — not for production callers)

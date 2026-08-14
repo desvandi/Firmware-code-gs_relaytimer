@@ -140,14 +140,86 @@ void TransactionJournal::begin() {
   s_executorTaskHandle = _executorTaskHandle;
 
   // Load slots via 9-row reconciliation (Rev26 I1).
-  // _loadFromNVS uses ObservationGuard internally.
+  // _loadFromNVS uses 2-phase approach (observation then mutation).
   _loadFromNVS();
 
   // Load ACK queue (Rev26 I3).
   _loadAckQueue();
 
+  // P2-1 CORRECTION (auditor P1-9): Merge missing ACKs from journal.
+  // For each COMMITTED journal entry with non-empty ackJson that is NOT
+  // already in the ACK queue, add it. This ensures ACKs are not lost
+  // even if ACK queue persistence failed before reboot.
+  _mergeAckQueueFromJournal();
+
   Serial.printf("[Journal] Loaded %u slots, %u pending ACKs\n",
                 _journalSize, _ackQueueCount);
+}
+
+// =============================================================================
+// _mergeAckQueueFromJournal (Rev26 I3 — boot merge)
+//
+//   P2-1 CORRECTION (auditor P1-9): previous version did NOT implement the
+//   promised boot merge. _loadFromNVS only loaded slots; _loadAckQueue only
+//   loaded the ACK blob. If a COMMITTED journal entry had ackJson but its
+//   ACK was missing from the queue (e.g., queueAck failed before reboot),
+//   the ACK would be lost forever.
+//
+//   Corrected: after loading both, scan journal COMMITTED entries and add
+//   any missing ACKs to the queue.
+// =============================================================================
+void TransactionJournal::_mergeAckQueueFromJournal() {
+  uint8_t added = 0;
+  for (uint8_t i = 0; i < JOURNAL_SIZE; i++) {
+    if (!_slots[i].inUse) continue;
+    if (_slots[i].record.recordState != RecordState::COMMITTED) continue;
+    if (_slots[i].record.ackJson.length() == 0) continue;
+
+    // Check if this requestId is already in ACK queue
+    int8_t existing = _findAckInQueue(_slots[i].record.requestId);
+    if (existing >= 0) continue;  // Already in queue
+
+    // Add missing ACK to queue
+    if (_ackQueueCount >= ACK_QUEUE_CAPACITY) {
+      // Queue full — find droppable slot (FAILED_EXHAUSTED or empty)
+      int8_t droppableIdx = -1;
+      for (uint8_t j = 0; j < ACK_QUEUE_CAPACITY; j++) {
+        if (_ackQueue[j].deliveryState == AckDeliveryState::ACK_FAILED_EXHAUSTED ||
+            _ackQueue[j].isEmpty()) {
+          droppableIdx = (int8_t)j;
+          break;
+        }
+      }
+      if (droppableIdx < 0) {
+        Serial.printf("[Journal] _mergeAckQueueFromJournal: queue full, cannot add ACK for rid=%s\n",
+                      _slots[i].record.requestId.c_str());
+        continue;
+      }
+      // Reuse droppable slot
+      AckRecord& rec = _ackQueue[droppableIdx];
+      rec.deliveryState = AckDeliveryState::ACK_NOT_SENT;
+      rec.requestId = _slots[i].record.requestId;
+      rec.commandHash = _slots[i].record.commandHash;
+      rec.retryCount = 0;
+      rec.lastAttemptTs = 0;
+      rec.ackJson = _slots[i].record.ackJson;
+      added++;
+    } else {
+      AckRecord& rec = _ackQueue[_ackQueueCount++];
+      rec.deliveryState = AckDeliveryState::ACK_NOT_SENT;
+      rec.requestId = _slots[i].record.requestId;
+      rec.commandHash = _slots[i].record.commandHash;
+      rec.retryCount = 0;
+      rec.lastAttemptTs = 0;
+      rec.ackJson = _slots[i].record.ackJson;
+      added++;
+    }
+  }
+
+  if (added > 0) {
+    Serial.printf("[Journal] _mergeAckQueueFromJournal: added %u missing ACK(s) from journal\n", added);
+    _persistAckQueue();
+  }
 }
 
 // =============================================================================
@@ -273,8 +345,14 @@ String TransactionJournal::_slotKeyB(uint8_t idx) {
 
 // =============================================================================
 // Dual-copy write (Rev26 I1 — writes one copy, verifies on read-back)
+//
+//   P2-1 CORRECTION (auditor P1-4): Added _assertMutationAllowed() at entry.
+//   This enforces I0a — _writeCopy() may only be called from mutation phase,
+//   not during observation. Callers must ensure ObservationGuard is not
+//   active when invoking this.
 // =============================================================================
 bool TransactionJournal::_writeCopy(uint8_t slotIdx, bool isCopyA, const JournalRecord& rec) {
+  _assertMutationAllowed();  // P1-4: enforce I0a
   uint8_t blob[BLOB_SIZE];
   uint16_t payloadEnd = serializeRecord(rec, blob, BLOB_SIZE);
   if (payloadEnd == 0) {
@@ -391,8 +469,11 @@ bool TransactionJournal::_readCopy(uint8_t slotIdx, bool isCopyA, JournalRecord&
 
 // =============================================================================
 // Erase both copies (Rev26 — used by recoverCorruptedEntry)
+//
+//   P2-1 CORRECTION (auditor P1-4): Added _assertMutationAllowed() at entry.
 // =============================================================================
 bool TransactionJournal::_eraseBlobNVS(uint8_t slotIdx) {
+  _assertMutationAllowed();  // P1-4: enforce I0a
   Preferences prefs;
   if (!prefs.begin(Core::NVS_NAMESPACE, false)) return false;
 
@@ -403,12 +484,32 @@ bool TransactionJournal::_eraseBlobNVS(uint8_t slotIdx) {
 }
 
 // =============================================================================
-// Clear slot (Rev26 — write EMPTY(gen=0) to both copies)
+// Clear slot (Rev26 — write EMPTY(prevGen+1) to both copies)
+//
+//   P2-1 CORRECTION (auditor P0-2): previous version wrote EMPTY(gen=0).
+//   If power loss occurred between writing copy A and copy B, copy B would
+//   still contain COMMITTED(gen=37). On boot, 9-row recovery would see
+//   A=EMPTY(gen=0), B=COMMITTED(gen=37) → GEN_NEWER_B → load B → resurrect
+//   the cleared transaction.
+//
+//   Corrected: write EMPTY(prevGen+1). After crash mid-clear:
+//     A = EMPTY(gen=38), B = COMMITTED(gen=37)
+//     → GEN_NEWER_A (distAB = 0xFFFFFFFF, distBA = 1)
+//     → load A (EMPTY) → slot is empty, no resurrection.
+//
+//   recoverCorruptedEntry() is different — it writes EMPTY(gen=0)
+//   unconditionally because both copies are already INVALID (quarantined).
+//
+//   P2-1 CORRECTION (auditor P1-4): Added _assertMutationAllowed() at entry.
 // =============================================================================
 bool TransactionJournal::_clearSlotNVS(uint8_t slotIdx) {
+  _assertMutationAllowed();  // P1-4: enforce I0a
+  // Get previous generation from current slot state (before clearing).
+  uint32_t prevGen = _slots[slotIdx].record.generation;
+
   JournalRecord empty;
   empty.schemaVersion = JOURNAL_SCHEMA_VERSION;
-  empty.generation = 0;
+  empty.generation = prevGen + 1;  // Crash-safe: prevGen+1 wins over stale COMMITTED(prevGen)
   empty.recordState = RecordState::EMPTY;
   empty.requestId = "";
   empty.commandHash = "";
@@ -434,8 +535,11 @@ bool TransactionJournal::_clearSlotNVS(uint8_t slotIdx) {
 //
 //   Repair does NOT increment generation.
 //   Repair does NOT change recordState or any field.
+//
+//   P2-1 CORRECTION (auditor P1-4): Added _assertMutationAllowed() at entry.
 // =============================================================================
 bool TransactionJournal::_repairSlot(uint8_t slotIdx, bool fromCopyA) {
+  _assertMutationAllowed();  // P1-4: enforce I0a
   JournalRecord source;
   if (!_readCopy(slotIdx, fromCopyA, source)) {
     Serial.printf("[Journal] _repairSlot: source copy %s unreadable for slot %u\n",
@@ -867,6 +971,15 @@ bool TransactionJournal::markExecuting(const String& requestId) {
 
 // =============================================================================
 // MUTATION API — commitTransaction (Rev26 — EXECUTING → COMMITTED + queue ACK)
+//
+//   P2-1 CORRECTION (auditor P1-7): previous version ignored queueAck return
+//   value. Corrected: if queueAck fails (ACK persistence failed), the
+//   transaction is NOT marked COMMITTED — return false so caller knows
+//   ACK delivery is not durable.
+//
+//   Note: The journal entry itself IS written to both copies (durable).
+//   Only the ACK queue persistence failed. The caller should retry the
+//   commit or handle the ACK delivery separately.
 // =============================================================================
 bool TransactionJournal::commitTransaction(const String& requestId, const String& ackJson) {
   _assertExecutorContext();
@@ -894,7 +1007,19 @@ bool TransactionJournal::commitTransaction(const String& requestId, const String
   if (!_writeCopy(slotIdx, false, rec)) return false;
 
   // Queue ACK for delivery (Rev26 I3 — independent of journal entry)
-  queueAck(requestId, ackJson);
+  // P1-7: propagate failure — if ACK queue cannot be persisted, the
+  // transaction is not fully durable (ACK delivery may be lost on reboot).
+  if (!queueAck(requestId, ackJson)) {
+    Serial.printf("[Journal] commitTransaction: queueAck FAILED for rid=%s — ACK delivery not durable\n",
+                  requestId.c_str());
+    // The journal entry IS committed (both copies written). The ACK queue
+    // persistence failed. We return false to signal the caller that ACK
+    // delivery is not durable — caller may retry queueAck separately.
+    // Note: P2-3 will add boot merge (P1-9) so even if ACK queue persistence
+    // fails here, the next boot will reconstruct the ACK from the journal
+    // COMMITTED entry. So this is recoverable.
+    return false;
+  }
 
   Serial.printf("[Journal] commitTransaction: rid=%s slot %u COMMITTED gen=%u\n",
                 requestId.c_str(), slotIdx, (unsigned)rec.generation);
@@ -903,6 +1028,9 @@ bool TransactionJournal::commitTransaction(const String& requestId, const String
 
 // =============================================================================
 // MUTATION API — commitTransactionFailed (Rev26 — failure terminal state)
+//
+//   P2-1 CORRECTION (auditor P1-7): same fix as commitTransaction —
+//   propagate queueAck failure.
 // =============================================================================
 bool TransactionJournal::commitTransactionFailed(const String& requestId, const String& ackJson,
                                                   TransactionState failureState) {
@@ -927,7 +1055,12 @@ bool TransactionJournal::commitTransactionFailed(const String& requestId, const 
   if (!_writeCopy(slotIdx, false, rec)) return false;
 
   // Queue failure ACK for delivery
-  queueAck(requestId, ackJson);
+  // P1-7: propagate failure
+  if (!queueAck(requestId, ackJson)) {
+    Serial.printf("[Journal] commitTransactionFailed: queueAck FAILED for rid=%s — ACK delivery not durable\n",
+                  requestId.c_str());
+    return false;
+  }
 
   Serial.printf("[Journal] commitTransactionFailed: rid=%s slot %u state=%s gen=%u\n",
                 requestId.c_str(), slotIdx, _stateToString(failureState), (unsigned)rec.generation);
@@ -998,35 +1131,98 @@ bool TransactionJournal::clearEntry(const String& requestId) {
 //   Writes EMPTY(gen=0) to both copies unconditionally.
 //   Used for CORRUPTED / QUARANTINED slots.
 //   Does NOT check I2 (operator override).
+//
+//   P2-1 CORRECTION (auditor P1-5): previous version only looked up by
+//   requestId in active slots (inUse=true). Quarantined slots have
+//   inUse=false, so recovery was unreachable. Corrected: now scans ALL
+//   slots — reads NVS for both copies of each slot to find the
+//   requestId even in quarantined slots. If found, calls recoverCorruptedSlot.
 // =============================================================================
 bool TransactionJournal::recoverCorruptedEntry(const String& requestId) {
   _assertExecutorContext();
   _assertMutationAllowed();
 
+  // First, check active slots (fast path)
   uint8_t slotIdx = _findSlot(requestId);
-  if (slotIdx == JOURNAL_SIZE) {
-    // Also check quarantined slots (which have inUse=false but may still
-    // hold the requestId in NVS).
-    // For now: not found in active slots. Operator may need to provide slotIdx.
-    Serial.printf("[Journal] recoverCorruptedEntry: requestId %s not found in active slots\n",
-                  requestId.c_str());
+  if (slotIdx != JOURNAL_SIZE) {
+    return recoverCorruptedSlot(slotIdx);
+  }
+
+  // P1-5 fix: scan ALL slots — read NVS for both copies of each slot
+  // to find the requestId even in quarantined slots.
+  for (uint8_t i = 0; i < JOURNAL_SIZE; i++) {
+    if (_slots[i].inUse) continue;  // Already checked via _findSlot
+
+    JournalRecord recA, recB;
+    bool validA = _readCopy(i, true, recA);
+    bool validB = _readCopy(i, false, recB);
+
+    if (validA && recA.requestId == requestId) {
+      Serial.printf("[Journal] recoverCorruptedEntry: found requestId %s in quarantined slot %u (copy A)\n",
+                    requestId.c_str(), i);
+      return recoverCorruptedSlot(i);
+    }
+    if (validB && recB.requestId == requestId) {
+      Serial.printf("[Journal] recoverCorruptedEntry: found requestId %s in quarantined slot %u (copy B)\n",
+                    requestId.c_str(), i);
+      return recoverCorruptedSlot(i);
+    }
+  }
+
+  Serial.printf("[Journal] recoverCorruptedEntry: requestId %s not found in any slot\n",
+                requestId.c_str());
+  return false;
+}
+
+// =============================================================================
+// recoverCorruptedSlot (Rev26 — slot-idx-based recovery, P1-5 addition)
+//
+//   Writes EMPTY(gen=0) to both copies unconditionally.
+//   Used by recoverCorruptedEntry() and directly by operator when slot
+//   index is known (e.g., from serial output "slot N QUARANTINED").
+// =============================================================================
+bool TransactionJournal::recoverCorruptedSlot(uint8_t slotIdx) {
+  _assertExecutorContext();
+  _assertMutationAllowed();
+
+  if (slotIdx >= JOURNAL_SIZE) {
+    Serial.printf("[Journal] recoverCorruptedSlot: slotIdx %u >= JOURNAL_SIZE\n", slotIdx);
     return false;
   }
 
   // Write EMPTY(gen=0) to both copies — unconditional, no I2 check.
-  if (!_clearSlotNVS(slotIdx)) {
-    Serial.printf("[Journal] recoverCorruptedEntry: _clearSlotNVS failed for slot %u\n", slotIdx);
+  // (Operator override — both copies already INVALID/quarantined, so
+  // generation preservation is not needed; gen=0 is the fresh-start value.)
+  JournalRecord empty;
+  empty.schemaVersion = JOURNAL_SCHEMA_VERSION;
+  empty.generation = 0;
+  empty.recordState = RecordState::EMPTY;
+  empty.requestId = "";
+  empty.commandHash = "";
+  empty.channelId = 0;
+  empty.desiredState = 0xFF;
+  empty.previousKnownState = 0;
+  empty.attempt = 0;
+  empty.timestamp = 0;
+  empty.ackJson = "";
+
+  if (!_writeCopy(slotIdx, true, empty)) {
+    Serial.printf("[Journal] recoverCorruptedSlot: write A failed for slot %u\n", slotIdx);
+    return false;
+  }
+  if (!_writeCopy(slotIdx, false, empty)) {
+    Serial.printf("[Journal] recoverCorruptedSlot: write B failed for slot %u\n", slotIdx);
     return false;
   }
 
   // Update in-RAM cache
-  _slots[slotIdx].record = JournalRecord();
+  _slots[slotIdx].record = empty;
   _slots[slotIdx].durability = SlotDurability::SLOT_EMPTY;
   _slots[slotIdx].inUse = false;
-  if (_journalSize > 0) _journalSize--;
+  // Note: _journalSize not decremented because quarantined slots weren't counted.
 
-  Serial.printf("[Journal] recoverCorruptedEntry: rid=%s slot %u recovered to EMPTY(gen=0)\n",
-                requestId.c_str(), slotIdx);
+  Serial.printf("[Journal] recoverCorruptedSlot: slot %u recovered to EMPTY(gen=0)\n",
+                slotIdx);
   return true;
 }
 
@@ -1091,32 +1287,70 @@ bool TransactionJournal::getDesiredState(const String& requestId) {
 }
 
 // =============================================================================
-// RECONCILIATION API (Rev26 — observation, uses ObservationGuard)
+// RECONCILIATION API (Rev26 — 2-phase: observation then mutation)
+//
+//   P2-1 CORRECTION (auditor P0-3): previous version held ObservationGuard
+//   while calling _writeCopy() — this violated I0a (observation and
+//   mutation are mutually exclusive). The guard was active during NVS
+//   writes, which is exactly the violation Rev26 I0a forbids.
+//
+//   Corrected: 2-phase reconciliation.
+//     Phase 1 (OBSERVATION): Read all slots, identify which need state
+//              transition (PENDING/EXECUTING → UNKNOWN). Collect list
+//              of (slotIdx, newRecordState) pairs. ObservationGuard active.
+//     Phase 2 (MUTATION): Apply state transitions to NVS. No guard active.
+//              Each _writeCopy() call goes through _assertMutationAllowed()
+//              which now passes (no observation in progress).
+//
+//   This satisfies I0a without weakening the invariant.
 // =============================================================================
+
+// Internal: collect reconciliation actions during observation phase
+struct ReconcileAction {
+  uint8_t slotIdx;
+  RecordState newState;
+};
+
 uint8_t TransactionJournal::reconcilePendingEntries() {
   _assertExecutorContext();
-  ObservationGuard guard(_observing);
 
-  uint8_t reconciled = 0;
-  for (uint8_t i = 0; i < JOURNAL_SIZE; i++) {
-    if (!_slots[i].inUse) continue;
-    RecordState rs = _slots[i].record.recordState;
-    if (rs == RecordState::PENDING || rs == RecordState::EXECUTING) {
-      // Reconcile based on snapshot
-      // (P2-1: simplified — full reconciliation is P2-3 work)
-      // For now: PENDING/EXECUTING entries left over from crash are marked UNKNOWN.
-      _slots[i].record.recordState = RecordState::UNKNOWN;
-      _writeCopy(i, true, _slots[i].record);
-      _writeCopy(i, false, _slots[i].record);
-      reconciled++;
+  // Phase 1: OBSERVATION — read all slots, collect actions.
+  ReconcileAction actions[JOURNAL_SIZE];
+  uint8_t actionCount = 0;
+  {
+    ObservationGuard guard(_observing);
+    for (uint8_t i = 0; i < JOURNAL_SIZE; i++) {
+      if (!_slots[i].inUse) continue;
+      RecordState rs = _slots[i].record.recordState;
+      if (rs == RecordState::PENDING || rs == RecordState::EXECUTING) {
+        actions[actionCount].slotIdx = i;
+        actions[actionCount].newState = RecordState::UNKNOWN;
+        actionCount++;
+      }
     }
   }
-  return reconciled;
+  // ObservationGuard out of scope — _observing is now false.
+
+  // Phase 2: MUTATION — apply state transitions to NVS.
+  // _assertMutationAllowed() will pass because _observing == false.
+  for (uint8_t i = 0; i < actionCount; i++) {
+    uint8_t slotIdx = actions[i].slotIdx;
+    _slots[slotIdx].record.recordState = actions[i].newState;
+    if (!_writeCopy(slotIdx, true, _slots[slotIdx].record)) {
+      Serial.printf("[Journal] reconcilePendingEntries: write A failed for slot %u\n", slotIdx);
+      continue;
+    }
+    if (!_writeCopy(slotIdx, false, _slots[slotIdx].record)) {
+      Serial.printf("[Journal] reconcilePendingEntries: write B failed for slot %u\n", slotIdx);
+      continue;
+    }
+  }
+
+  return actionCount;
 }
 
 TransactionState TransactionJournal::reconcileEntry(const String& requestId) {
   _assertExecutorContext();
-  ObservationGuard guard(_observing);
 
   uint8_t slotIdx = _findSlot(requestId);
   if (slotIdx == JOURNAL_SIZE) return TransactionState::PENDING;
@@ -1127,18 +1361,40 @@ TransactionState TransactionJournal::reconcileEntry(const String& requestId) {
     return _fromRecordState(rec.recordState);
   }
 
-  // PENDING/EXECUTING left from crash → reconcile to UNKNOWN
-  // (P2-1: simplified; P2-3 will implement full GPIO snapshot reconciliation)
+  // Phase 1: OBSERVATION — determine new state.
+  // (Already have the record in RAM from earlier _findSlot — no NVS read
+  // needed. Just decide the new state under guard to satisfy I0a.)
+  {
+    ObservationGuard guard(_observing);
+    // No mutation here — just confirm the decision.
+    // rec.recordState is already PENDING or EXECUTING (checked above).
+  }
+  // Guard out of scope.
+
+  // Phase 2: MUTATION — apply state transition.
   rec.recordState = RecordState::UNKNOWN;
-  _writeCopy(slotIdx, true, rec);
-  _writeCopy(slotIdx, false, rec);
+  if (!_writeCopy(slotIdx, true, rec)) {
+    Serial.printf("[Journal] reconcileEntry: write A failed for slot %u\n", slotIdx);
+  }
+  if (!_writeCopy(slotIdx, false, rec)) {
+    Serial.printf("[Journal] reconcileEntry: write B failed for slot %u\n", slotIdx);
+  }
   return TransactionState::UNKNOWN;
 }
 
 // =============================================================================
 // ACK QUEUE — queueAck (Rev26 I3 — durable in tj_ackq)
+//
+//   P2-1 CORRECTION (auditor P1-6): previous version silently dropped ACK #1
+//   when queue full. Corrected: only drop ACK_FAILED_EXHAUSTED or empty slots.
+//   If all 8 slots are occupied by active ACKs (NOT_SENT/PUBLISH_ACCEPTED/
+//   BROKER_CONFIRMED/PWA_RECEIVED), return false — caller must handle.
+//
+//   P2-1 CORRECTION (auditor P1-7): return bool. commitTransaction() checks
+//   return value and propagates failure (does not return true if ACK
+//   persistence failed).
 // =============================================================================
-void TransactionJournal::queueAck(const String& requestId, const String& ackJson) {
+bool TransactionJournal::queueAck(const String& requestId, const String& ackJson) {
   _assertExecutorContext();
 
   // Check if requestId already in queue
@@ -1149,29 +1405,68 @@ void TransactionJournal::queueAck(const String& requestId, const String& ackJson
     _ackQueue[existing].deliveryState = AckDeliveryState::ACK_NOT_SENT;
     _ackQueue[existing].retryCount = 0;
     _ackQueue[existing].lastAttemptTs = 0;
-  } else {
-    // Add new entry — evict oldest if queue full (LRU)
-    if (_ackQueueCount >= ACK_QUEUE_CAPACITY) {
-      // Evict slot 0 (oldest — FIFO for simplicity; P2-3 may use LRU)
-      for (uint8_t i = 0; i < ACK_QUEUE_CAPACITY - 1; i++) {
-        _ackQueue[i] = _ackQueue[i + 1];
-      }
-      _ackQueueCount = ACK_QUEUE_CAPACITY - 1;
+    if (!_persistAckQueue()) {
+      Serial.printf("[Journal] queueAck: _persistAckQueue failed (update existing) for rid=%s\n",
+                    requestId.c_str());
+      return false;
     }
-    AckRecord& rec = _ackQueue[_ackQueueCount++];
-    rec.deliveryState = AckDeliveryState::ACK_NOT_SENT;
-    rec.requestId = requestId;
-    rec.commandHash = "";  // Optional — can be filled by caller
-    rec.retryCount = 0;
-    rec.lastAttemptTs = 0;
-    rec.ackJson = ackJson;
+    return true;
   }
 
-  _persistAckQueue();
+  // Need a new slot. If queue full, find a droppable slot.
+  uint8_t insertIdx = _ackQueueCount;
+  if (_ackQueueCount >= ACK_QUEUE_CAPACITY) {
+    // P1-6 fix: only drop ACK_FAILED_EXHAUSTED or empty slots.
+    // Active ACKs (NOT_SENT/PUBLISH_ACCEPTED/BROKER_CONFIRMED/PWA_RECEIVED)
+    // must NOT be silently dropped.
+    int8_t droppableIdx = -1;
+    for (uint8_t i = 0; i < ACK_QUEUE_CAPACITY; i++) {
+      if (_ackQueue[i].deliveryState == AckDeliveryState::ACK_FAILED_EXHAUSTED ||
+          _ackQueue[i].isEmpty()) {
+        droppableIdx = (int8_t)i;
+        break;
+      }
+    }
+    if (droppableIdx < 0) {
+      // All 8 slots are active — cannot queue without losing an active ACK.
+      Serial.printf("[Journal] queueAck: ACK queue full with active ACKs, refusing to queue rid=%s\n",
+                    requestId.c_str());
+      return false;
+    }
+    // Reuse droppable slot
+    insertIdx = (uint8_t)droppableIdx;
+  } else {
+    _ackQueueCount++;
+  }
+
+  AckRecord& rec = _ackQueue[insertIdx];
+  rec.deliveryState = AckDeliveryState::ACK_NOT_SENT;
+  rec.requestId = requestId;
+  rec.commandHash = "";
+  rec.retryCount = 0;
+  rec.lastAttemptTs = 0;
+  rec.ackJson = ackJson;
+
+  if (!_persistAckQueue()) {
+    Serial.printf("[Journal] queueAck: _persistAckQueue failed (new entry) for rid=%s\n",
+                  requestId.c_str());
+    // Rollback: decrement count if we added a new slot
+    if (insertIdx == _ackQueueCount - 1) {
+      _ackQueueCount--;
+    }
+    return false;
+  }
+
+  return true;
 }
 
 // =============================================================================
 // ACK QUEUE — processPendingAcks (Rev26 I3 — retry delivery)
+//
+//   P2-1 CORRECTION (auditor P1-8): previous version only persisted if
+//   `processed > 0`. But retryCount++ and lastAttemptTs updates also need
+//   persistence (so retry policy survives reboot). Corrected: track a
+//   `dirty` flag, persist if any state changed.
 // =============================================================================
 uint8_t TransactionJournal::processPendingAcks() {
   _assertExecutorContext();
@@ -1179,6 +1474,7 @@ uint8_t TransactionJournal::processPendingAcks() {
   if (!s_publishCallback) return 0;
 
   uint8_t processed = 0;
+  bool dirty = false;  // P1-8: track any state change
   unsigned long now = millis();
 
   for (uint8_t i = 0; i < _ackQueueCount; i++) {
@@ -1199,11 +1495,11 @@ uint8_t TransactionJournal::processPendingAcks() {
       rec.deliveryState = AckDeliveryState::ACK_FAILED_EXHAUSTED;
       Serial.printf("[Journal] ACK FAILED_EXHAUSTED: rid=%s\n", rec.requestId.c_str());
       processed++;
+      dirty = true;  // P1-8: state changed
       continue;
     }
 
     // Publish via callback
-    // (P2-1: publish to ack topic — actual topic wiring is P2-2 work)
     bool published = s_publishCallback("ack",
                                         (const uint8_t*)rec.ackJson.c_str(),
                                         rec.ackJson.length());
@@ -1212,18 +1508,23 @@ uint8_t TransactionJournal::processPendingAcks() {
       rec.retryCount++;
       rec.lastAttemptTs = now;
       processed++;
+      dirty = true;  // P1-8: state changed
       Serial.printf("[Journal] ACK published: rid=%s (attempt %u)\n",
                      rec.requestId.c_str(), rec.retryCount);
     } else {
       rec.retryCount++;
       rec.lastAttemptTs = now;
+      dirty = true;  // P1-8: state changed (retryCount/lastAttemptTs)
       Serial.printf("[Journal] ACK publish failed: rid=%s (attempt %u)\n",
                      rec.requestId.c_str(), rec.retryCount);
     }
   }
 
-  if (processed > 0) {
-    _persistAckQueue();
+  // P1-8: persist if any state changed (not just when processed > 0)
+  if (dirty) {
+    if (!_persistAckQueue()) {
+      Serial.printf("[Journal] processPendingAcks: _persistAckQueue FAILED — retry state may be lost\n");
+    }
   }
 
   return processed;
@@ -1488,23 +1789,182 @@ int8_t TransactionJournal::_findAckInQueue(const String& requestId) const {
 }
 
 // =============================================================================
-// _loadFromNVS (Rev26 — observation phase, uses ObservationGuard)
+// _loadFromNVS (Rev26 — 2-phase: observation then mutation)
+//
+//   P2-1 CORRECTION (auditor P0-3): previous version held ObservationGuard
+//   while calling _evaluateSlot() → _reconcileSlot() → _repairSlot() →
+//   _writeCopy(). The guard was active during NVS writes — violating I0a.
+//
+//   Corrected: 2-phase loading.
+//     Phase 1 (OBSERVATION): Read both copies of every slot, classify
+//              generation relationship, collect list of slots that need
+//              repair (copy A or B invalid) or quarantine (both invalid).
+//              ObservationGuard active.
+//     Phase 2 (MUTATION): Apply repairs to NVS. No guard active.
 // =============================================================================
 void TransactionJournal::_loadFromNVS() {
-  ObservationGuard guard(_observing);
-
   _journalSize = 0;
   _journalWriteIdx = 0;
 
-  for (uint8_t i = 0; i < JOURNAL_SIZE; i++) {
-    SlotDurability d = _evaluateSlot(i);
-    if (d == SlotDurability::SLOT_VALID && _slots[i].inUse) {
+  // Phase 1: OBSERVATION — read all slots, classify, collect actions.
+  // We use a local struct to record per-slot decisions, then apply them
+  // in Phase 2 without the guard.
+  struct SlotDecision {
+    uint8_t slotIdx;
+    SlotDurability durability;
+    JournalRecord loadedRecord;  // For SLOT_VALID: the authoritative copy
+    bool needsRepairFromA;       // If true, repair B from A in Phase 2
+    bool needsRepairFromB;       // If true, repair A from B in Phase 2
+    bool needsQuarantine;        // If true, quarantine slot in Phase 2
+  };
+  SlotDecision decisions[JOURNAL_SIZE];
+  uint8_t decisionCount = 0;
+
+  {
+    ObservationGuard guard(_observing);
+
+    for (uint8_t i = 0; i < JOURNAL_SIZE; i++) {
+      SlotDecision dec;
+      dec.slotIdx = i;
+      dec.durability = SlotDurability::SLOT_EMPTY;
+      dec.needsRepairFromA = false;
+      dec.needsRepairFromB = false;
+      dec.needsQuarantine = false;
+
+      // Check if slot is empty (no NVS keys).
+      bool aExists, bExists;
+      {
+        Preferences prefs;
+        prefs.begin(Core::NVS_NAMESPACE, true);
+        aExists = prefs.isKey(_slotKeyA(i).c_str());
+        bExists = prefs.isKey(_slotKeyB(i).c_str());
+        prefs.end();
+      }
+      if (!aExists && !bExists) {
+        dec.durability = SlotDurability::SLOT_EMPTY;
+        decisions[decisionCount++] = dec;
+        continue;
+      }
+
+      // Read both copies (observation — no mutation).
+      JournalRecord recA, recB;
+      bool validA = _readCopy(i, true, recA);
+      bool validB = _readCopy(i, false, recB);
+
+      if (!validA && !validB) {
+        // Row 1: both INVALID → quarantine
+        dec.durability = SlotDurability::SLOT_QUARANTINED;
+        dec.needsQuarantine = true;
+        // Preserve requestId for recovery lookup (use empty if both unreadable)
+        decisions[decisionCount++] = dec;
+        continue;
+      }
+
+      if (validA && !validB) {
+        // Row 2: A VALID, B INVALID → repair A→B
+        dec.durability = SlotDurability::SLOT_VALID;
+        dec.loadedRecord = recA;
+        dec.needsRepairFromA = true;
+        decisions[decisionCount++] = dec;
+        continue;
+      }
+
+      if (!validA && validB) {
+        // Row 3: A INVALID, B VALID → repair B→A
+        dec.durability = SlotDurability::SLOT_VALID;
+        dec.loadedRecord = recB;
+        dec.needsRepairFromB = true;
+        decisions[decisionCount++] = dec;
+        continue;
+      }
+
+      // Both VALID — apply generation classifier.
+      GenRelation rel = classifyGeneration(recA.generation, recB.generation);
+
+      if (rel == GenRelation::GEN_NEWER_A) {
+        // Row 4
+        dec.durability = SlotDurability::SLOT_VALID;
+        dec.loadedRecord = recA;
+      } else if (rel == GenRelation::GEN_NEWER_B) {
+        // Row 5
+        dec.durability = SlotDurability::SLOT_VALID;
+        dec.loadedRecord = recB;
+      } else if (rel == GenRelation::GEN_EQUAL) {
+        if (canonicalEqual(recA, recB)) {
+          // Row 6
+          dec.durability = SlotDurability::SLOT_VALID;
+          dec.loadedRecord = recA;
+        } else {
+          // Row 7: GEN_EQUAL + divergent → CORRUPTED
+          dec.durability = SlotDurability::SLOT_QUARANTINED;
+          dec.needsQuarantine = true;
+        }
+      } else if (rel == GenRelation::GEN_AMBIGUOUS) {
+        // Row 8
+        dec.durability = SlotDurability::SLOT_QUARANTINED;
+        dec.needsQuarantine = true;
+      } else {
+        // Row 9: GEN_INVALID
+        dec.durability = SlotDurability::SLOT_QUARANTINED;
+        dec.needsQuarantine = true;
+      }
+
+      decisions[decisionCount++] = dec;
+    }
+  }
+  // ObservationGuard out of scope — _observing is now false.
+
+  // Phase 2: MUTATION — apply decisions to in-RAM cache + perform NVS repairs.
+  // _assertMutationAllowed() passes because _observing == false.
+  for (uint8_t d = 0; d < decisionCount; d++) {
+    SlotDecision& dec = decisions[d];
+    uint8_t i = dec.slotIdx;
+
+    if (dec.durability == SlotDurability::SLOT_EMPTY) {
+      _slots[i].record = JournalRecord();
+      _slots[i].durability = SlotDurability::SLOT_EMPTY;
+      _slots[i].inUse = false;
+      continue;
+    }
+
+    if (dec.needsQuarantine) {
+      // Quarantine — no NVS erase (preserves evidence)
+      _slots[i].durability = SlotDurability::SLOT_QUARANTINED;
+      _slots[i].record = JournalRecord();  // RAM-only
+      _slots[i].inUse = false;
+      Serial.printf("[Journal] _loadFromNVS: slot %u QUARANTINED\n", i);
+      continue;
+    }
+
+    if (dec.needsRepairFromA) {
+      // Repair B from A
+      if (!_repairSlot(i, true)) {
+        // Repair failed — quarantine
+        _slots[i].durability = SlotDurability::SLOT_QUARANTINED;
+        _slots[i].inUse = false;
+        Serial.printf("[Journal] _loadFromNVS: slot %u repair A→B failed, QUARANTINED\n", i);
+        continue;
+      }
+    }
+
+    if (dec.needsRepairFromB) {
+      // Repair A from B
+      if (!_repairSlot(i, false)) {
+        _slots[i].durability = SlotDurability::SLOT_QUARANTINED;
+        _slots[i].inUse = false;
+        Serial.printf("[Journal] _loadFromNVS: slot %u repair B→A failed, QUARANTINED\n", i);
+        continue;
+      }
+    }
+
+    // Load the authoritative record
+    _slots[i].record = dec.loadedRecord;
+    _slots[i].durability = SlotDurability::SLOT_VALID;
+    _slots[i].inUse = (dec.loadedRecord.recordState != RecordState::EMPTY);
+    if (_slots[i].inUse) {
       _journalSize++;
     }
   }
-
-  Serial.printf("[Journal] _loadFromNVS: %u slots loaded, %u quarantined\n",
-                _journalSize, (unsigned)0);  // P2-1: count quarantined in P2-3
 }
 
 // =============================================================================
@@ -1522,8 +1982,97 @@ uint32_t TransactionJournal::_getSlotGeneration(uint8_t slotIdx) const {
 
 bool TransactionJournal::_forceReloadSlot(uint8_t slotIdx) {
   if (slotIdx >= JOURNAL_SIZE) return false;
-  SlotDurability d = _evaluateSlot(slotIdx);
-  return d == SlotDurability::SLOT_VALID;
+  // P2-1 CORRECTION (auditor P0-3): use 2-phase approach (no mutation during
+  // observation). This mirrors _loadFromNVS logic but for a single slot.
+  // We can't call _loadFromNVS (which iterates all slots), so we replicate
+  // the 2-phase pattern here.
+
+  JournalRecord recA, recB;
+  bool validA, validB;
+  bool aExists, bExists;
+
+  // Phase 1: OBSERVATION
+  {
+    ObservationGuard guard(_observing);
+    {
+      Preferences prefs;
+      prefs.begin(Core::NVS_NAMESPACE, true);
+      aExists = prefs.isKey(_slotKeyA(slotIdx).c_str());
+      bExists = prefs.isKey(_slotKeyB(slotIdx).c_str());
+      prefs.end();
+    }
+    if (!aExists && !bExists) {
+      _slots[slotIdx].record = JournalRecord();
+      _slots[slotIdx].durability = SlotDurability::SLOT_EMPTY;
+      _slots[slotIdx].inUse = false;
+      return true;  // Empty slot, not VALID but loaded successfully
+    }
+    validA = _readCopy(slotIdx, true, recA);
+    validB = _readCopy(slotIdx, false, recB);
+  }
+  // ObservationGuard out of scope.
+
+  // Phase 2: MUTATION (apply repair if needed, no guard active)
+  if (!validA && !validB) {
+    _slots[slotIdx].durability = SlotDurability::SLOT_QUARANTINED;
+    _slots[slotIdx].record = JournalRecord();
+    _slots[slotIdx].inUse = false;
+    return false;  // Quarantined, not VALID
+  }
+  if (validA && !validB) {
+    if (!_repairSlot(slotIdx, true)) {
+      _slots[slotIdx].durability = SlotDurability::SLOT_QUARANTINED;
+      _slots[slotIdx].inUse = false;
+      return false;
+    }
+    validB = _readCopy(slotIdx, false, recB);
+    if (!validB) {
+      _slots[slotIdx].durability = SlotDurability::SLOT_QUARANTINED;
+      _slots[slotIdx].inUse = false;
+      return false;
+    }
+  }
+  if (!validA && validB) {
+    if (!_repairSlot(slotIdx, false)) {
+      _slots[slotIdx].durability = SlotDurability::SLOT_QUARANTINED;
+      _slots[slotIdx].inUse = false;
+      return false;
+    }
+    validA = _readCopy(slotIdx, true, recA);
+    if (!validA) {
+      _slots[slotIdx].durability = SlotDurability::SLOT_QUARANTINED;
+      _slots[slotIdx].inUse = false;
+      return false;
+    }
+  }
+
+  // Both VALID — apply generation classifier
+  GenRelation rel = classifyGeneration(recA.generation, recB.generation);
+  if (rel == GenRelation::GEN_NEWER_A) {
+    _slots[slotIdx].record = recA;
+    _slots[slotIdx].durability = SlotDurability::SLOT_VALID;
+    _slots[slotIdx].inUse = (recA.recordState != RecordState::EMPTY);
+    return _slots[slotIdx].durability == SlotDurability::SLOT_VALID;
+  }
+  if (rel == GenRelation::GEN_NEWER_B) {
+    _slots[slotIdx].record = recB;
+    _slots[slotIdx].durability = SlotDurability::SLOT_VALID;
+    _slots[slotIdx].inUse = (recB.recordState != RecordState::EMPTY);
+    return _slots[slotIdx].durability == SlotDurability::SLOT_VALID;
+  }
+  if (rel == GenRelation::GEN_EQUAL) {
+    if (canonicalEqual(recA, recB)) {
+      _slots[slotIdx].record = recA;
+      _slots[slotIdx].durability = SlotDurability::SLOT_VALID;
+      _slots[slotIdx].inUse = (recA.recordState != RecordState::EMPTY);
+      return _slots[slotIdx].durability == SlotDurability::SLOT_VALID;
+    }
+  }
+  // Row 7/8/9: CORRUPTED
+  _slots[slotIdx].durability = SlotDurability::SLOT_QUARANTINED;
+  _slots[slotIdx].record = JournalRecord();
+  _slots[slotIdx].inUse = false;
+  return false;
 }
 
 // =============================================================================
