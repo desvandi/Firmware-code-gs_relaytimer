@@ -1,3 +1,14 @@
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  This document has been superseded by Rev13.               ║ -->
+<!-- ║  Refer to:                                                ║ -->
+<!-- ║    - CYCLE-8C-REV13-PRECEDENCE-CLOSURE.md                  ║ -->
+<!-- ║  for the authoritative current design.                     ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
 # CYCLE-8C-Rev10: Transaction Journal v4 — Final Closure
 
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
