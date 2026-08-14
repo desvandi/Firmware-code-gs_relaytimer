@@ -96,12 +96,27 @@ inline void handleScheduleUpsert() {
   sendSuccess("Schedule saved", data);
 }
 
-// DELETE /api/schedule?id=N
+// DELETE /api/schedule?id=N&channelId=C  OR  DELETE /api/schedule?id=N
+// audit-fixes-v2 (auditor #5 P1-2): schedule ID semantics were inconsistent:
+//   - MQTT status published id = (channelId * 10) + scheduleIndex + 1 (composite)
+//   - MQTT command upsert/delete used id = scheduleIndex within channel (1-4)
+//   - REST POST used id = scheduleIndex within channel (matches MQTT command)
+//   - REST DELETE used id = global sequential across all channels (1-48)
+//   This meant the same schedule ID from /api/status could mean different
+//   things in REST DELETE vs MQTT command.
+//
+//   Now REST DELETE accepts the composite ID format from MQTT status:
+//     id = (channelId * 10) + scheduleIndex + 1
+//   For backward compatibility, also accepts the old global-sequential format
+//   when channelId query param is NOT provided AND id > 48 (impossible composite).
+//   Preferred usage: pass channelId explicitly.
+//     DELETE /api/schedule?channelId=3&id=2   (deletes channel 3 schedule index 2)
+//     DELETE /api/schedule?id=32               (composite: channel 3 schedule 2)
 inline void handleScheduleDelete() {
   if (!requireAuth()) return;
   if (!requireCsrf()) return;
   if (!Web::http.hasArg("id")) {
-    sendError(400, "Missing id");
+    sendError(400, "Missing id (use ?id=N&channelId=C or composite id=N)");
     return;
   }
   int id = Web::http.arg("id").toInt();
@@ -109,22 +124,77 @@ inline void handleScheduleDelete() {
     sendError(400, "Invalid id");
     return;
   }
-  // Search across all channels
-  for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
-    if (id <= (int)Core::channels[i].schedCount) {
-      // Shift down
-      for (uint8_t j = id - 1; j < Core::channels[i].schedCount - 1; j++) {
-        Core::channels[i].sched[j] = Core::channels[i].sched[j + 1];
-      }
-      Core::channels[i].schedCount--;
-      Storage::config.markDirty();
-      Services::relayEngine.forceRefresh();
-      sendSuccess("Schedule deleted", "{\"deleted\":true}");
+
+  uint8_t targetChannel = 0;
+  uint8_t targetSchedIdx = 0;
+
+  // audit-fixes-v2 (P1-2): prefer explicit channelId param.
+  if (Web::http.hasArg("channelId")) {
+    int chId = Web::http.arg("channelId").toInt();
+    if (chId < 1 || chId > Core::NUM_CHANNELS) {
+      sendError(400, "Invalid channelId (1-12)");
       return;
     }
-    id -= Core::channels[i].schedCount;
+    if (id < 1 || id > Core::MAX_SCHEDULES) {
+      sendError(400, "Invalid schedule id (1-4 within channel)");
+      return;
+    }
+    targetChannel = (uint8_t)(chId - 1);
+    targetSchedIdx = (uint8_t)(id - 1);
+  } else {
+    // No channelId param — try composite ID format: id = (channelId * 10) + schedIdx + 1
+    // Composite IDs are >= 11 (channel 1 schedule 1 = 11).
+    if (id >= 11) {
+      targetChannel = (uint8_t)((id / 10) - 1);
+      targetSchedIdx = (uint8_t)((id % 10) - 1);
+      if (targetChannel >= Core::NUM_CHANNELS || targetSchedIdx >= Core::MAX_SCHEDULES) {
+        sendError(400, "Invalid composite id");
+        return;
+      }
+    } else {
+      // Legacy global-sequential format (id 1-48). Iterate channels.
+      // audit-fixes-v2: kept for backward compat with old PWA builds.
+      int remaining = id;
+      for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
+        if (remaining <= (int)Core::channels[i].schedCount) {
+          targetChannel = i;
+          targetSchedIdx = (uint8_t)(remaining - 1);
+          break;
+        }
+        remaining -= Core::channels[i].schedCount;
+      }
+      if (targetChannel >= Core::NUM_CHANNELS) {
+        sendError(404, "Schedule not found");
+        return;
+      }
+    }
   }
-  sendError(404, "Schedule not found");
+
+  // Validate schedule exists at the computed slot
+  if (targetSchedIdx >= Core::channels[targetChannel].schedCount) {
+    sendError(404, "Schedule not found at specified slot");
+    return;
+  }
+
+  // Shift down
+  for (uint8_t j = targetSchedIdx; j < Core::channels[targetChannel].schedCount - 1; j++) {
+    Core::channels[targetChannel].sched[j] = Core::channels[targetChannel].sched[j + 1];
+  }
+  Core::channels[targetChannel].schedCount--;
+  Storage::config.markDirty();
+  Services::relayEngine.forceRefresh();
+
+  int channelId = targetChannel + 1;
+  int scheduleId = targetSchedIdx + 1;
+  Services::Log.append(Core::LogType::ConfigChange,
+    "Schedule deleted via REST: CH" + String(channelId) + " idx=" + String(scheduleId),
+    channelId);
+
+  char data[128];
+  snprintf(data, sizeof(data),
+           "{\"deleted\":true,\"channelId\":%d,\"scheduleId\":%d}",
+           channelId, scheduleId);
+  sendSuccess("Schedule deleted", data);
 }
 
 }} // namespace Web::Handlers

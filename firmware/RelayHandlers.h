@@ -16,6 +16,11 @@
 namespace Web { namespace Handlers {
 
 // POST /api/relay { channelId, action, mode?, manualState? }
+// audit-fixes-v2 (auditor #4 P1-1): REST API previously accepted `action=toggle`
+//   which is non-idempotent. MQTT command contract already removed toggle for
+//   idempotency (only on/off/set_mode). REST API now matches — toggle is
+//   rejected with 400. Idempotent mutations are critical for retry safety:
+//   request → timeout → retry must not flip state twice.
 inline void handleRelay() {
   if (!requireAuth()) return;
   if (!requireCsrf()) return;
@@ -38,9 +43,7 @@ inline void handleRelay() {
   }
   uint8_t idx = channelId - 1;
 
-  if (strcmp(actionStr, "toggle") == 0) {
-    Services::relayEngine.toggle(idx);
-  } else if (strcmp(actionStr, "on") == 0) {
+  if (strcmp(actionStr, "on") == 0) {
     Services::relayEngine.setManual(idx, true);
   } else if (strcmp(actionStr, "off") == 0) {
     Services::relayEngine.setManual(idx, false);
@@ -58,7 +61,7 @@ inline void handleRelay() {
       return;
     }
   } else {
-    sendError(400, "Invalid action (toggle/on/off/set_mode)");
+    sendError(400, "Invalid action (use on/off/set_mode — toggle removed for idempotency)");
     return;
   }
 

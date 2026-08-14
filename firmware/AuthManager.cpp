@@ -15,6 +15,7 @@
 #include "Globals.h"
 #include "Config.h"
 #include "LogService.h"
+#include "RtcDriver.h"  // audit-fixes-v2 (P1-2): Drivers::rtc.getUnixTime() for refresh token expiry
 #include <ArduinoJson.h>
 #include <Preferences.h>
 
@@ -85,9 +86,27 @@ String AuthManager::_generateRefreshToken() {
 //   evict slot 0, the oldest by convention since login pushes to the first
 //   empty slot. Per-device MAX_REFRESH_TOKENS=4 is small enough that LRU
 //   precision is not security-critical.)
+//
+// audit-fixes-v2 (auditor #4 P1-2): refresh token format changed to include
+//   server-side issuedAt timestamp. Format: "<token>.<issuedAtUnixSec>"
+//   where token is 32 hex chars (REFRESH_TOKEN_LEN) and issuedAt is a
+//   decimal unix timestamp. _isRefreshTokenValid() now rejects tokens whose
+//   age exceeds JWT_REFRESH_TTL_SECONDS, even if the token string itself is
+//   still in NVS. This closes the gap where a stolen refresh token remained
+//   valid indefinitely (until evicted or rotated).
 bool AuthManager::_storeRefreshToken(const String& token) {
   Preferences prefs;
   if (!prefs.begin(Core::NVS_NAMESPACE, false)) return false;
+
+  // audit-fixes-v2 (P1-2): pack token + issuedAt into stored value.
+  //   Format: "<32hex>.<unixSec>" — total ~43 chars max.
+  uint32_t nowSec = (uint32_t)(Drivers::rtc.getUnixTime());
+  if (nowSec == 0) {
+    // RTC not set — fall back to millis()/1000 (uptime). This is imperfect
+    // but better than nothing. RTC will be set via PWA Settings later.
+    nowSec = (uint32_t)(millis() / 1000);
+  }
+  String packed = token + "." + String(nowSec);
 
   // Find existing slot (same token already stored — shouldn't happen, but defensive)
   // or first empty slot. If all slots full → evict slot 0 (oldest by convention).
@@ -100,8 +119,8 @@ bool AuthManager::_storeRefreshToken(const String& token) {
     String existing = prefs.getString(key, "");
     if (existing.length() == 0) {
       if (firstEmpty == -1) firstEmpty = i;  // remember first empty slot
-    } else if (existing == token) {
-      slot = i;  // already stored — overwrite in place
+    } else if (existing.startsWith(token + ".")) {
+      slot = i;  // already stored — overwrite in place (refresh issuedAt)
       break;
     }
   }
@@ -110,9 +129,7 @@ bool AuthManager::_storeRefreshToken(const String& token) {
     if (firstEmpty != -1) {
       slot = firstEmpty;  // use first empty slot
     } else {
-      // All slots full — evict slot 0 (oldest by convention; LRU would require
-      // timestamp tracking which we don't have here. With MAX=4 and per-device
-      // scope, this is acceptable.)
+      // All slots full — evict slot 0 (oldest by convention)
       slot = 0;
       Services::Log.append(Core::LogType::AuthFail,
         "Refresh token slot pool full — evicting oldest (slot 0)", 0);
@@ -120,31 +137,68 @@ bool AuthManager::_storeRefreshToken(const String& token) {
   }
 
   snprintf(key, sizeof(key), "rt_%u", slot);
-  prefs.putString(key, token);
+  prefs.putString(key, packed);
   prefs.end();
   return true;
 }
 
 // R10B-5: Check if refresh token is in NVS (valid). Does NOT remove it.
+// audit-fixes-v2 (auditor #4 P1-2): now also checks server-side expiry.
+//   Stored format is "<token>.<issuedAtUnixSec>". If now - issuedAt >
+//   JWT_REFRESH_TTL_SECONDS (7 days), the token is considered expired and
+//   this function returns false. The expired entry is also proactively
+//   removed from NVS to free the slot.
 bool AuthManager::_isRefreshTokenValid(const String& token) {
   if (token.length() != Core::REFRESH_TOKEN_LEN) return false;
 
   Preferences prefs;
-  if (!prefs.begin(Core::NVS_NAMESPACE, true)) return false;
+  if (!prefs.begin(Core::NVS_NAMESPACE, false)) return false;  // read-write for cleanup
+
+  uint32_t nowSec = (uint32_t)(Drivers::rtc.getUnixTime());
+  if (nowSec == 0) {
+    nowSec = (uint32_t)(millis() / 1000);
+  }
 
   char key[12];
   bool found = false;
   for (uint8_t i = 0; i < Core::MAX_REFRESH_TOKENS; i++) {
     snprintf(key, sizeof(key), "rt_%u", i);
     String stored = prefs.getString(key, "");
-    if (stored.length() == Core::REFRESH_TOKEN_LEN &&
-        Utils::constantTimeMemEquals(
-          (const volatile uint8_t*)stored.c_str(),
+    if (stored.length() == 0) continue;
+
+    // Parse "<token>.<issuedAt>" format
+    int dotIdx = stored.indexOf('.');
+    if (dotIdx != Core::REFRESH_TOKEN_LEN) {
+      // Old format (no dot) or malformed — treat as expired, remove it.
+      prefs.remove(key);
+      continue;
+    }
+    String storedToken = stored.substring(0, dotIdx);
+    String issuedAtStr = stored.substring(dotIdx + 1);
+    uint32_t issuedAt = (uint32_t)strtoul(issuedAtStr.c_str(), nullptr, 10);
+
+    // Check token string matches (constant-time)
+    if (!Utils::constantTimeMemEquals(
+          (const volatile uint8_t*)storedToken.c_str(),
           (const volatile uint8_t*)token.c_str(),
           Core::REFRESH_TOKEN_LEN)) {
-      found = true;
-      break;
+      continue;
     }
+
+    // audit-fixes-v2 (P1-2): server-side expiry check.
+    //   If the token is older than JWT_REFRESH_TTL_SECONDS, reject it.
+    //   This is the gate that was missing — previously a stolen refresh
+    //   token remained valid indefinitely as long as the string was in NVS.
+    uint32_t ageSec = nowSec - issuedAt;
+    if (ageSec > Core::JWT_REFRESH_TTL_SECONDS) {
+      Services::Log.append(Core::LogType::AuthFail,
+        "Refresh token expired (age=" + String(ageSec) + "s) — removing from NVS", 0);
+      prefs.remove(key);
+      continue;
+    }
+
+    found = true;
+    break;
   }
   prefs.end();
   return found;
@@ -161,11 +215,11 @@ void AuthManager::_invalidateRefreshToken(const String& token) {
   for (uint8_t i = 0; i < Core::MAX_REFRESH_TOKENS; i++) {
     snprintf(key, sizeof(key), "rt_%u", i);
     String stored = prefs.getString(key, "");
-    if (stored.length() == Core::REFRESH_TOKEN_LEN &&
-        Utils::constantTimeMemEquals(
-          (const volatile uint8_t*)stored.c_str(),
-          (const volatile uint8_t*)token.c_str(),
-          Core::REFRESH_TOKEN_LEN)) {
+    if (stored.length() == 0) continue;
+
+    // Match either new format "<token>.<issuedAt>" or old format "<token>".
+    // audit-fixes-v2: use startsWith so both formats are invalidated correctly.
+    if (stored.startsWith(token + ".") || stored == token) {
       prefs.remove(key);
       break;
     }
@@ -243,8 +297,15 @@ bool AuthManager::refreshTokens(const String& refreshToken,
   outRefreshToken = _generateRefreshToken();
   _storeRefreshToken(outRefreshToken);
 
+  // audit-fixes-v2 (auditor #5 P1-5): regenerate CSRF token on refresh.
+  //   Previously `outCsrf = getCsrfToken()` returned the EXISTING token without
+  //   checking expiry. If the CSRF token had expired (15min TTL = same as access
+  //   token), getCsrfToken() returned an empty string. The PWA received empty
+  //   CSRF, the next mutation failed with 403. Now: always generate a fresh
+  //   CSRF token on successful refresh, matching the 15min access token TTL.
+  generateCsrfToken();
   outCsrf = getCsrfToken();
-  Services::Log.append(Core::LogType::Login, "Tokens refreshed (rotated)", 0);
+  Services::Log.append(Core::LogType::Login, "Tokens refreshed (rotated + CSRF regenerated)", 0);
   return true;
 }
 

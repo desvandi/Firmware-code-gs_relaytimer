@@ -21,10 +21,23 @@ ConfigStore config;
 // USER CONFIG
 // ============================================================================
 void ConfigStore::initDefaultUserConfig() {
-  uint64_t mac = ESP.getEfuseMac();
+  // audit-fixes-v2 (auditor #4 P1-3): default REST password was previously
+  //   MAC-derived ("T%04X%04X%04X" from ESP.getEfuseMac()). Since MAC is
+  //   visible in WiFi beacons AND is used as MQTT topic identifier, an
+  //   attacker who knows the MAC can reconstruct the default REST password
+  //   and gain LAN-mode access without any other credential.
+  //   Now: generate a random 16-char alphanumeric password from esp_random()
+  //   (CSPRNG). Stored only as PBKDF2 hash in config.json — plaintext is
+  //   shown ONCE to Serial (dev) or redacted (prod) for provisioning.
+  //   The owner reads the plaintext from Serial during first boot (dev) or
+  //   from a printed provisioning sheet (prod), then changes it via PWA.
   char defaultPass[17];
-  snprintf(defaultPass, sizeof(defaultPass), "T%04X%04X%04X",
-           (uint16_t)(mac >> 32), (uint16_t)(mac >> 16), (uint16_t)mac);
+  static const char charset[] = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";  // no I,O,0,1
+  for (uint8_t i = 0; i < 16; i++) {
+    defaultPass[i] = charset[esp_random() % (sizeof(charset) - 1)];
+  }
+  defaultPass[16] = '\0';
+
   strcpy(Core::userConfig.wwwUser, "admin");
   Utils::generateRandomBytes(Core::userConfig.salt, Core::SALT_LEN);
   Core::userConfig.iterations = Core::PBKDF2_ITERATIONS;
@@ -36,7 +49,7 @@ void ConfigStore::initDefaultUserConfig() {
     return;
   }
   Utils::bytesToHex(hash, 32, Core::userConfig.passHashHex);
-  Services::Log.append(Core::LogType::ConfigChange, "Default user config created", 0);
+  Services::Log.append(Core::LogType::ConfigChange, "Default user config created (random password)", 0);
 #ifdef PRODUCTION_BUILD
   // audit-fixes: do NOT print the default password to Serial in production.
   //   The owner reads it from a printed provisioning sheet or via authenticated
