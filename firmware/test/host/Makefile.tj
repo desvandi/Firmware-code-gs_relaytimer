@@ -1,0 +1,47 @@
+# =============================================================================
+# Makefile — host-side P2-1 test harness for TransactionJournal
+# =============================================================================
+# Builds the test binary by compiling the REAL firmware source files:
+#   - firmware/TransactionJournal.cpp  (P2-1 Rev26 implementation)
+#   - firmware/JournalRecord.cpp       (Phase 1 foundation)
+# against three minimal shims (Arduino.h, Preferences.h, Config.h, esp_crc.h).
+# No mocking of the unit under test — the source files are the same ones
+# that get flashed to the ESP32.
+#
+# Usage:
+#     make -f Makefile.tj           # build the test binary
+#     make -f Makefile.tj run       # build + run
+#     make -f Makefile.tj clean     # remove build artifacts
+# =============================================================================
+
+CXX      ?= g++
+CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Werror
+
+ROOT_DIR := $(CURDIR)
+SRC_DIR  := $(ROOT_DIR)/../..
+SHIM_DIR := $(ROOT_DIR)/shims
+
+TEST_SRC  := $(ROOT_DIR)/TransactionJournalTest.cpp
+FIRMWARE1 := $(SRC_DIR)/TransactionJournal.cpp
+FIRMWARE2 := $(SRC_DIR)/JournalRecord.cpp
+
+BIN       := journal_journal_test_bin
+
+.PHONY: all run clean
+
+all: $(BIN)
+
+$(BIN): $(TEST_SRC) $(FIRMWARE1) $(FIRMWARE2) \
+        $(SHIM_DIR)/Arduino.h $(SHIM_DIR)/Preferences.h \
+        $(SHIM_DIR)/Config.h $(SHIM_DIR)/esp_crc.h
+	$(CXX) $(CXXFLAGS) \
+	    -I$(SHIM_DIR) \
+	    -I$(SRC_DIR) \
+	    $(TEST_SRC) $(FIRMWARE1) $(FIRMWARE2) \
+	    -o $(BIN)
+
+run: $(BIN)
+	./$(BIN)
+
+clean:
+	rm -f $(BIN)

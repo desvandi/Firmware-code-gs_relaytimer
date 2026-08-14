@@ -1,4 +1,6 @@
-# Host test build artifact — do not commit binaries
+# Host test build artifacts — do not commit binaries
 journal_record_test
+journal_journal_test_bin
+transaction_journal_test
 *.o
 *.obj

@@ -195,6 +195,13 @@ void setup() {
   // IMPORTANT: RelayEngine.forceRefresh() is deliberately DEFERRED until after
   // reconciliation completes. This prevents scheduler/PIR logic from
   // contaminating the evidence used for recovery.
+
+  // P2-1: Register snapshot provider so TransactionJournal can read relay
+  // state without a hard dependency on RelayDriver.h.
+  Services::setSnapshotProvider([](uint8_t idx) -> bool {
+    return Drivers::relay.getState(idx);
+  });
+
   Services::journal.captureOutputSnapshot();
 
   // ---------- NETWORK: WiFi STA (join MiFi) + AP fallback ----------

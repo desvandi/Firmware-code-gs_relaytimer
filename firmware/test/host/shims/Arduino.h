@@ -2,17 +2,17 @@
 // Host-test shim: Arduino.h
 // =============================================================================
 // Replicates the minimal subset of the Arduino API used by JournalRecord.cpp
-// so the SAME source file compiles and runs on the host under g++.
+// and TransactionJournal.cpp so the SAME source files compile and run on the
+// host under g++.
 //
-// This shim ONLY implements:
+// This shim implements:
 //   - class String  (length(), c_str(), (const char*, unsigned) ctor,
-//                   (const char*) ctor, assignment from const char*,
-//                   ==, !=, default ctor)
-//   - min(a, b)     (template; matches Arduino's macro semantics)
-//
-// No other Arduino features (Serial, delay, PROGMEM, etc.) are needed for
-// Phase 1 JournalRecord testing. If a future phase requires more, extend
-// this shim rather than reaching for the real Arduino.h.
+//                    (const char*) ctor, assignment, ==, !=, indexOf,
+//                    substring, toLowerCase — covers JournalRecord +
+//                    TransactionJournal usage)
+//   - min(a, b)      (template)
+//   - Serial         (SerialClass with printf/print/println — for logging)
+//   - millis()       (returns std::time(nullptr)*1000 — sufficient for tests)
 //
 // IMPORTANT: This shim is ONLY compiled for host tests. The ESP32 build uses
 // the real Arduino.h from the arduino-esp32 framework; this shim is never
@@ -24,12 +24,11 @@
 
 #include <string>
 #include <cstdint>
+#include <cstdio>
+#include <cstdarg>
+#include <ctime>
 
 // --- String ----------------------------------------------------------------
-// Internally backed by std::string so behaviour matches Arduino's String for
-// the operations JournalRecord.cpp uses (length, c_str, binary-safe ctor,
-// assignment, equality). Arduino's String is null-terminated; this shim
-// preserves that contract — embedded nulls are not a use case for Phase 1.
 class String {
 public:
     String() : s_() {}
@@ -38,10 +37,8 @@ public:
         : s_(cstr ? std::string(cstr, length) : std::string(length, '\0')) {}
     String(const std::string& s) : s_(s) {}
 
-    // Explicit copy constructor (silences -Wdeprecated-copy under -Werror).
     String(const String& other) : s_(other.s_) {}
 
-    // Assignment from const char* (Arduino supports this).
     String& operator=(const char* cstr) {
         s_ = (cstr ? cstr : "");
         return *this;
@@ -61,15 +58,66 @@ public:
     bool operator!=(const String& other) const { return !(*this == other); }
     bool operator!=(const char* other) const { return !(*this == other); }
 
+    // --- Additional methods used by TransactionJournal.cpp ---
+    int indexOf(char c) const { return (int)s_.find(c); }
+    int indexOf(const char* substr) const {
+        if (!substr) return -1;
+        size_t pos = s_.find(substr);
+        return (pos == std::string::npos) ? -1 : (int)pos;
+    }
+    String substring(int start) const {
+        if (start < 0) start = 0;
+        if ((size_t)start > s_.length()) return String();
+        return String(s_.substr(start));
+    }
+    String substring(int start, int end) const {
+        if (start < 0) start = 0;
+        if (end < start) return String();
+        if ((size_t)start > s_.length()) return String();
+        if ((size_t)end > s_.length()) end = (int)s_.length();
+        return String(s_.substr(start, end - start));
+    }
+    void toLowerCase() {
+        for (auto& c : s_) {
+            c = (char)tolower((unsigned char)c);
+        }
+    }
+
 private:
     std::string s_;
 };
 
 // --- min(a, b) -------------------------------------------------------------
-// Arduino defines min() as a macro / template; here it's a plain template.
 template <typename T, typename U>
 static inline auto min(const T& a, const U& b) -> decltype(b < a ? b : a) {
     return (b < a) ? b : a;
 }
+
+// --- Serial ----------------------------------------------------------------
+class __attribute__((unused)) SerialClass {
+public:
+    void __attribute__((unused)) printf(const char* fmt, ...) {
+        va_list args;
+        va_start(args, fmt);
+        vprintf(fmt, args);
+        va_end(args);
+    }
+    void __attribute__((unused)) print(const char* s) { fputs(s ? s : "", stdout); }
+    void __attribute__((unused)) print(const String& s) { fputs(s.c_str(), stdout); }
+    void __attribute__((unused)) println(const char* s) { puts(s ? s : ""); }
+    void __attribute__((unused)) println(const String& s) { puts(s.c_str()); }
+    void __attribute__((unused)) println() { putchar('\n'); }
+};
+static __attribute__((unused)) SerialClass Serial;
+
+// --- millis() --------------------------------------------------------------
+static inline __attribute__((unused)) unsigned long millis() {
+    return (unsigned long)(std::time(nullptr) * 1000);
+}
+
+// --- HIGH / LOW (used by Config.h's RELAY_ON/RELAY_OFF constants) ----------
+// Arduino defines these as 0x0 and 0x1 respectively.
+static const uint8_t LOW = 0x00;
+static const uint8_t HIGH = 0x01;
 
 #endif // HOST_SHIM_ARDUINO_H
