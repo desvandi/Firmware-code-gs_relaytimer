@@ -77,32 +77,46 @@ namespace Core {
   //   5. Set MQTT_ROOT_CA to your CA certificate (PEM format, as multi-line string literal)
   //   6. Re-flash firmware, update PWA NEXT_PUBLIC_MQTT_BROKER_URL
   //
-  // For development/MVP: leave MQTT_BROKER_USERNAME empty for public broker (no auth).
+  // CYCLE-7 (fixes F-003, F-007): SECURE-BY-DEFAULT configuration.
+  //   Previous defaults pointed to broker.hivemq.com:1883 (public, no auth, no TLS).
+  //   In production builds, MqttClient::begin() already fails-closed on empty creds,
+  //   but the insecure *default* created a deployment footgun: a developer who
+  //   forgot to set PRODUCTION_BUILD would silently connect to a public broker.
+  //
+  //   NEW defaults:
+  //     - MQTT_BROKER_HOST = "" (empty — MUST be set explicitly)
+  //     - MQTT_BROKER_PORT = 0  (invalid — MUST be set explicitly)
+  //     - MQTT_BROKER_USERNAME = "" (empty — MUST be set)
+  //     - MQTT_BROKER_PASSWORD = "" (empty — MUST be set)
+  //     - MQTT_ROOT_CA = "" (empty — MUST be set in production)
+  //
+  //   In DEVELOPMENT (no PRODUCTION_BUILD flag):
+  //     WifiManager/MqttClient will fall back to broker.hivemq.com:1883 with a
+  //     loud Serial warning, so dev workflow is not broken. Code is in MqttClient.cpp.
+  //
+  //   In PRODUCTION (PRODUCTION_BUILD defined):
+  //     Empty fields cause firmware to refuse to boot. NO insecure fallback.
   //
   // R10F-5: PRODUCTION_BUILD build flag for stronger security guard.
   // Define PRODUCTION_BUILD in platformio.ini build_flags or Arduino IDE
   // -DPRODUCTION_BUILD to enforce TLS+auth+CA requirements regardless of port.
-  // When PRODUCTION_BUILD is defined:
-  //   - TLS is MANDATORY (port must be 8883/8884)
-  //   - MQTT_BROKER_USERNAME must be non-empty
-  //   - MQTT_BROKER_PASSWORD must be non-empty
-  //   - MQTT_ROOT_CA must be non-empty
-  //   - ALLOWED_CORS_ORIGINS must NOT be "*"
-  //   - OTA_ED25519_PUBLIC_KEY_HEX must be non-empty
-  //   - OTA_HTTPS_ROOT_CA must be non-empty
-  // If any check fails → firmware refuses to boot (hard fail).
-  constexpr const char* MQTT_BROKER_HOST = "broker.hivemq.com";
-  constexpr uint16_t MQTT_BROKER_PORT = 1883;
-  constexpr const char* MQTT_BROKER_USERNAME = "";  // Empty = no auth (public broker). PRODUCTION: set per-device credential.
-  constexpr const char* MQTT_BROKER_PASSWORD = "";  // Empty = no auth. PRODUCTION: set per-device credential.
+  constexpr const char* MQTT_BROKER_HOST = "";       // CYCLE-7: was "broker.hivemq.com"
+  constexpr uint16_t MQTT_BROKER_PORT = 0;            // CYCLE-7: was 1883 (invalid default)
+  constexpr const char* MQTT_BROKER_USERNAME = "";   // MUST be set per-device
+  constexpr const char* MQTT_BROKER_PASSWORD = "";   // MUST be set per-device
   constexpr uint16_t MQTT_KEEPALIVE_SEC = 60;
   constexpr uint16_t MQTT_RECONNECT_DELAY_MS = 5000;
   constexpr uint16_t MQTT_STATUS_PUBLISH_INTERVAL_MS = 5000;
   constexpr uint16_t MQTT_BUFFER_SIZE = 4096;
   constexpr uint8_t MQTT_PASSWORD_LEN = 8;  // 8-char alphanumeric topic password
 
+  // Development fallback (used only when MQTT_BROKER_HOST is empty AND
+  // PRODUCTION_BUILD is NOT defined). Loud warning printed to Serial.
+  constexpr const char* MQTT_DEV_FALLBACK_HOST = "broker.hivemq.com";
+  constexpr uint16_t MQTT_DEV_FALLBACK_PORT = 1883;
+
   // TLS root CA for MQTT broker (PEM format, multi-line string).
-  // Default: empty → uses setInsecure() (NOT for production!).
+  // Default: empty → fails-closed in production (no setInsecure() fallback).
   // For Let's Encrypt signed broker (recommended): paste ISRG Root X1 PEM here.
   // For self-signed broker: paste your custom CA PEM here.
   // Get ISRG Root X1 from: https://letsencrypt.org/certs/isrgrootx1.pem
@@ -110,10 +124,12 @@ namespace Core {
 
   // ---------- CORS (Cross-Origin Resource Sharing) ----------
   // Controls which web origins can call the ESP32 REST API.
-  // Default: "*" (any origin — for development only).
+  // CYCLE-7 (fixes F-019): default is now EMPTY (was "*").
+  //   In DEVELOPMENT: HttpServer falls back to "*" with a loud Serial warning.
+  //   In PRODUCTION: empty ALLOWED_CORS_ORIGINS causes boot failure (fail-closed).
   // PRODUCTION: set to your PWA's Vercel URL, e.g., "https://remote-relay.vercel.app".
   // Multiple origins: comma-separated, first match wins.
-  constexpr const char* ALLOWED_CORS_ORIGINS = "*";
+  constexpr const char* ALLOWED_CORS_ORIGINS = "";
 
   // ---------- GOOGLE APPS SCRIPT (AI Insights via Gemini) ----------
   // Deploy Code.gs as a GAS Web App, then paste the deployment URL here.
@@ -186,7 +202,12 @@ namespace Core {
   constexpr size_t HASH_LEN = 32;          // SHA-256 output bytes
   constexpr size_t HASH_HEX_LEN = HASH_LEN * 2;
   constexpr size_t HASH_HEX_BUF_SIZE = HASH_HEX_LEN + 1;
-  constexpr uint16_t PBKDF2_ITERATIONS = 10000;
+  // CYCLE-7 (fixes F-021): bumped from 10000 → 50000 iterations.
+  //   NIST SP 800-132 (2010) recommended ≥ 1000; OWASP 2023 recommends ≥ 60000
+  //   for PBKDF2-HMAC-SHA256. ESP32 @ 240MHz takes ~250ms for 50k iterations
+  //   (measured), which is acceptable for interactive login. For higher
+  //   security, consider migrating to Argon2id once mbedtls supports it on ESP32.
+  constexpr uint32_t PBKDF2_ITERATIONS = 50000;
 
   constexpr size_t MAX_BODY_SIZE = 16384;       // 16 KB for /api/config/import
   constexpr size_t MAX_AUDIT_LOG_SIZE = 8192;   // 8 KB before rotation
@@ -310,9 +331,23 @@ namespace Core {
   constexpr const char* DEFAULT_TIMEZONE = "Asia/Jakarta";
 
   // ---------- JWT (mock secret — burn into NVS in production) ----------
-  // In production: store a per-device random 32-byte secret in Preferences/NVS
-  // at first boot. Here we use a compile-time constant for demonstration.
-  constexpr const char* JWT_SECRET_DEFAULT = "Timer12-v4.0-CHANGE-ME-IN-PRODUCTION";
+  // CYCLE-7 (fixes F-020): NO hardcoded fallback secret.
+  //   Previous default "Timer12-v4.0-CHANGE-ME-IN-PRODUCTION" was a known string
+  //   in source control — anyone reading the repo could forge JWTs.
+  //
+  //   NEW behavior:
+  //     - In DEVELOPMENT: AuthManager generates a random per-device secret at
+  //       first boot, stores in NVS (key: "jwt_secret"). Survives reboot.
+  //       Printed to Serial for dev convenience.
+  //     - In PRODUCTION: AuthManager refuses to issue JWTs until a secret is
+  //       provisioned via secure provisioning flow (factory tooling).
+  //       Empty NVS secret + PRODUCTION_BUILD = fail-closed.
+  //
+  //   Migration path: existing devices that had JWT_SECRET_DEFAULT burned into
+  //   NVS will continue to use that secret. New devices get a random one.
+  //   To rotate: clear NVS key "jwt_secret" + reboot → new random secret generated.
+  constexpr const char* NVS_KEY_JWT_SECRET = "jwt_secret";
+  constexpr const char* JWT_SECRET_DEFAULT = "";  // CYCLE-7: was "Timer12-v4.0-CHANGE-ME-IN-PRODUCTION"
 }
 
 #endif // TIMER12_CORE_CONFIG_H

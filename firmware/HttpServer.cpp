@@ -30,10 +30,24 @@ void HttpServer::_sendSecurityHeaders() {
     "style-src 'self' 'unsafe-inline'; img-src 'self' data:;");
 
   // P0 #10 (audit round 9): CORS origin now configurable.
-  // Default: "*" (development). Production: set ALLOWED_CORS_ORIGINS in Config.h
-  // to PWA's Vercel URL.
+  // CYCLE-7 (fixes F-019): default is now EMPTY (was "*").
+  //   - In DEVELOPMENT: empty ALLOWED_CORS_ORIGINS falls back to "*" with warning.
+  //   - In PRODUCTION: MqttClient::begin() already fails-closed on empty CORS,
+  //     so we never reach here in production. But defensive: treat empty as
+  //     deny-all if somehow we do.
   String origin = "*";
+#ifndef PRODUCTION_BUILD
+  // Dev fallback: empty ALLOWED_CORS_ORIGINS = allow all (with warning).
+  static bool corsWarned = false;
+  if (!corsWarned && strlen(Core::ALLOWED_CORS_ORIGINS) == 0) {
+    Serial.println("[HTTP] WARNING: ALLOWED_CORS_ORIGINS is empty — falling back to '*' (dev only)");
+    Serial.println("[HTTP]   Set ALLOWED_CORS_ORIGINS in Config.h or build with -DPRODUCTION_BUILD.");
+    corsWarned = true;
+  }
+  if (strcmp(Core::ALLOWED_CORS_ORIGINS, "*") != 0 && strlen(Core::ALLOWED_CORS_ORIGINS) > 0) {
+#else
   if (strcmp(Core::ALLOWED_CORS_ORIGINS, "*") != 0) {
+#endif
     // Echo back Origin if it's in the allowed list
     if (http.hasHeader("Origin")) {
       String reqOrigin = http.header("Origin");
@@ -121,7 +135,17 @@ void HttpServer::_registerRoutes() {
       http.send(204);
     } else {
       http.sendHeader("X-Frame-Options", "DENY");
-      String origin = (strcmp(Core::ALLOWED_CORS_ORIGINS, "*") == 0) ? "*" : "";
+      // CYCLE-7: dev fallback — empty ALLOWED_CORS_ORIGINS = "*" in dev.
+      String origin;
+#ifndef PRODUCTION_BUILD
+      if (strlen(Core::ALLOWED_CORS_ORIGINS) == 0) {
+        origin = "*";
+      } else {
+        origin = (strcmp(Core::ALLOWED_CORS_ORIGINS, "*") == 0) ? "*" : "";
+      }
+#else
+      origin = (strcmp(Core::ALLOWED_CORS_ORIGINS, "*") == 0) ? "*" : "";
+#endif
       if (origin.length() > 0) {
         http.sendHeader("Access-Control-Allow-Origin", origin);
         http.sendHeader("Access-Control-Allow-Credentials", "true");

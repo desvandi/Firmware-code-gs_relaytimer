@@ -64,8 +64,10 @@ void LogServiceClass::append(Core::LogType type, const char* msg, int8_t channel
   strncpy(e.message, msg, sizeof(e.message) - 1);
   e.message[sizeof(e.message) - 1] = '\0';
   _persistActivity(e);
-  // Also push to MQTT for real-time remote log streaming
-  mqtt.publishLog(type, String(msg), channelId);
+  // Also push to MQTT for real-time remote log streaming.
+  // CYCLE-7 (fixes F-023): pass the actual monotonic ID instead of letting
+  //   MqttClient use millis() which collides on wrap and isn't unique per-boot.
+  mqtt.publishLog(type, String(msg), channelId, e.id);
 }
 
 void LogServiceClass::append(Core::LogType type, const String& msg, int8_t channelId) {

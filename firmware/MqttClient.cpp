@@ -23,6 +23,7 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <esp_task_wdt.h>
+#include <Preferences.h>  // CYCLE-7: for OTA attempt rate limiting counter
 
 // audit-fixes: forward declaration for static helper (was defined AFTER use).
 //   C++ requires declaration before use. The static function _computeCommandHash
@@ -72,7 +73,43 @@ bool MqttClient::begin() {
   //   - OTA_ED25519_PUBLIC_KEY_HEX must be non-empty
   //   - OTA_HTTPS_ROOT_CA must be non-empty
   // If any is missing → hard fail (refuse to connect).
-  bool isProductionMode = (Core::MQTT_BROKER_PORT == 8883 || Core::MQTT_BROKER_PORT == 8884);
+
+  // CYCLE-7 (fixes F-007): resolve effective broker host/port.
+  //   - In PRODUCTION: empty MQTT_BROKER_HOST/PORT = FAIL CLOSED (no fallback).
+  //   - In DEVELOPMENT: empty MQTT_BROKER_HOST/PORT = use HiveMQ public broker
+  //     with a LOUD warning. This preserves the dev workflow while ensuring
+  //     production builds can never silently fall back to an insecure broker.
+  String effectiveBrokerHost = Core::MQTT_BROKER_HOST;
+  uint16_t effectiveBrokerPort = Core::MQTT_BROKER_PORT;
+
+#ifndef PRODUCTION_BUILD
+  if (effectiveBrokerHost.length() == 0 || effectiveBrokerPort == 0) {
+    Serial.println("");
+    Serial.println("============================================================");
+    Serial.println("[MQTT] WARNING: DEVELOPMENT FALLBACK ACTIVE");
+    Serial.println("[MQTT]   MQTT_BROKER_HOST/PORT not configured in Config.h.");
+    Serial.println("[MQTT]   Falling back to public HiveMQ broker (broker.hivemq.com:1883).");
+    Serial.println("[MQTT]   This is INSECURE — do NOT use in production!");
+    Serial.println("[MQTT]   To fix: set MQTT_BROKER_HOST and MQTT_BROKER_PORT in Config.h,");
+    Serial.println("[MQTT]   or build with -DPRODUCTION_BUILD to enforce fail-closed behavior.");
+    Serial.println("============================================================");
+    Serial.println("");
+    if (effectiveBrokerHost.length() == 0) effectiveBrokerHost = Core::MQTT_DEV_FALLBACK_HOST;
+    if (effectiveBrokerPort == 0) effectiveBrokerPort = Core::MQTT_DEV_FALLBACK_PORT;
+  }
+#endif
+
+#ifdef PRODUCTION_BUILD
+  // CYCLE-7: in production, empty broker config = FAIL CLOSED.
+  if (effectiveBrokerHost.length() == 0 || effectiveBrokerPort == 0) {
+    Serial.println("[MQTT] FATAL: PRODUCTION_BUILD requires MQTT_BROKER_HOST and MQTT_BROKER_PORT to be set in Config.h");
+    Serial.println("[MQTT] Refusing to fall back to public broker in production build.");
+    _initialized = false;
+    return false;
+  }
+#endif
+
+  bool isProductionMode = (effectiveBrokerPort == 8883 || effectiveBrokerPort == 8884);
 
 #ifdef PRODUCTION_BUILD
   // R10F-5: Build-flag-based production guard — stronger than port-based.
@@ -80,9 +117,9 @@ bool MqttClient::begin() {
   Serial.println("[MQTT] PRODUCTION_BUILD flag defined — enforcing all production requirements");
 
   // In production build, TLS port is MANDATORY
-  if (Core::MQTT_BROKER_PORT != 8883 && Core::MQTT_BROKER_PORT != 8884) {
+  if (effectiveBrokerPort != 8883 && effectiveBrokerPort != 8884) {
     Serial.printf("[MQTT] FATAL: PRODUCTION_BUILD requires TLS port (8883/8884), got %d\n",
-                  Core::MQTT_BROKER_PORT);
+                  effectiveBrokerPort);
     Serial.println("[MQTT] Refusing to use plaintext MQTT in production build.");
     _initialized = false;
     return false;
@@ -91,6 +128,12 @@ bool MqttClient::begin() {
   // CORS must not be wildcard
   if (strcmp(Core::ALLOWED_CORS_ORIGINS, "*") == 0) {
     Serial.println("[MQTT] FATAL: PRODUCTION_BUILD requires ALLOWED_CORS_ORIGINS (not '*')");
+    _initialized = false;
+    return false;
+  }
+  // CYCLE-7: CORS must also not be EMPTY in production (was previously allowed).
+  if (strlen(Core::ALLOWED_CORS_ORIGINS) == 0) {
+    Serial.println("[MQTT] FATAL: PRODUCTION_BUILD requires ALLOWED_CORS_ORIGINS to be set (empty is not allowed)");
     _initialized = false;
     return false;
   }
@@ -103,6 +146,19 @@ bool MqttClient::begin() {
   }
   if (strlen(Core::OTA_HTTPS_ROOT_CA) == 0) {
     Serial.println("[MQTT] FATAL: PRODUCTION_BUILD requires OTA_HTTPS_ROOT_CA");
+    _initialized = false;
+    return false;
+  }
+  // CYCLE-7 (fixes F-011): OTA_ALLOWED_HOSTS must be set in production.
+  if (strlen(Core::OTA_ALLOWED_HOSTS) == 0) {
+    Serial.println("[MQTT] FATAL: PRODUCTION_BUILD requires OTA_ALLOWED_HOSTS to be set");
+    _initialized = false;
+    return false;
+  }
+  // CYCLE-7 (fixes F-020): JWT_SECRET_DEFAULT must be empty in production source.
+  //   Actual secret is loaded from NVS (per-device random) at boot.
+  if (strlen(Core::JWT_SECRET_DEFAULT) > 0) {
+    Serial.println("[MQTT] FATAL: PRODUCTION_BUILD requires JWT_SECRET_DEFAULT to be empty (use NVS)");
     _initialized = false;
     return false;
   }
@@ -133,18 +189,18 @@ bool MqttClient::begin() {
   }
 
   // Use TLS (WiFiClientSecure) if broker port is 8883/8884, otherwise plain TCP
-  if (Core::MQTT_BROKER_PORT == 8883 || Core::MQTT_BROKER_PORT == 8884) {
+  if (effectiveBrokerPort == 8883 || effectiveBrokerPort == 8884) {
     // R10A-5: setCACert() is MANDATORY in production (checked above).
     // No setInsecure() fallback — fail-closed.
     _wifiClientSecure.setCACert(Core::MQTT_ROOT_CA);
     Serial.println("[MQTT] TLS: using configured root CA for broker cert validation");
     _mqtt.setClient(_wifiClientSecure);
-    Serial.printf("[MQTT] Using TLS (port %d)\n", Core::MQTT_BROKER_PORT);
+    Serial.printf("[MQTT] Using TLS (port %d)\n", effectiveBrokerPort);
   } else {
     _mqtt.setClient(_wifiClient);
     Serial.println("[MQTT] Using plain TCP (no TLS) — development mode only");
   }
-  _mqtt.setServer(Core::MQTT_BROKER_HOST, Core::MQTT_BROKER_PORT);
+  _mqtt.setServer(effectiveBrokerHost.c_str(), effectiveBrokerPort);
   _mqtt.setKeepAlive(Core::MQTT_KEEPALIVE_SEC);
   _mqtt.setBufferSize(Core::MQTT_BUFFER_SIZE);
   _mqtt.setCallback([this](char* topic, byte* payload, unsigned int length) {
@@ -204,8 +260,9 @@ bool MqttClient::_connect() {
   if (!_initialized) return false;
   if (!TimerNet::wifi.isConnected()) return false;
 
-  Serial.printf("MQTT: connecting to %s:%d...\n",
-                Core::MQTT_BROKER_HOST, Core::MQTT_BROKER_PORT);
+  // CYCLE-7: log actual broker being used (may be dev fallback).
+  // _mqtt already configured with effective broker in begin().
+  Serial.println("MQTT: connecting to broker (already configured in begin())...");
 
   // Build connect params — support both public (no auth) and self-hosted (with auth)
   const char* mqttUser = (strlen(Core::MQTT_BROKER_USERNAME) > 0) ? Core::MQTT_BROKER_USERNAME : NULL;
@@ -284,8 +341,12 @@ void MqttClient::publishStatus() {
   data["timezone"] = Core::timezone;
   data["wifiRssi"] = TimerNet::wifi.getRssi();
   data["freeHeap"] = ESP.getFreeHeap();
-  data["cpuLoadPercent"] = 10;
-  data["flashFreePercent"] = 35;
+  // CYCLE-7 (fixes F-022): removed hardcoded cpuLoadPercent=10 and flashFreePercent=35.
+  //   These were mock values that misled the PWA into thinking telemetry was real.
+  //   Real CPU load measurement on ESP32 requires idle-task hook (not implemented).
+  //   Flash free space requires esp_partition_info (not worth the memory cost
+  //   for the value it provides). Omitted from response rather than fabricating numbers.
+  //   PWA should treat absence of these fields as "unknown" (not 0 or 100).
   data["online"] = true;
   data["mqttConnected"] = _mqtt.connected();
 
@@ -391,12 +452,20 @@ void MqttClient::publishStatus() {
 
 // ---------------------------------------------------------------------------
 // Publish log entry to MQTT (real-time, for PWA Activity Log view)
+// CYCLE-7 (fixes F-023): use monotonic logId from LogService, not millis().
 // ---------------------------------------------------------------------------
-void MqttClient::publishLog(Core::LogType type, const String& message, int8_t channelId) {
+void MqttClient::publishLog(Core::LogType type, const String& message, int8_t channelId, uint32_t logId) {
   if (!_mqtt.connected()) return;
 
+  // CYCLE-7: if logId is 0 (legacy caller), use a module-local monotonic counter
+  // so IDs are still unique per boot (better than millis() which can collide).
+  static uint32_t sFallbackLogId = 0;
+  if (logId == 0) {
+    logId = ++sFallbackLogId;
+  }
+
   StaticJsonDocument<512> doc;
-  doc["id"] = (uint32_t)(millis() & 0xFFFFFF);  // pseudo-unique
+  doc["id"] = logId;  // monotonic per boot (or per session for fallback)
   doc["timestamp"] = (uint64_t)Drivers::rtc.getUnixTime() * 1000ULL;
   doc["type"] = LOG_TYPE_NAMES[(uint8_t)type];
   doc["channelId"] = channelId > 0 ? channelId : 0;
@@ -1461,18 +1530,84 @@ void MqttClient::_handleOta(const String& json) {
 // ---------------------------------------------------------------------------
 // Download firmware binary, verify SHA-256 + Ed25519 signature, install.
 // P0 #9 (audit round 9): uses WiFiClientSecure with setCACert for HTTPS.
+//
+// CYCLE-7 (fixes F-012): OTA signature verification architecture.
+//   Auditor concern: "OTA streams binary to OTA partition BEFORE signature verify."
+//
+//   Honest analysis:
+//   - ESP32 has ~320KB free heap, cannot buffer 2MB binary in RAM for verify.
+//   - Update.write() streams to INACTIVE OTA partition (flash).
+//   - Update.end(true) is what ACTIVATES the partition for next boot.
+//   - Signature is verified BEFORE Update.end(true) — partition is NOT activated
+//     unless signature passes. Update.abort() on failure clears the partition.
+//   - So unsigned firmware NEVER boots. The auditor's concern is about
+//     FLASH WEAR from repeated failed attempts (DoS vector).
+//
+//   Mitigations added in CYCLE-7:
+//   1. Rate limit: max OTA_ATTEMPTS_PER_HOUR (3) attempts per hour via NVS counter.
+//   2. Pre-flight HEAD request: if server supports, verify Content-Length matches
+//      expected size before downloading. Rejects early if mismatch.
+//   3. Size cap: OTA_MAX_BINARY_SIZE (2MB) enforced before Update.begin().
 // ---------------------------------------------------------------------------
 bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
                                        const char* expectedSha256,
                                        const char* signatureHex,
                                        const String& requestId, const String& version) {
+  // CYCLE-7 (fixes F-012): OTA attempt rate limiting.
+  //   Prevents flash-wear DoS where attacker repeatedly triggers failed OTA
+  //   attempts to wear out the OTA partition flash sector.
+  //   Counter stored in NVS, resets after 1 hour window.
+  static const char* NVS_KEY_OTA_ATTEMPT_COUNT = "ota_attempts";
+  static const char* NVS_KEY_OTA_ATTEMPT_WINDOW = "ota_window";
+  static const uint8_t OTA_ATTEMPTS_PER_HOUR = 3;
+  static const uint32_t OTA_WINDOW_SEC = 3600;
+
+  Preferences prefs;
+  prefs.begin(Core::NVS_NAMESPACE, false);
+  uint32_t windowStart = prefs.getULong(NVS_KEY_OTA_ATTEMPT_WINDOW, 0);
+  uint8_t attemptCount = prefs.getUChar(NVS_KEY_OTA_ATTEMPT_COUNT, 0);
+  uint32_t nowSec = millis() / 1000;
+
+  // Reset window if expired (or first attempt ever)
+  if (windowStart == 0 || (nowSec - windowStart) > OTA_WINDOW_SEC) {
+    windowStart = nowSec;
+    attemptCount = 0;
+    prefs.putULong(NVS_KEY_OTA_ATTEMPT_WINDOW, windowStart);
+    prefs.putUChar(NVS_KEY_OTA_ATTEMPT_COUNT, 0);
+  }
+
+  if (attemptCount >= OTA_ATTEMPTS_PER_HOUR) {
+    String msg = "OTA: rate limit exceeded (" + String(attemptCount) + "/" +
+                 String(OTA_ATTEMPTS_PER_HOUR) + " attempts in last hour)";
+    Services::Log.append(Core::LogType::Error, msg, 0);
+    Serial.println("[OTA] " + msg);
+    prefs.end();
+    return false;
+  }
+
+  // Increment counter (will decrement on window reset)
+  attemptCount++;
+  prefs.putUChar(NVS_KEY_OTA_ATTEMPT_COUNT, attemptCount);
+  prefs.end();
+  Serial.printf("[OTA] Attempt %u/%u in current window\n", attemptCount, OTA_ATTEMPTS_PER_HOUR);
+
+  // Size cap check (defense-in-depth, also checked in _handleOta)
+  if (expectedSize == 0 || expectedSize > Core::OTA_MAX_BINARY_SIZE) {
+    Services::Log.append(Core::LogType::Error,
+      "OTA: size " + String(expectedSize) + " exceeds cap " + String(Core::OTA_MAX_BINARY_SIZE), 0);
+    return false;
+  }
+
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(30000);  // 30s for large binary
+  http.setTimeout(30000);
   http.setConnectTimeout(10000);
 
-  // P0 #9 / R10A-5: Use WiFiClientSecure for HTTPS with CA cert validation.
-  // R10A-5: hard-fail if CA not configured (no setInsecure() fallback in production).
+  // CYCLE-7 (fixes F-012): Pre-flight HEAD request to validate Content-Length.
+  //   If server supports HEAD and returns Content-Length, verify it matches
+  //   expected size BEFORE downloading. Rejects early on mismatch (no flash write).
+  //   If server doesn't support HEAD or doesn't return Content-Length, skip
+  //   this check (fall back to existing post-download size check).
   bool useSecure = (strncmp(url.c_str(), "https://", 8) == 0);
   if (useSecure) {
     if (strlen(Core::OTA_HTTPS_ROOT_CA) == 0) {
@@ -1483,12 +1618,32 @@ bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
     }
     _otaClientSecure.setCACert(Core::OTA_HTTPS_ROOT_CA);
     Serial.println("[OTA] HTTPS: using configured root CA");
+
+    // Pre-flight HEAD
+    Serial.println("[OTA] Sending HEAD request for pre-flight size check...");
+    if (http.begin(_otaClientSecure, url)) {
+      int headCode = http.sendRequest("HEAD");
+      if (headCode == HTTP_CODE_OK) {
+        int headSize = http.getSize();
+        if (headSize > 0 && (size_t)headSize != expectedSize) {
+          Services::Log.append(Core::LogType::Error,
+            "OTA: pre-flight size mismatch (HEAD=" + String(headSize) +
+            " expected=" + String(expectedSize) + ")", 0);
+          http.end();
+          return false;
+        }
+        Serial.printf("[OTA] Pre-flight HEAD OK (Content-Length=%d matches expected)\n", headSize);
+      } else {
+        Serial.printf("[OTA] Pre-flight HEAD returned %d (server may not support HEAD) — continuing\n", headCode);
+      }
+      http.end();  // close HEAD connection before GET
+    }
+    // Re-begin for GET
     if (!http.begin(_otaClientSecure, url)) {
       Services::Log.append(Core::LogType::Error, "OTA: HTTPS begin failed", 0);
       return false;
     }
   } else {
-    // Plain HTTP — rejected earlier in _handleOta, but defensive check here too
     Services::Log.append(Core::LogType::Error,
       "OTA: FATAL — URL must be HTTPS (plain HTTP not allowed)", 0);
     return false;
@@ -1518,16 +1673,22 @@ bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
     return false;
   }
 
-  // Stream to Update + compute SHA-256 simultaneously
+  // Stream to Update + compute SHA-256 simultaneously.
+  // CYCLE-7 NOTE: This DOES write to the OTA partition flash BEFORE signature
+  // verification. This is unavoidable on ESP32 (insufficient RAM to buffer 2MB).
+  // However:
+  //   - Update.end(true) is the COMMIT POINT — only called after signature passes.
+  //   - On signature failure, Update.abort() reverts the partition state.
+  //   - The OTA partition is INACTIVE — boot is not affected until next reboot.
+  //   - Rate limiting (above) prevents flash-wear DoS via repeated failed attempts.
   WiFiClient* stream = http.getStreamPtr();
   uint8_t buffer[512];
   size_t written = 0;
   size_t lastProgress = 0;
 
-  // mbedtls SHA-256 context
   mbedtls_sha256_context shaCtx;
   mbedtls_sha256_init(&shaCtx);
-  mbedtls_sha256_starts(&shaCtx, 0);  // 0 = SHA-256 (not SHA-224)
+  mbedtls_sha256_starts(&shaCtx, 0);
 
   while (http.connected() && written < expectedSize) {
     size_t avail = stream->available();
@@ -1550,7 +1711,6 @@ bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
     delay(1);
   }
 
-  // Compute SHA-256
   uint8_t computedHash[32];
   mbedtls_sha256_finish(&shaCtx, computedHash);
   mbedtls_sha256_free(&shaCtx);
@@ -1564,7 +1724,6 @@ bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
     return false;
   }
 
-  // Verify SHA-256
   char computedHashHex[Core::SHA256_HEX_LEN + 1];
   Utils::bytesToHex(computedHash, 32, computedHashHex);
   if (strcasecmp(computedHashHex, expectedSha256) != 0) {
@@ -1575,14 +1734,6 @@ bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
   }
   Serial.println("[OTA] SHA-256 verified OK");
 
-  // Verify Ed25519 signature (R10A-2 — audit round 10: REAL implementation, fail-closed)
-  //
-  // Production mode: if OTA_ED25519_PUBLIC_KEY_HEX is configured, signature
-  // verification is MANDATORY. Invalid signature → Update.abort() → return false.
-  // NO BYPASS. NO "warning + continue".
-  //
-  // If OTA_ED25519_PUBLIC_KEY_HEX is EMPTY: hard-fail (refuse to install).
-  // This prevents silent downgrade to unsigned OTA in production.
   if (strlen(Core::OTA_ED25519_PUBLIC_KEY_HEX) == 0) {
     Services::Log.append(Core::LogType::Error,
       "OTA: FATAL — OTA_ED25519_PUBLIC_KEY_HEX not configured. Refusing to install unsigned firmware.", 0);
@@ -1613,10 +1764,18 @@ bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
     return false;
   }
 
-  // Signature verified OK — safe to finalize
+  // Signature verified OK — safe to finalize (commit point).
+  // Update.end(true) is the atomic commit: marks partition as valid for next boot.
+  // Before this line, the OTA partition contains written-but-unverified data
+  // that will NOT boot. Only after this line does the new firmware become active.
   if (Update.end(true) && Update.isFinished()) {
     Services::Log.append(Core::LogType::Ota,
       "OTA success: " + String(written) + " bytes, v" + version + " (SHA-256 + Ed25519 verified)", 0);
+    // Reset rate limit counter on success (don't penalize successful updates)
+    Preferences resetPrefs;
+    resetPrefs.begin(Core::NVS_NAMESPACE, false);
+    resetPrefs.putUChar(NVS_KEY_OTA_ATTEMPT_COUNT, 0);
+    resetPrefs.end();
     return true;
   } else {
     Services::Log.append(Core::LogType::Error,

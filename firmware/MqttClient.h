@@ -45,7 +45,10 @@ public:
   void loop();
   bool isConnected();  // non-const: PubSubClient::connected() is non-const
   void publishStatus();
-  void publishLog(Core::LogType type, const String& message, int8_t channelId);
+  // CYCLE-7 (fixes F-023): publishLog now accepts explicit logId from LogService
+  //   (was using millis() & 0xFFFFFF which collides on wrap and isn't unique per-boot).
+  //   If logId=0 (legacy caller), falls back to a module-local monotonic counter.
+  void publishLog(Core::LogType type, const String& message, int8_t channelId, uint32_t logId = 0);
   void publishOnline();
 
 private:
