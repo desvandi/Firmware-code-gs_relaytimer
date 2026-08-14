@@ -73,7 +73,19 @@ namespace Core {
   //   6. Re-flash firmware, update PWA NEXT_PUBLIC_MQTT_BROKER_URL
   //
   // For development/MVP: leave MQTT_BROKER_USERNAME empty for public broker (no auth).
-  // Topic password still provides basic obscurity but is NOT authentication.
+  //
+  // R10F-5: PRODUCTION_BUILD build flag for stronger security guard.
+  // Define PRODUCTION_BUILD in platformio.ini build_flags or Arduino IDE
+  // -DPRODUCTION_BUILD to enforce TLS+auth+CA requirements regardless of port.
+  // When PRODUCTION_BUILD is defined:
+  //   - TLS is MANDATORY (port must be 8883/8884)
+  //   - MQTT_BROKER_USERNAME must be non-empty
+  //   - MQTT_BROKER_PASSWORD must be non-empty
+  //   - MQTT_ROOT_CA must be non-empty
+  //   - ALLOWED_CORS_ORIGINS must NOT be "*"
+  //   - OTA_ED25519_PUBLIC_KEY_HEX must be non-empty
+  //   - OTA_HTTPS_ROOT_CA must be non-empty
+  // If any check fails → firmware refuses to boot (hard fail).
   constexpr const char* MQTT_BROKER_HOST = "broker.hivemq.com";
   constexpr uint16_t MQTT_BROKER_PORT = 1883;
   constexpr const char* MQTT_BROKER_USERNAME = "";  // Empty = no auth (public broker). PRODUCTION: set per-device credential.

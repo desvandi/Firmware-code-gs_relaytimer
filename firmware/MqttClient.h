@@ -6,18 +6,23 @@
 // ESP32 publishes status + logs; subscribes to commands from PWA.
 // Works behind CGNAT/MiFi because MQTT uses outbound connection.
 //
-// Topic structure (unique per device, based on MAC address):
-//   timer12/<mac>/<mqttPass>/status   — ESP32 publishes SystemStatus JSON (every 5s + on-change)
-//   timer12/<mac>/<mqttPass>/command  — PWA publishes command JSON, ESP32 executes
-//   timer12/<mac>/<mqttPass>/log      — ESP32 publishes activity log entries (real-time)
-//   timer12/<mac>/<mqttPass>/online   — ESP32 publishes "1" on connect, "0" on disconnect (LWT)
-//   timer12/<mac>/<mqttPass>/ota      — PWA publishes OTA update commands (signed)
-//   timer12/<mac>/<mqttPass>/ack      — ESP32 publishes ACK for each command (with actual result)
+// Topic structure (R10C-3: password removed from topic — auth via broker creds):
+//   timer12/<mac>/status   — ESP32 publishes SystemStatus JSON (every 5s + on-change)
+//   timer12/<mac>/command  — PWA publishes command JSON, ESP32 executes
+//   timer12/<mac>/log      — ESP32 publishes activity log entries (real-time)
+//   timer12/<mac>/online   — ESP32 publishes "1" on connect, "0" on disconnect (LWT)
+//   timer12/<mac>/ota      — PWA publishes OTA update commands (signed)
+//   timer12/<mac>/ack      — ESP32 publishes ACK for each command (with actual result)
 //
-// Audit round 9 changes:
-//   - Dedup buffer: requestId added to buffer ONLY after successful execution
-//   - Duplicate ACK: includes actual relay state (channelId/state/source/modeAuto)
-//   - All mutations (relay/schedule/pir/channel/time/system/config) send ACK with data
+// Authentication: via broker username/password (MQTT CONNECT)
+// Authorization: via broker ACL (per-device topic restrictions)
+//
+// Audit round 10E/10F changes:
+//   - R10E-1: Atomic ACK transaction (construct → publish → store in one call)
+//   - R10E-2: Validation order: type → fields → hash → dedup → execute
+//   - R10E-3: Dedup TTL (15min, timestamp-based)
+//   - R10F-1: Check publish() return value — don't store if publish fails
+//   - R10F-2: Clean up expired dedup entries on discovery (no stale shadowing)
 //   - Invalid actions return success:false (not silently ignored)
 //   - OTA via MQTT: requires Ed25519 signature + SHA-256 hash + size + requestId
 //   - TLS: setCACert() instead of setInsecure() when MQTT_ROOT_CA is set

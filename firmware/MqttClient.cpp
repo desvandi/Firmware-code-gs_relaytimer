@@ -36,33 +36,75 @@ static const char* LOG_TYPE_NAMES[] = {
 };
 
 bool MqttClient::begin() {
-  // R10A-5 (audit round 10): Production MQTT guard.
-  // For 220V relay control, MQTT must be TLS + authenticated + CA-verified.
-  // Production mode is triggered by: port 8883 OR 8884.
+  // R10A-5 / R10F-5 (audit round 10F): Production MQTT guard.
+  //
+  // Two ways to trigger production mode:
+  //   1. Port-based: MQTT_BROKER_PORT == 8883 || 8884 (automatic)
+  //   2. Build flag: PRODUCTION_BUILD defined (explicit, stronger)
+  //
+  // R10F-5: PRODUCTION_BUILD flag enforces requirements REGARDLESS of port.
+  // This prevents accidental deployment with port 1883 + plaintext in production.
+  //
   // In production mode, ALL of these must be configured:
+  //   - MQTT_BROKER_PORT must be 8883 or 8884 (TLS)
   //   - MQTT_BROKER_USERNAME (non-empty)
   //   - MQTT_BROKER_PASSWORD (non-empty)
   //   - MQTT_ROOT_CA (non-empty PEM)
+  //   - ALLOWED_CORS_ORIGINS must NOT be "*"
+  //   - OTA_ED25519_PUBLIC_KEY_HEX must be non-empty
+  //   - OTA_HTTPS_ROOT_CA must be non-empty
   // If any is missing → hard fail (refuse to connect).
-  //
-  // For development (port 1883): public broker + topic password is acceptable.
   bool isProductionMode = (Core::MQTT_BROKER_PORT == 8883 || Core::MQTT_BROKER_PORT == 8884);
+
+#ifdef PRODUCTION_BUILD
+  // R10F-5: Build-flag-based production guard — stronger than port-based.
+  isProductionMode = true;
+  Serial.println("[MQTT] PRODUCTION_BUILD flag defined — enforcing all production requirements");
+
+  // In production build, TLS port is MANDATORY
+  if (Core::MQTT_BROKER_PORT != 8883 && Core::MQTT_BROKER_PORT != 8884) {
+    Serial.printf("[MQTT] FATAL: PRODUCTION_BUILD requires TLS port (8883/8884), got %d\n",
+                  Core::MQTT_BROKER_PORT);
+    Serial.println("[MQTT] Refusing to use plaintext MQTT in production build.");
+    _initialized = false;
+    return false;
+  }
+
+  // CORS must not be wildcard
+  if (strcmp(Core::ALLOWED_CORS_ORIGINS, "*") == 0) {
+    Serial.println("[MQTT] FATAL: PRODUCTION_BUILD requires ALLOWED_CORS_ORIGINS (not '*')");
+    _initialized = false;
+    return false;
+  }
+
+  // OTA signing must be configured
+  if (strlen(Core::OTA_ED25519_PUBLIC_KEY_HEX) == 0) {
+    Serial.println("[MQTT] FATAL: PRODUCTION_BUILD requires OTA_ED25519_PUBLIC_KEY_HEX");
+    _initialized = false;
+    return false;
+  }
+  if (strlen(Core::OTA_HTTPS_ROOT_CA) == 0) {
+    Serial.println("[MQTT] FATAL: PRODUCTION_BUILD requires OTA_HTTPS_ROOT_CA");
+    _initialized = false;
+    return false;
+  }
+#endif
 
   if (isProductionMode) {
     if (strlen(Core::MQTT_BROKER_USERNAME) == 0) {
-      Serial.println("[MQTT] FATAL: Production mode (port 8883/8884) requires MQTT_BROKER_USERNAME");
+      Serial.println("[MQTT] FATAL: Production mode requires MQTT_BROKER_USERNAME");
       Serial.println("[MQTT] Refusing to connect. Configure credentials in Config.h and re-flash.");
       _initialized = false;
       return false;
     }
     if (strlen(Core::MQTT_BROKER_PASSWORD) == 0) {
-      Serial.println("[MQTT] FATAL: Production mode (port 8883/8884) requires MQTT_BROKER_PASSWORD");
+      Serial.println("[MQTT] FATAL: Production mode requires MQTT_BROKER_PASSWORD");
       Serial.println("[MQTT] Refusing to connect. Configure credentials in Config.h and re-flash.");
       _initialized = false;
       return false;
     }
     if (strlen(Core::MQTT_ROOT_CA) == 0) {
-      Serial.println("[MQTT] FATAL: Production mode (port 8883/8884) requires MQTT_ROOT_CA (PEM)");
+      Serial.println("[MQTT] FATAL: Production mode requires MQTT_ROOT_CA (PEM)");
       Serial.println("[MQTT] Refusing to connect with setInsecure() in production.");
       Serial.println("[MQTT] Get Let's Encrypt root CA: https://letsencrypt.org/certs/isrgrootx1.pem");
       Serial.println("[MQTT] Paste PEM in Config.h MQTT_ROOT_CA and re-flash.");
@@ -376,10 +418,16 @@ void MqttClient::_publishAck(const String& requestId, bool success, const char* 
   String json;
   serializeJson(doc, json);
 
-  // R10E-1: Atomic publish + store
-  _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-  if (success && commandHash.length() > 0) {
+  // R10F-1: Check publish() return value before storing.
+  // If publish fails, DON'T store in dedup buffer — PWA never received ACK,
+  // so it will retry. If we stored anyway, retry would be seen as duplicate
+  // and we'd replay an ACK that was never delivered.
+  bool published = _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
+  if (published && success && commandHash.length() > 0) {
     _addProcessed(requestId, commandHash, json);
+  }
+  if (!published) {
+    Serial.printf("[MQTT ACK] WARNING: publish failed for %s — NOT stored in dedup\n", requestId.c_str());
   }
   Serial.printf("[MQTT ACK] %s: %s%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL",
@@ -413,10 +461,16 @@ void MqttClient::_publishRelayAck(const String& requestId, bool success, const c
   String json;
   serializeJson(doc, json);
 
-  // R10E-1: Atomic publish + store
-  _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-  if (success && commandHash.length() > 0) {
+  // R10F-1: Check publish() return value before storing.
+  // If publish fails, DON'T store in dedup buffer — PWA never received ACK,
+  // so it will retry. If we stored anyway, retry would be seen as duplicate
+  // and we'd replay an ACK that was never delivered.
+  bool published = _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
+  if (published && success && commandHash.length() > 0) {
     _addProcessed(requestId, commandHash, json);
+  }
+  if (!published) {
+    Serial.printf("[MQTT ACK] WARNING: publish failed for %s — NOT stored in dedup\n", requestId.c_str());
   }
   Serial.printf("[MQTT ACK] %s: %s (relay CH%d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", channelId,
@@ -443,10 +497,16 @@ void MqttClient::_publishScheduleAck(const String& requestId, bool success, cons
   String json;
   serializeJson(doc, json);
 
-  // R10E-1: Atomic publish + store
-  _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-  if (success && commandHash.length() > 0) {
+  // R10F-1: Check publish() return value before storing.
+  // If publish fails, DON'T store in dedup buffer — PWA never received ACK,
+  // so it will retry. If we stored anyway, retry would be seen as duplicate
+  // and we'd replay an ACK that was never delivered.
+  bool published = _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
+  if (published && success && commandHash.length() > 0) {
     _addProcessed(requestId, commandHash, json);
+  }
+  if (!published) {
+    Serial.printf("[MQTT ACK] WARNING: publish failed for %s — NOT stored in dedup\n", requestId.c_str());
   }
   Serial.printf("[MQTT ACK] %s: %s (schedule CH%d id=%d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", channelId, scheduleId,
@@ -478,10 +538,16 @@ void MqttClient::_publishPirAck(const String& requestId, bool success, const cha
   String json;
   serializeJson(doc, json);
 
-  // R10E-1: Atomic publish + store
-  _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-  if (success && commandHash.length() > 0) {
+  // R10F-1: Check publish() return value before storing.
+  // If publish fails, DON'T store in dedup buffer — PWA never received ACK,
+  // so it will retry. If we stored anyway, retry would be seen as duplicate
+  // and we'd replay an ACK that was never delivered.
+  bool published = _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
+  if (published && success && commandHash.length() > 0) {
     _addProcessed(requestId, commandHash, json);
+  }
+  if (!published) {
+    Serial.printf("[MQTT ACK] WARNING: publish failed for %s — NOT stored in dedup\n", requestId.c_str());
   }
   Serial.printf("[MQTT ACK] %s: %s (pir %d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", pirId,
@@ -509,10 +575,16 @@ void MqttClient::_publishChannelAck(const String& requestId, bool success, const
   String json;
   serializeJson(doc, json);
 
-  // R10E-1: Atomic publish + store
-  _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
-  if (success && commandHash.length() > 0) {
+  // R10F-1: Check publish() return value before storing.
+  // If publish fails, DON'T store in dedup buffer — PWA never received ACK,
+  // so it will retry. If we stored anyway, retry would be seen as duplicate
+  // and we'd replay an ACK that was never delivered.
+  bool published = _mqtt.publish(_topicAck.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
+  if (published && success && commandHash.length() > 0) {
     _addProcessed(requestId, commandHash, json);
+  }
+  if (!published) {
+    Serial.printf("[MQTT ACK] WARNING: publish failed for %s — NOT stored in dedup\n", requestId.c_str());
   }
   Serial.printf("[MQTT ACK] %s: %s (channel CH%d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", channelId,
@@ -1402,34 +1474,70 @@ static String _processedAckResults[DEDUP_BUFFER_SIZE];
 static unsigned long _processedTimestamps[DEDUP_BUFFER_SIZE];  // R10E-3: millis() when stored
 static uint8_t _dedupIdx = 0;
 
-// R10E-3: Check if requestId is duplicate AND still within TTL.
+// R10E-3 / R10F-2: Check if requestId is duplicate AND still within TTL.
+//
+// R10F-2 FIX: When an expired entry is found, CLEAR it immediately.
+// Previous bug: expired entry stayed in buffer, causing _isDuplicate() to
+// find the OLD expired entry first (returning false) even if a NEWER valid
+// entry with same requestId existed in another slot. This led to double
+// execution of commands after TTL expiry.
+//
+// Now: expired entries are cleaned up on discovery. The loop CONTINUES
+// searching for a valid (non-expired) entry with same requestId.
 bool MqttClient::_isDuplicate(const String& requestId) {
   unsigned long now = millis();
   for (uint8_t i = 0; i < DEDUP_BUFFER_SIZE; i++) {
     if (_processedIds[i] == requestId) {
-      // R10E-3: Check TTL — if expired, treat as not-duplicate (allow re-execute)
+      // R10F-2: Check TTL — if expired, CLEAN UP this slot and continue searching
       if (now - _processedTimestamps[i] > DEDUP_TTL_MS) {
-        return false;  // expired — treat as new command
+        // Expired — clear this slot so it can't shadow newer entries
+        _processedIds[i] = "";
+        _processedHashes[i] = "";
+        _processedAckResults[i] = "";
+        _processedTimestamps[i] = 0;
+        // Continue searching — there might be a newer valid entry with same requestId
+        continue;
       }
-      return true;
+      return true;  // found valid (non-expired) duplicate
     }
   }
-  return false;
+  return false;  // no valid duplicate found
 }
 
-// R10A-3: Find the commandHash associated with a previously-seen requestId.
-String _getHashForRequestId(const String& requestId) {
+// R10F-2: Helper that finds the FIRST VALID (non-expired) entry for a requestId.
+// Also cleans up expired entries encountered during search.
+// Returns index of valid entry, or -1 if not found / all expired.
+static int _findValidDedupEntry(const String& requestId) {
+  unsigned long now = millis();
   for (uint8_t i = 0; i < DEDUP_BUFFER_SIZE; i++) {
-    if (_processedIds[i] == requestId) return _processedHashes[i];
+    if (_processedIds[i] == requestId) {
+      if (now - _processedTimestamps[i] > DEDUP_TTL_MS) {
+        // Expired — clean up
+        _processedIds[i] = "";
+        _processedHashes[i] = "";
+        _processedAckResults[i] = "";
+        _processedTimestamps[i] = 0;
+        continue;  // keep searching for valid entry
+      }
+      return i;  // found valid entry
+    }
   }
+  return -1;  // no valid entry
+}
+
+// R10A-3: Find the commandHash for a valid (non-expired) requestId.
+// R10F-2: Now uses _findValidDedupEntry to skip expired entries.
+String _getHashForRequestId(const String& requestId) {
+  int idx = _findValidDedupEntry(requestId);
+  if (idx >= 0) return _processedHashes[idx];
   return "";
 }
 
-// R10D-2: Get the ORIGINAL ACK result JSON for a previously-processed requestId.
+// R10D-2: Get the ORIGINAL ACK result JSON for a valid (non-expired) requestId.
+// R10F-2: Now uses _findValidDedupEntry to skip expired entries.
 String _getAckResultForRequestId(const String& requestId) {
-  for (uint8_t i = 0; i < DEDUP_BUFFER_SIZE; i++) {
-    if (_processedIds[i] == requestId) return _processedAckResults[i];
-  }
+  int idx = _findValidDedupEntry(requestId);
+  if (idx >= 0) return _processedAckResults[idx];
   return "";
 }
 
