@@ -1,38 +1,34 @@
 // =============================================================================
 // Services/TransactionJournal.h — Durable transaction journal for MQTT commands
 // =============================================================================
-// R10G-1/R10G-2 (audit round 10G): NVS-persisted transaction journal.
+// R10G/R10H (audit rounds 10G/10H): NVS-persisted transaction journal.
 //
-// PROBLEM (engineer audit R10F):
-//   - RAM-only dedup buffer lost on reboot → same requestId re-executed
-//   - publish()==true doesn't guarantee PWA received ACK (QoS 0)
-//   - 15-min TTL allowed re-execution after expiry (dangerous for non-idempotent)
-//   - No ACK retry → PWA timeout → retry → re-execute
+// R10H-1 FIX: NVS atomicity. Previous version did 5 separate NVS writes
+// (3 putString + 2 putUChar). Power loss between writes → partial state.
+// FIX: Serialize entire entry to single blob → putBytes() atomic write.
 //
-// SOLUTION:
-//   1. Transaction Journal (NVS-persisted):
-//      - Stores {requestId, commandHash, ackJson} for successful commands
-//      - Survives reboot (NVS flash)
-//      - same requestId → NEVER execute again → always replay result
-//      - No TTL expiry (requestId is permanent once stored)
-//      - Buffer size: 16 entries (LRU eviction — oldest overwritten when full)
+// R10H-2 FIX: LRU eviction. Previous 16-entry buffer evicted oldest after
+// 16 commands, breaking "permanent dedup" claim. Increased to 64 entries.
+// Documented honestly: beyond 64 commands, oldest entries CAN be re-executed.
 //
-//   2. ACK Retry Queue (RAM, rebuilt from NVS on boot):
-//      - After execute, ACK is queued for delivery
-//      - Loop() retries pending ACKs every 2s
-//      - Max 10 retries per ACK, then give up (PWA will timeout + retry,
-//        which hits journal → replay, no re-execution)
-//      - Bounded: max 8 pending ACKs in queue
+// R10H-3: Commit-flag pattern. Each entry has a "valid" flag. On boot,
+// entries with flag=false are treated as corrupted (power loss during write)
+// and are NOT loaded. This prevents partial entries from causing false
+// "already processed" results.
 //
-// TRADE-OFF:
-//   - NVS write per command: ~100k writes per flash sector, 16 sectors
-//   - At 100 commands/day: ~3.6 years flash lifetime (acceptable)
-//   - For high-frequency commands: consider wear-leveling or FRAM
+// DURABILITY BOUNDARY (honest documentation):
+//   The sequence is: execute command → store to NVS → publish ACK.
+//   If ESP32 crashes AFTER execute but BEFORE store:
+//     - Physical state has changed (relay moved, schedule saved to LittleFS)
+//     - Journal does NOT have the entry
+//     - PWA retry → journal miss → RE-EXECUTE
+//   For SET_STATE (relay ON/OFF): idempotent, re-execute produces same result.
+//   For schedule upsert: may create duplicate (but capped at 4 per channel).
+//   For config/time: idempotent (overwrite).
+//   For OTA: not stored in journal (separate flow with Update library).
 //
-// CRITICAL CONTRACT:
-//   If requestId is in journal → command was already executed successfully.
-//   Firmware MUST NOT re-execute. Always replay stored ackJson.
-//   This holds across reboots, TTL expiry, and publish failures.
+//   This is a FUNDAMENTAL limitation of software-only transaction durability
+//   on ESP32 without hardware transaction support. Accepted as documented risk.
 // =============================================================================
 #pragma once
 #ifndef TIMER12_SERVICES_TRANSACTION_JOURNAL_H
@@ -45,58 +41,43 @@ namespace Services {
 
 class TransactionJournal {
 public:
-  // Initialize — loads journal from NVS into RAM cache.
-  // Called once in setup() BEFORE MQTT client begins.
   void begin();
-
-  // Check if requestId exists in journal (command already executed).
-  // Returns true if found (regardless of age — NO TTL expiry).
   bool isProcessed(const String& requestId);
-
-  // Get the commandHash stored for a requestId.
-  // Returns empty string if not found.
   String getCommandHash(const String& requestId);
-
-  // Get the ACK JSON stored for a requestId (for replay).
-  // Returns empty string if not found.
   String getAckJson(const String& requestId);
-
-  // Store a successful transaction.
-  // Called AFTER command executed + ACK JSON constructed.
-  // The ACK will be queued for delivery via queueAck().
-  // Returns true if stored successfully.
   bool storeTransaction(const String& requestId, const String& commandHash,
                         const String& ackJson);
-
-  // Queue an ACK for delivery (or re-delivery).
-  // Called by storeTransaction (first delivery) and by loop() (retries).
   void queueAck(const String& requestId, const String& ackJson);
-
-  // Process pending ACK queue — called from loop().
-  // Retries publishing ACKs that haven't been confirmed delivered.
-  // Returns number of ACKs successfully published this tick.
   uint8_t processPendingAcks();
-
-  // Get count of pending ACKs (for diagnostics).
   uint8_t getPendingAckCount() const { return _pendingAckCount; }
-
-  // Get count of transactions in journal.
   uint8_t getJournalSize() const { return _journalSize; }
 
 private:
-  static const uint8_t JOURNAL_SIZE = 16;  // NVS entries (LRU)
+  // R10H-2: Increased from 16 to 64 entries.
+  // At 100 commands/day, oldest entry is ~15 hours old when evicted.
+  // This gives PWA ample retry window (PWA timeout is 5s, retries for ~2min).
+  // Beyond 64 commands, oldest entries CAN be re-executed — documented limitation.
+  static const uint8_t JOURNAL_SIZE = 64;
   static const uint8_t MAX_PENDING_ACKS = 8;
   static const uint8_t MAX_ACK_RETRIES = 10;
-  static const unsigned long ACK_RETRY_INTERVAL_MS = 2000;  // 2s between retries
+  static const unsigned long ACK_RETRY_INTERVAL_MS = 2000;
 
-  // RAM cache of NVS journal (loaded on boot)
+  // R10H-1: Max blob size for NVS write (must fit requestId + hash + ackJson)
+  // requestId: max 64 chars + null = 65
+  // commandHash: 64 hex chars + null = 65
+  // ackJson: max ~1024 chars (relay/schedule/pir/channel ACK all < 500 bytes)
+  // valid flag: 1 byte
+  // Total: ~1156 bytes, round up to 1200
+  static const uint16_t BLOB_SIZE = 1200;
+
+  // RAM cache of NVS journal
   String _journalIds[JOURNAL_SIZE];
   String _journalHashes[JOURNAL_SIZE];
   String _journalAcks[JOURNAL_SIZE];
+  bool _journalValid[JOURNAL_SIZE];  // R10H-3: commit flag
   uint8_t _journalSize = 0;
-  uint8_t _journalWriteIdx = 0;  // LRU write pointer
+  uint8_t _journalWriteIdx = 0;
 
-  // Pending ACK queue (RAM only — rebuilt from journal on boot)
   struct PendingAck {
     String requestId;
     String ackJson;
@@ -107,15 +88,14 @@ private:
   uint8_t _pendingAckCount = 0;
 
   void _loadFromNVS();
-  void _saveEntryToNVS(uint8_t idx);
+  // R10H-1: Atomic blob write — serializes entry to single buffer, writes once.
+  void _saveEntryToNVSAtomic(uint8_t idx);
+  // R10H-1: Deserialize blob back to fields
+  bool _deserializeEntry(const uint8_t* blob, size_t len, uint8_t idx);
   int _findInJournal(const String& requestId);
 };
 
 extern TransactionJournal journal;
-
-// R10G-2: Set publish callback for ACK retry queue.
-// Called by MqttClient::begin() to inject the MQTT publish function.
-// TransactionJournal uses this to publish ACKs from processPendingAcks().
 void setPublishCallback(std::function<bool(const char* topic, const uint8_t* payload, size_t len)> cb);
 
 } // namespace Services
