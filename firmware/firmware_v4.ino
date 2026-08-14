@@ -80,6 +80,7 @@
 #include "AuthManager.h"
 #include "OtaManager.h"
 #include "MqttClient.h"
+#include "TransactionJournal.h"  // R10G-1: NVS transaction journal
 
 // Web
 #include "HttpServer.h"

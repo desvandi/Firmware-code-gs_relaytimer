@@ -60,6 +60,7 @@ private:
   String _topicOnline;
   String _topicOta;
   String _topicAck;
+  String _topicAckForJournal;  // R10G-2: stored for publish callback
   unsigned long _lastPublishMs = 0;
   unsigned long _lastReconnectMs = 0;
   bool _initialized = false;
