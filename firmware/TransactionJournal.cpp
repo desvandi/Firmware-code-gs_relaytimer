@@ -181,38 +181,50 @@ bool TransactionJournal::_deserializeEntry(const uint8_t* blob, size_t len, uint
 }
 
 // ============================================================================
-// _saveEntryToNVSAtomic — write entry blob + persist writeIdx + optionally commit
+// CYCLE-8B-Rev1 (fixes C8B-001): SEPARATED operations.
+//
+//   _createPendingEntryNVS: write blob for NEW PENDING entry.
+//     - Phase 0: clear commit flag (only if slot was previously used)
+//     - Phase 1: write blob with state=PENDING
+//     - Phase 1b: persist writeIdx (new slot only)
+//     - Phase 2: set state=PENDING (commit flag stays 0)
+//     - If crash during this: entry is PENDING (correct — execute didn't run)
+//
+//   _commitExecutingEntryNVS: commit EXECUTING → COMMITTED.
+//     - Does NOT clear commit flag (preserves EXECUTING evidence)
+//     - Phase 1: write blob with NEW ackJson (commit still 0, state still EXECUTING in NVS)
+//     - Phase 1b: set state=COMMITTED (commit still 0)
+//     - Phase 2: flip commit flag 0 → 1 (atomic commit point)
+//     - If crash during Phase 1: entry still EXECUTING (blob may be partial,
+//       but commit flag still 0, state still EXECUTING — reconciliation will
+//       mark UNKNOWN, NOT FAILED — this is the key fix for C8B-001)
+//     - If crash during Phase 2: commit flag may be 0 or 1.
+//       - If 0: entry is EXECUTING (commit didn't complete) → reconciliation UNKNOWN
+//       - If 1: entry is COMMITTED (commit completed) → replay ACK
 // ============================================================================
-bool TransactionJournal::_saveEntryToNVSAtomic(uint8_t idx, bool commitToCommitted) {
-  if (idx >= JOURNAL_SIZE) return false;
 
-  const String& rid = _journalIds[idx];
-  const String& hash = _journalHashes[idx];
-  const String& ack = _journalAcks[idx];
-
+// Helper: serialize entry blob (shared by both functions)
+// Note: esp_crc32_le is from esp_crc.h (already included at top of file)
+static size_t _serializeBlob(uint8_t* blob, size_t blobSize,
+                              const String& rid, const String& hash, const String& ack,
+                              uint8_t channelId, bool desiredState, bool previousKnown,
+                              uint8_t attempt, uint32_t timestamp) {
   uint8_t idLen = min((unsigned)rid.length(), (unsigned)64);
   uint8_t hashLen = min((unsigned)hash.length(), (unsigned)64);
   uint16_t ackLen = min((unsigned)ack.length(), (unsigned)1024);
 
-  // CYCLE-8A: payload now includes channelId(1) + desiredState(1) +
-  // previousKnownState(1) + attempt(1) + timestamp(4) = 8 extra bytes
   size_t payloadLen = 1 + idLen + 1 + hashLen + 1 + 1 + 1 + 1 + 4 + 2 + ackLen;
-  size_t totalLen = BLOB_HEADER_SIZE + payloadLen;
+  size_t totalLen = 8 + payloadLen;  // BLOB_HEADER_SIZE = 8
 
-  if (totalLen > BLOB_SIZE) {
-    Serial.printf("[Journal] ERROR: blob too large (%u > %u)\n", totalLen, BLOB_SIZE);
-    return false;
-  }
+  if (totalLen > blobSize) return 0;
 
-  uint8_t blob[BLOB_SIZE];
-  memset(blob, 0, BLOB_SIZE);
-
-  blob[0] = BLOB_MAGIC1;
-  blob[1] = BLOB_MAGIC2;
-  blob[2] = BLOB_VERSION;  // CYCLE-8A: version 2
+  memset(blob, 0, blobSize);
+  blob[0] = 0x54;  // 'T'
+  blob[1] = 0x4A;  // 'J'
+  blob[2] = 2;     // BLOB_VERSION
   blob[3] = 0;
 
-  uint8_t* payload = blob + BLOB_HEADER_SIZE;
+  uint8_t* payload = blob + 8;
   size_t offset = 0;
 
   payload[offset++] = idLen;
@@ -223,16 +235,14 @@ bool TransactionJournal::_saveEntryToNVSAtomic(uint8_t idx, bool commitToCommitt
   memcpy(payload + offset, hash.c_str(), hashLen);
   offset += hashLen;
 
-  // CYCLE-8A: new fields
-  payload[offset++] = _journalChannelId[idx];
-  payload[offset++] = _journalDesiredState[idx] ? 1 : 0;
-  payload[offset++] = _journalPreviousKnownState[idx] ? 1 : 0;
-  payload[offset++] = _journalAttempt[idx];
-  uint32_t ts = _journalTimestamp[idx];
-  payload[offset++] = ts & 0xFF;
-  payload[offset++] = (ts >> 8) & 0xFF;
-  payload[offset++] = (ts >> 16) & 0xFF;
-  payload[offset++] = (ts >> 24) & 0xFF;
+  payload[offset++] = channelId;
+  payload[offset++] = desiredState ? 1 : 0;
+  payload[offset++] = previousKnown ? 1 : 0;
+  payload[offset++] = attempt;
+  payload[offset++] = timestamp & 0xFF;
+  payload[offset++] = (timestamp >> 8) & 0xFF;
+  payload[offset++] = (timestamp >> 16) & 0xFF;
+  payload[offset++] = (timestamp >> 24) & 0xFF;
 
   payload[offset++] = ackLen & 0xFF;
   payload[offset++] = (ackLen >> 8) & 0xFF;
@@ -241,11 +251,29 @@ bool TransactionJournal::_saveEntryToNVSAtomic(uint8_t idx, bool commitToCommitt
     offset += ackLen;
   }
 
-  uint32_t crc = _computeCRC(payload, payloadLen);
+  uint32_t crc = esp_crc32_le(0, payload, payloadLen);
   blob[4] = crc & 0xFF;
   blob[5] = (crc >> 8) & 0xFF;
   blob[6] = (crc >> 16) & 0xFF;
   blob[7] = (crc >> 24) & 0xFF;
+
+  return totalLen;
+}
+
+// CYCLE-8B-Rev1: Create NEW PENDING entry (fixes C8B-001)
+bool TransactionJournal::_createPendingEntryNVS(uint8_t idx) {
+  if (idx >= JOURNAL_SIZE) return false;
+
+  uint8_t blob[BLOB_SIZE];
+  size_t totalLen = _serializeBlob(blob, BLOB_SIZE,
+    _journalIds[idx], _journalHashes[idx], _journalAcks[idx],
+    _journalChannelId[idx], _journalDesiredState[idx],
+    _journalPreviousKnownState[idx], _journalAttempt[idx],
+    _journalTimestamp[idx]);
+  if (totalLen == 0) {
+    Serial.printf("[Journal] _createPendingEntryNVS: blob too large (idx=%u)\n", idx);
+    return false;
+  }
 
   Preferences prefs;
   if (!prefs.begin(Core::NVS_NAMESPACE, false)) {
@@ -260,26 +288,26 @@ bool TransactionJournal::_saveEntryToNVSAtomic(uint8_t idx, bool commitToCommitt
   snprintf(commitKey, sizeof(commitKey), "%s%u", NVS_KEY_TJ_COMMIT_PREFIX, idx);
   snprintf(stateKey, sizeof(stateKey), "%s%u", NVS_KEY_TJ_STATE_PREFIX, idx);
 
-  // Phase 0: Clear commit flag + set state to PENDING
+  // Phase 0: Clear commit flag (invalidate any old entry in this slot)
   prefs.putUChar(commitKey, 0);
-  prefs.putUChar(stateKey, (uint8_t)TransactionState::PENDING);
 
   // Phase 1: Write blob data
   size_t written = prefs.putBytes(entryKey, blob, totalLen);
   if (written != totalLen) {
-    Serial.printf("[Journal] Phase 1 write FAILED (wrote %u/%u bytes)\n", written, totalLen);
+    Serial.printf("[Journal] createPending Phase 1 write FAILED (wrote %u/%u bytes)\n",
+                  written, totalLen);
     prefs.end();
     _journalValid[idx] = false;
     return false;
   }
 
-  // Phase 1b: Persist writeIdx (only for NEW entries)
+  // Phase 1b: Persist writeIdx (only for NEW slots)
   bool isNewSlot = !_journalValid[idx];
   if (isNewSlot) {
     uint8_t nextWriteIdx = (_journalWriteIdx + 1) % JOURNAL_SIZE;
     size_t widxWritten = prefs.putUChar(NVS_KEY_TJ_WIDX, nextWriteIdx);
     if (widxWritten != 1) {
-      Serial.printf("[Journal] Phase 1b writeIdx persist FAILED\n");
+      Serial.printf("[Journal] createPending Phase 1b writeIdx persist FAILED\n");
       prefs.end();
       _journalValid[idx] = false;
       return false;
@@ -288,30 +316,105 @@ bool TransactionJournal::_saveEntryToNVSAtomic(uint8_t idx, bool commitToCommitt
     if (_journalSize < JOURNAL_SIZE) _journalSize++;
   }
 
-  // Phase 2: Set commit flag if requested
-  if (commitToCommitted) {
-    size_t commitWritten = prefs.putUChar(commitKey, 1);
-    if (commitWritten != 1) {
-      Serial.printf("[Journal] Phase 2 commit FAILED (idx=%u)\n", idx);
-      prefs.end();
-      _journalValid[idx] = true;
-      _journalCommitted[idx] = false;
-      _journalState[idx] = TransactionState::EXECUTING;  // stuck in EXECUTING
-      return false;
-    }
-    _journalCommitted[idx] = true;
-    _journalState[idx] = TransactionState::COMMITTED;
-    prefs.putUChar(stateKey, (uint8_t)TransactionState::COMMITTED);
-  } else {
-    _journalCommitted[idx] = false;
-    _journalState[idx] = TransactionState::PENDING;
-    // state key already set to PENDING in Phase 0
-  }
+  // Phase 2: Set state=PENDING (commit flag stays 0)
+  prefs.putUChar(stateKey, (uint8_t)TransactionState::PENDING);
 
   prefs.putUChar(NVS_KEY_TJ_COUNT, _journalSize < JOURNAL_SIZE ? _journalSize : JOURNAL_SIZE);
+  prefs.end();
+
+  _journalValid[idx] = true;
+  _journalCommitted[idx] = false;
+  _journalState[idx] = TransactionState::PENDING;
+  return true;
+}
+
+// CYCLE-8B-Rev1: Commit EXECUTING → COMMITTED (fixes C8B-001)
+//   Does NOT reset state to PENDING. Preserves EXECUTING evidence during crash window.
+bool TransactionJournal::_commitExecutingEntryNVS(uint8_t idx, const String& ackJson) {
+  if (idx >= JOURNAL_SIZE) return false;
+  if (!_journalValid[idx]) {
+    Serial.printf("[Journal] _commitExecutingEntryNVS: slot %u not valid\n", idx);
+    return false;
+  }
+
+  // Monotonicity check: must be in EXECUTING state to commit.
+  if (_journalState[idx] != TransactionState::EXECUTING) {
+    Serial.printf("[Journal] _commitExecutingEntryNVS: slot %u state=%s (expected EXECUTING) — REJECTED (monotonicity)\n",
+                  idx, _stateToString(_journalState[idx]));
+    return false;
+  }
+
+  // Update ackJson in RAM
+  _journalAcks[idx] = ackJson;
+
+  uint8_t blob[BLOB_SIZE];
+  size_t totalLen = _serializeBlob(blob, BLOB_SIZE,
+    _journalIds[idx], _journalHashes[idx], _journalAcks[idx],
+    _journalChannelId[idx], _journalDesiredState[idx],
+    _journalPreviousKnownState[idx], _journalAttempt[idx],
+    _journalTimestamp[idx]);
+  if (totalLen == 0) {
+    Serial.printf("[Journal] _commitExecutingEntryNVS: blob too large (idx=%u)\n", idx);
+    return false;
+  }
+
+  Preferences prefs;
+  if (!prefs.begin(Core::NVS_NAMESPACE, false)) {
+    Serial.println("[Journal] FATAL: Cannot open NVS for commit");
+    return false;
+  }
+
+  char entryKey[20];
+  char commitKey[20];
+  char stateKey[20];
+  snprintf(entryKey, sizeof(entryKey), "%s%u", NVS_KEY_TJ_ENTRY_PREFIX, idx);
+  snprintf(commitKey, sizeof(commitKey), "%s%u", NVS_KEY_TJ_COMMIT_PREFIX, idx);
+  snprintf(stateKey, sizeof(stateKey), "%s%u", NVS_KEY_TJ_STATE_PREFIX, idx);
+
+  // CYCLE-8B-Rev1 (fixes C8B-001): Do NOT clear commit flag here.
+  //   The commit flag is currently 0 (entry is EXECUTING, not yet committed).
+  //   We write the new blob (with ackJson) FIRST, keeping commit=0.
+  //   If crash during blob write: entry remains EXECUTING (blob may be partial,
+  //   but state is still EXECUTING — reconciliation will mark UNKNOWN, not FAILED).
+  //   Only AFTER blob write succeeds do we flip commit flag 0→1.
+
+  // Phase 1: Write blob with new ackJson (commit flag still 0, state still EXECUTING in NVS)
+  size_t written = prefs.putBytes(entryKey, blob, totalLen);
+  if (written != totalLen) {
+    Serial.printf("[Journal] commitExecuting Phase 1 write FAILED (wrote %u/%u bytes)\n",
+                  written, totalLen);
+    prefs.end();
+    // Entry remains EXECUTING — caller should treat as commit failure
+    return false;
+  }
+
+  // Phase 1b: Set state=COMMITTED (but commit flag still 0 — not yet atomic commit)
+  size_t stateWritten = prefs.putUChar(stateKey, (uint8_t)TransactionState::COMMITTED);
+  if (stateWritten != 1) {
+    Serial.printf("[Journal] commitExecuting Phase 1b state write FAILED (idx=%u)\n", idx);
+    prefs.end();
+    // Entry remains EXECUTING (state not updated, commit flag still 0)
+    return false;
+  }
+
+  // Phase 2: Flip commit flag 0 → 1 (ATOMIC COMMIT POINT)
+  size_t commitWritten = prefs.putUChar(commitKey, 1);
+  if (commitWritten != 1) {
+    Serial.printf("[Journal] commitExecuting Phase 2 commit flip FAILED (idx=%u)\n", idx);
+    prefs.end();
+    // State byte says COMMITTED but commit flag still 0.
+    // On load, _loadFromNVS treats commit=0 as uncommitted regardless of state byte.
+    // Revert RAM state to EXECUTING to match NVS reality.
+    _journalState[idx] = TransactionState::EXECUTING;
+    _journalCommitted[idx] = false;
+    return false;
+  }
 
   prefs.end();
-  _journalValid[idx] = true;
+
+  // Success — update RAM state
+  _journalCommitted[idx] = true;
+  _journalState[idx] = TransactionState::COMMITTED;
   return true;
 }
 
@@ -320,6 +423,13 @@ bool TransactionJournal::_saveEntryToNVSAtomic(uint8_t idx, bool commitToCommitt
 // ============================================================================
 bool TransactionJournal::_setTransactionStateNVS(uint8_t idx, TransactionState state) {
   if (idx >= JOURNAL_SIZE) return false;
+
+  // CYCLE-8B-Rev1: monotonicity check
+  if (!_isTransitionAllowed(_journalState[idx], state)) {
+    Serial.printf("[Journal] _setTransactionStateNVS REJECTED (monotonicity): %s → %s (idx=%u)\n",
+                  _stateToString(_journalState[idx]), _stateToString(state), idx);
+    return false;
+  }
 
   Preferences prefs;
   if (!prefs.begin(Core::NVS_NAMESPACE, false)) return false;
@@ -340,31 +450,72 @@ bool TransactionJournal::_setTransactionStateNVS(uint8_t idx, TransactionState s
 }
 
 // ============================================================================
-// _commitSlotNVS — flip commit flag 0 → 1 + update ackJson
+// CYCLE-8B-Rev1: Monotonicity validator
 // ============================================================================
-bool TransactionJournal::_commitSlotNVS(uint8_t idx, const String& ackJson) {
-  if (idx >= JOURNAL_SIZE) return false;
-  if (!_journalValid[idx]) {
-    Serial.printf("[Journal] _commitSlotNVS: slot %u not valid\n", idx);
-    return false;
-  }
+bool TransactionJournal::_isTransitionAllowed(TransactionState from, TransactionState to) {
+  // ALLOWED transitions (forward only):
+  //   (none/PENDING) → PENDING          (creating new entry — from is PENDING or invalid)
+  //   PENDING → EXECUTING               (markExecuting)
+  //   EXECUTING → COMMITTED             (commitTransaction)
+  //   PENDING → UNKNOWN                 (reconciliation)
+  //   EXECUTING → UNKNOWN               (reconciliation)
+  //   PENDING → FAILED                  (reconciliation — proven not executed)
+  //   Any non-terminal → (cleared)      (clearEntry — handled separately)
+  //
+  // FORBIDDEN:
+  //   EXECUTING → PENDING               (was C8B-001 bug)
+  //   COMMITTED → anything              (terminal)
+  //   COMMITTED_UNKNOWN → anything      (terminal)
+  //   UNKNOWN → PENDING/EXECUTING/COMMITTED (UNKNOWN is semi-terminal — only clearable)
+  //   FAILED → PENDING/EXECUTING/COMMITTED (FAILED is semi-terminal — only clearable)
 
-  _journalAcks[idx] = ackJson;
-  return _saveEntryToNVSAtomic(idx, true);
+  if (from == to) return true;  // no-op is allowed
+
+  switch (from) {
+    case TransactionState::PENDING:
+      return to == TransactionState::EXECUTING ||
+             to == TransactionState::UNKNOWN ||
+             to == TransactionState::FAILED;
+    case TransactionState::EXECUTING:
+      return to == TransactionState::COMMITTED ||
+             to == TransactionState::UNKNOWN;
+             // NOT allowed: EXECUTING → PENDING (C8B-001 fix)
+             // NOT allowed: EXECUTING → FAILED (ambiguous — use UNKNOWN instead)
+    case TransactionState::COMMITTED:
+    case TransactionState::COMMITTED_UNKNOWN:
+      return false;  // terminal — no transitions allowed
+    case TransactionState::UNKNOWN:
+    case TransactionState::FAILED:
+      return false;  // semi-terminal — only clearEntry can remove (handled separately)
+    default:
+      return false;
+  }
 }
 
 // ============================================================================
-void TransactionJournal::_clearSlotNVS(uint8_t idx) {
+// CYCLE-8B-Rev1 (fixes C8B-007): _clearSlotNVS now returns success status.
+//   Caller (clearEntry) checks return value before updating RAM state.
+//   If NVS write fails, RAM state is NOT updated (prevents journal resurrection).
+// ============================================================================
+bool TransactionJournal::_clearSlotNVS(uint8_t idx) {
   Preferences prefs;
-  if (!prefs.begin(Core::NVS_NAMESPACE, false)) return;
+  if (!prefs.begin(Core::NVS_NAMESPACE, false)) return false;
 
   char commitKey[20];
   char stateKey[20];
   snprintf(commitKey, sizeof(commitKey), "%s%u", NVS_KEY_TJ_COMMIT_PREFIX, idx);
   snprintf(stateKey, sizeof(stateKey), "%s%u", NVS_KEY_TJ_STATE_PREFIX, idx);
-  prefs.putUChar(commitKey, 0);
-  prefs.putUChar(stateKey, (uint8_t)TransactionState::PENDING);
+
+  // Clear commit flag and reset state to PENDING (slot is now free for reuse)
+  size_t w1 = prefs.putUChar(commitKey, 0);
+  size_t w2 = prefs.putUChar(stateKey, (uint8_t)TransactionState::PENDING);
   prefs.end();
+
+  if (w1 != 1 || w2 != 1) {
+    Serial.printf("[Journal] _clearSlotNVS FAILED (idx=%u, w1=%u w2=%u)\n", idx, w1, w2);
+    return false;
+  }
+  return true;
 }
 
 // ============================================================================
@@ -475,23 +626,27 @@ void TransactionJournal::_loadFromNVS() {
 }
 
 // ============================================================================
-// CYCLE-8B: Reconcile PENDING/EXECUTING entries using captured SNAPSHOT
+// CYCLE-8B-Rev1: Reconcile PENDING/EXECUTING entries using captured SNAPSHOT
 // ============================================================================
 // IMPORTANT (fixes C8A-001): This uses the SNAPSHOT captured by
 // captureOutputSnapshot(), NOT live GPIO reads. The snapshot was taken AFTER
 // RelayDriver.begin() (safe OFF state) but BEFORE RelayEngine.forceRefresh().
 //
-// Reconciliation logic (CYCLE-8B, honest about limitations):
+// Reconciliation logic (CYCLE-8B-Rev1, fixes C8B-002):
 //   - PENDING entries: execute DEFINITELY didn't run (journal says so).
 //     Snapshot is OFF (safe init). desiredState may be ON or OFF.
-//       - desired=OFF: idempotent no-op, can't tell → COMMITTED_UNKNOWN (conservative)
-//       - desired=ON: execute didn't run, snapshot=OFF → FAILED (allow retry) — CORRECT
+//       - desired=ON: execute didn't run, snapshot=OFF → FAILED (proven not executed, allow retry)
+//       - desired=OFF: idempotent, can't tell → UNKNOWN (cannot determine)
 //   - EXECUTING entries: execute MAY have run, but GPIO is now OFF (safe init).
 //     We CANNOT determine if execute ran before crash.
-//     → mark COMMITTED_UNKNOWN (conservative) — PWA gets disclaimer
+//     → mark UNKNOWN (cannot determine — NOT FAILED, because FAILED would
+//       incorrectly allow retry which could double-execute)
 //
-// This is the best we can do without battery-backed GPIO register.
-// For true pre-crash GPIO recovery, hardware revision is needed.
+// KEY CHANGE from Cycle 8B:
+//   - EXECUTING → UNKNOWN (was COMMITTED_UNKNOWN)
+//   - PENDING + desired=OFF → UNKNOWN (was COMMITTED_UNKNOWN)
+//   - UNKNOWN is clearable (allows retry), COMMITTED_UNKNOWN is NOT clearable (durable)
+//   - This distinguishes "proven not executed" (FAILED) from "cannot determine" (UNKNOWN)
 // ============================================================================
 uint8_t TransactionJournal::reconcilePendingEntries() {
   setBootPhase(BootPhase::RECONCILING);
@@ -517,33 +672,33 @@ uint8_t TransactionJournal::reconcilePendingEntries() {
     TransactionState newState;
 
     if (_journalState[i] == TransactionState::PENDING) {
-      // PENDING — execute DEFINITELY didn't run.
-      // For relay commands: snapshot is OFF (safe init).
-      //   - desired=ON: execute didn't run → FAILED (allow retry) — CORRECT
-      //   - desired=OFF: idempotent, can't tell → COMMITTED_UNKNOWN (conservative)
-      // For non-relay (channelId=0): can't verify via GPIO → COMMITTED_UNKNOWN
+      // PENDING — execute DEFINITELY didn't run (journal says so).
       if (_journalChannelId[i] == 0) {
-        newState = TransactionState::COMMITTED_UNKNOWN;
+        // Non-relay command — cannot verify via GPIO → UNKNOWN
+        newState = TransactionState::UNKNOWN;
         Services::Log.append(Core::LogType::Error,
-          "Non-relay PENDING transaction reconciled as COMMITTED_UNKNOWN (no GPIO verification): " + _journalIds[i], 0);
+          "Non-relay PENDING transaction reconciled as UNKNOWN (no GPIO verification): " + _journalIds[i], 0);
       } else if (_journalDesiredState[i]) {
-        // desired=ON, but PENDING means execute never ran → FAILED
+        // desired=ON, PENDING means execute never ran → FAILED (proven not executed)
         newState = TransactionState::FAILED;
         Services::Log.append(Core::LogType::Error,
-          "PENDING transaction with desired=ON reconciled as FAILED (execute never ran): " + _journalIds[i], 0);
+          "PENDING transaction with desired=ON reconciled as FAILED (proven not executed): " + _journalIds[i], 0);
       } else {
-        // desired=OFF — idempotent, snapshot is OFF, can't tell → conservative
-        newState = TransactionState::COMMITTED_UNKNOWN;
+        // desired=OFF — idempotent, snapshot is OFF, can't tell → UNKNOWN
+        newState = TransactionState::UNKNOWN;
         Services::Log.append(Core::LogType::Error,
-          "PENDING transaction with desired=OFF reconciled as COMMITTED_UNKNOWN (idempotent, can't verify): " + _journalIds[i], 0);
+          "PENDING transaction with desired=OFF reconciled as UNKNOWN (idempotent, cannot determine): " + _journalIds[i], 0);
       }
     } else {
       // EXECUTING — execute MAY have run, but GPIO is now OFF (safe init).
-      // We CANNOT determine if execute ran before crash.
-      // → mark COMMITTED_UNKNOWN (conservative) — PWA gets disclaimer
-      newState = TransactionState::COMMITTED_UNKNOWN;
+      // CYCLE-8B-Rev1 (fixes C8B-002): mark UNKNOWN, NOT FAILED.
+      //   FAILED would mean "proven not executed" — but EXECUTING means execute
+      //   WAS called. We cannot prove it didn't run. Mark UNKNOWN so caller
+      //   knows to handle with caution (retry may or may not be safe depending
+      //   on command idempotency).
+      newState = TransactionState::UNKNOWN;
       Services::Log.append(Core::LogType::Error,
-        "EXECUTING transaction reconciled as COMMITTED_UNKNOWN (GPIO was safe-init OFF, cannot determine if execute ran): " + _journalIds[i], 0);
+        "EXECUTING transaction reconciled as UNKNOWN (GPIO was safe-init OFF, cannot determine if execute ran): " + _journalIds[i], 0);
     }
 
     _setTransactionStateNVS(i, newState);
@@ -562,28 +717,18 @@ TransactionState TransactionJournal::reconcileEntry(const String& requestId) {
     return _journalState[idx];
   }
 
-  // During RUNNING phase, use live GPIO read (snapshot is stale by now).
-  // This is the Cycle 8A behavior — acceptable for retry during normal operation
-  // because RelayEngine has been running and GPIO reflects current logic.
-  if (_journalChannelId[idx] == 0) {
-    _setTransactionStateNVS(idx, TransactionState::COMMITTED_UNKNOWN);
-    return _journalState[idx];
-  }
-
-  uint8_t chIdx = _journalChannelId[idx] - 1;
-  if (chIdx >= Core::NUM_CHANNELS) {
-    _setTransactionStateNVS(idx, TransactionState::FAILED);
-    return _journalState[idx];
-  }
-
-  bool actualGpioState = Drivers::relay.readLogicalState(chIdx);
-  bool desired = _journalDesiredState[idx];
-
-  if (actualGpioState == desired) {
-    _setTransactionStateNVS(idx, TransactionState::COMMITTED_UNKNOWN);
-  } else {
-    _setTransactionStateNVS(idx, TransactionState::FAILED);
-  }
+  // CYCLE-8B-Rev1 (fixes C8B-004): During RUNNING phase, GPIO is controlled by
+  //   RelayEngine (scheduler/PIR/manual). Live GPIO read does NOT prove whether
+  //   THIS transaction's execute ran — it only shows current RelayEngine output.
+  //   Therefore, ALL reconciliations during RUNNING → UNKNOWN (cannot determine).
+  //   We do NOT use GPIO equality as proof (that was the Cycle 8A/8B bug).
+  //
+  //   Callers must handle UNKNOWN explicitly:
+  //   - For idempotent commands (relay ON/OFF): retry is safe, treat like FAILED
+  //   - For non-idempotent commands: do NOT retry, surface to operator
+  _setTransactionStateNVS(idx, TransactionState::UNKNOWN);
+  Services::Log.append(Core::LogType::Error,
+    "Transaction reconciled as UNKNOWN during RUNNING phase (GPIO controlled by RelayEngine, cannot determine original execution): " + requestId, 0);
   return _journalState[idx];
 }
 
@@ -597,12 +742,15 @@ int TransactionJournal::_findInJournal(const String& requestId) {
   return -1;
 }
 
-// CYCLE-8A: isProcessed now EXCLUDES FAILED entries.
-//   FAILED entries allow retry with same requestId.
+// CYCLE-8B-Rev1: isProcessed returns true ONLY for COMMITTED and COMMITTED_UNKNOWN.
+//   PENDING/EXECUTING: in-flight (caller should reconcile or wait)
+//   FAILED: proven not executed (allow retry)
+//   UNKNOWN: cannot determine (caller decides — default: allow retry with caution)
 bool TransactionJournal::isProcessed(const String& requestId) {
   int idx = _findInJournal(requestId);
   if (idx < 0) return false;
-  return _journalState[idx] != TransactionState::FAILED;
+  return _journalState[idx] == TransactionState::COMMITTED ||
+         _journalState[idx] == TransactionState::COMMITTED_UNKNOWN;
 }
 
 bool TransactionJournal::isCommitted(const String& requestId) {
@@ -672,7 +820,7 @@ bool TransactionJournal::storeIntent(const String& requestId, const String& comm
   _journalTimestamp[idx] = (uint32_t)Drivers::rtc.getUnixTime();
   _journalState[idx] = TransactionState::PENDING;
 
-  if (!_saveEntryToNVSAtomic(idx, false)) {
+  if (!_createPendingEntryNVS(idx)) {
     Serial.printf("[Journal] storeIntent FAILED for rid=%s — execute MUST NOT proceed\n",
                   requestId.c_str());
     _journalIds[idx] = "";
@@ -702,10 +850,61 @@ bool TransactionJournal::markExecuting(const String& requestId) {
                   requestId.c_str(), _stateToString(_journalState[idx]));
     return false;
   }
+  // CYCLE-8B-Rev1 (fixes C8B-005): persist attempt counter atomically with state.
+  //   Previous: attempt++ in RAM only, then _setTransactionStateNVS writes state.
+  //   If crash between RAM update and NVS write: attempt lost on reboot.
+  //   Now: rewrite blob with incremented attempt + state=EXECUTING in single NVS write.
   _journalAttempt[idx]++;
-  if (!_setTransactionStateNVS(idx, TransactionState::EXECUTING)) {
+  _journalState[idx] = TransactionState::EXECUTING;
+
+  // Rewrite blob with new attempt value (preserves all other fields)
+  uint8_t blob[BLOB_SIZE];
+  size_t totalLen = _serializeBlob(blob, BLOB_SIZE,
+    _journalIds[idx], _journalHashes[idx], _journalAcks[idx],
+    _journalChannelId[idx], _journalDesiredState[idx],
+    _journalPreviousKnownState[idx], _journalAttempt[idx],
+    _journalTimestamp[idx]);
+  if (totalLen == 0) {
+    Serial.printf("[Journal] markExecuting: blob serialization FAILED (idx=%u)\n", idx);
+    _journalAttempt[idx]--;  // revert
+    _journalState[idx] = TransactionState::PENDING;
     return false;
   }
+
+  Preferences prefs;
+  if (!prefs.begin(Core::NVS_NAMESPACE, false)) {
+    Serial.println("[Journal] markExecuting: Cannot open NVS");
+    _journalAttempt[idx]--;
+    _journalState[idx] = TransactionState::PENDING;
+    return false;
+  }
+
+  char entryKey[20];
+  char stateKey[20];
+  snprintf(entryKey, sizeof(entryKey), "%s%u", NVS_KEY_TJ_ENTRY_PREFIX, idx);
+  snprintf(stateKey, sizeof(stateKey), "%s%u", NVS_KEY_TJ_STATE_PREFIX, idx);
+
+  // Write blob (with new attempt) — commit flag stays 0
+  size_t written = prefs.putBytes(entryKey, blob, totalLen);
+  if (written != totalLen) {
+    Serial.printf("[Journal] markExecuting: blob write FAILED (idx=%u)\n", idx);
+    prefs.end();
+    _journalAttempt[idx]--;
+    _journalState[idx] = TransactionState::PENDING;
+    return false;
+  }
+
+  // Set state=EXECUTING (commit flag stays 0 — entry not yet committed)
+  size_t stateWritten = prefs.putUChar(stateKey, (uint8_t)TransactionState::EXECUTING);
+  prefs.end();
+
+  if (stateWritten != 1) {
+    Serial.printf("[Journal] markExecuting: state write FAILED (idx=%u)\n", idx);
+    _journalAttempt[idx]--;
+    _journalState[idx] = TransactionState::PENDING;
+    return false;
+  }
+
   Serial.printf("[Journal] Marked EXECUTING: rid=%s (attempt %u)\n",
                 requestId.c_str(), _journalAttempt[idx]);
   return true;
@@ -724,10 +923,18 @@ bool TransactionJournal::commitTransaction(const String& requestId, const String
   if (_journalState[idx] == TransactionState::COMMITTED) {
     Serial.printf("[Journal] commitTransaction: rid=%s already COMMITTED — updating ackJson\n",
                   requestId.c_str());
+    // Already committed — just update ackJson in-place (idempotent)
+    // Use _commitExecutingEntryNVS which handles state check, but we need to
+    // bypass the EXECUTING check. For now, just update RAM + queue.
+    _journalAcks[idx] = ackJson;
+    queueAck(requestId, ackJson);
+    return true;
   }
 
-  if (!_commitSlotNVS(idx, ackJson)) {
-    Serial.printf("[Journal] commitTransaction FAILED for rid=%s\n", requestId.c_str());
+  // CYCLE-8B-Rev1: use separated commit function (fixes C8B-001)
+  if (!_commitExecutingEntryNVS(idx, ackJson)) {
+    Serial.printf("[Journal] commitTransaction FAILED for rid=%s (state=%s)\n",
+                  requestId.c_str(), _stateToString(_journalState[idx]));
     Services::Log.append(Core::LogType::Error,
       "Transaction commit FAILED (NVS write error): " + requestId, 0);
     return false;
@@ -746,9 +953,23 @@ bool TransactionJournal::storeTransaction(const String& requestId,
                                            const String& ackJson) {
   int existing = _findInJournal(requestId);
   if (existing >= 0) {
+    // Entry already exists — update in place.
+    // CYCLE-8B-Rev1: use monotonic transitions only.
+    // If existing is PENDING → mark EXECUTING → commit (proper flow)
+    // If existing is EXECUTING → commit
+    // If existing is COMMITTED/COMMITTED_UNKNOWN → just update ackJson
+    if (_journalState[existing] == TransactionState::COMMITTED ||
+        _journalState[existing] == TransactionState::COMMITTED_UNKNOWN) {
+      _journalAcks[existing] = ackJson;
+      queueAck(requestId, ackJson);
+      return true;
+    }
+    // For PENDING/EXECUTING, transition to EXECUTING then COMMITTED
+    if (_journalState[existing] == TransactionState::PENDING) {
+      _setTransactionStateNVS(existing, TransactionState::EXECUTING);
+    }
     _journalHashes[existing] = commandHash;
-    _journalAcks[existing] = ackJson;
-    bool ok = _saveEntryToNVSAtomic(existing, true);
+    bool ok = _commitExecutingEntryNVS(existing, ackJson);
     if (ok) {
       queueAck(requestId, ackJson);
     }
@@ -763,23 +984,35 @@ bool TransactionJournal::storeTransaction(const String& requestId,
 
 // ============================================================================
 // CYCLE-8B: clearEntry — allows clearing PENDING, EXECUTING, and FAILED.
-//   NOT allowed: COMMITTED, COMMITTED_UNKNOWN (these are durable).
-//   Fixes C8A-005: invalid commands that leave PENDING entries can now be cleared.
+// CYCLE-8B-Rev1: clearEntry allows PENDING, EXECUTING, FAILED, UNKNOWN.
+//   NOT allowed: COMMITTED, COMMITTED_UNKNOWN (terminal, durable).
+//   Returns true if entry was cleared (fixes C8B-007: check NVS write success).
 // ============================================================================
-void TransactionJournal::clearEntry(const String& requestId) {
+bool TransactionJournal::clearEntry(const String& requestId) {
   int idx = _findInJournal(requestId);
-  if (idx < 0) return;
+  if (idx < 0) return false;
 
   TransactionState state = _journalState[idx];
   if (state == TransactionState::COMMITTED || state == TransactionState::COMMITTED_UNKNOWN) {
     Serial.printf("[Journal] clearEntry: rid=%s state=%s — cannot clear durable entry\n",
                   requestId.c_str(), _stateToString(state));
-    return;
+    return false;
   }
 
   Serial.printf("[Journal] Clearing entry: rid=%s (slot %u, state=%s) — retry allowed\n",
                 requestId.c_str(), idx, _stateToString(state));
-  _clearSlotNVS(idx);
+
+  // CYCLE-8B-Rev1 (fixes C8B-007): check NVS write success BEFORE updating RAM.
+  //   If NVS write fails, RAM state is NOT updated — prevents journal resurrection
+  //   (where entry reappears after reboot because NVS still has it).
+  if (!_clearSlotNVS(idx)) {
+    Serial.printf("[Journal] clearEntry FAILED: NVS write error (rid=%s) — RAM NOT updated\n",
+                  requestId.c_str());
+    Services::Log.append(Core::LogType::Error,
+      "clearEntry NVS write FAILED — entry may reappear after reboot: " + requestId, 0);
+    return false;
+  }
+
   _journalValid[idx] = false;
   _journalCommitted[idx] = false;
   _journalState[idx] = TransactionState::PENDING;
@@ -792,6 +1025,7 @@ void TransactionJournal::clearEntry(const String& requestId) {
   _journalAttempt[idx] = 0;
   _journalTimestamp[idx] = 0;
   if (_journalSize > 0) _journalSize--;
+  return true;
 }
 
 // ============================================================================

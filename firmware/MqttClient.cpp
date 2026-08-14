@@ -881,91 +881,112 @@ void MqttClient::_handleCommand(const String& json) {
   String commandHash = _computeCommandHash(doc);
 
   // ===========================================================================
-  // CYCLE-8A (AUDIT-7-001): Transaction Recovery State Machine
+  // CYCLE-8B-Rev1: Monotonic state machine duplicate handling
   // ===========================================================================
-  //   Duplicate handling now reconciles with actual GPIO state:
-  //     - Hash mismatch → security rejection (requestId reuse with different command).
-  //     - COMMITTED → replay stored ACK (true duplicate, durable success).
-  //     - COMMITTED_UNKNOWN → replay ACK with disclaimer (GPIO matches, but no durable proof).
-  //     - FAILED → clear entry, allow retry (execute didn't happen or failed).
-  //     - PENDING/EXECUTING → reconcile first (read GPIO, compare to desiredState).
+  //   isProcessed() returns true ONLY for COMMITTED and COMMITTED_UNKNOWN.
+  //   For other states, we check getTransactionState() explicitly:
+  //     - COMMITTED → replay stored ACK (true duplicate, durable success)
+  //     - COMMITTED_UNKNOWN → replay ACK with disclaimer
+  //     - FAILED → clear entry, allow retry (proven not executed)
+  //     - UNKNOWN → surface to PWA, do NOT auto-retry (cannot determine)
+  //     - PENDING/EXECUTING → reconcile, then decide
   // ===========================================================================
-  if (Services::journal.isProcessed(requestId)) {
-    String previousHash = Services::journal.getCommandHash(requestId);
-    if (previousHash.length() > 0 && previousHash != commandHash) {
-      Serial.printf("[MQTT] SECURITY: requestId reuse with different command! rid=%s\n", requestId.c_str());
-      Services::Log.append(Core::LogType::AuthFail,
-        "SECURITY: requestId reuse with different command: " + requestId, 0);
-      _publishAck(requestId, false, "requestId reuse with different command — rejected");
-      return;
-    }
+  int existingIdx = -1;  // Check if requestId exists in journal
+  {
+    // Use a helper to check existence without isProcessed() boolean
+    Services::TransactionState existingState = Services::journal.getTransactionState(requestId);
+    // getTransactionState returns PENDING if not found — but PENDING is also a valid
+    // in-flight state. We need to distinguish "not in journal" from "in journal as PENDING".
+    // Use isProcessed() + getTransactionState() combination:
+    //   - If isProcessed()=true → COMMITTED or COMMITTED_UNKNOWN
+    //   - If isProcessed()=false AND getTransactionState()=PENDING → could be not-found OR in-flight PENDING
+    //   To resolve: check if requestId actually exists by trying getCommandHash()
+    String existingHash = Services::journal.getCommandHash(requestId);
+    if (existingHash.length() > 0) {
+      // requestId exists in journal
+      existingIdx = 1;  // marker (not actual index, just "exists")
 
-    Services::TransactionState state = Services::journal.getTransactionState(requestId);
-
-    if (state == Services::TransactionState::COMMITTED) {
-      // True duplicate — replay ORIGINAL ACK via journal.
-      Serial.printf("[MQTT] Duplicate (COMMITTED): %s — replaying original ACK\n", requestId.c_str());
-      String originalAckJson = Services::journal.getAckJson(requestId);
-      if (originalAckJson.length() > 0) {
-        Services::journal.queueAck(requestId, originalAckJson);
-      } else {
-        _publishAck(requestId, true, "Duplicate command (already executed)");
+      // Hash mismatch → security rejection
+      if (existingHash != commandHash) {
+        Serial.printf("[MQTT] SECURITY: requestId reuse with different command! rid=%s\n", requestId.c_str());
+        Services::Log.append(Core::LogType::AuthFail,
+          "SECURITY: requestId reuse with different command: " + requestId, 0);
+        _publishAck(requestId, false, "requestId reuse with different command — rejected");
+        return;
       }
-      return;
-    }
 
-    if (state == Services::TransactionState::COMMITTED_UNKNOWN) {
-      // Reconciled at boot — GPIO matches desired, but no durable proof.
-      Serial.printf("[MQTT] Duplicate (COMMITTED_UNKNOWN): %s — replaying ACK with disclaimer\n",
-                    requestId.c_str());
-      String originalAckJson = Services::journal.getAckJson(requestId);
-      if (originalAckJson.length() > 0) {
-        Services::journal.queueAck(requestId, originalAckJson);
-      } else {
-        _publishAck(requestId, true,
-          "Command may have executed (reconciled from PENDING after crash — GPIO matches desired state, physical contact state unknown)");
+      Services::TransactionState state = existingState;
+
+      if (state == Services::TransactionState::COMMITTED) {
+        // True duplicate — replay ORIGINAL ACK via journal.
+        Serial.printf("[MQTT] Duplicate (COMMITTED): %s — replaying original ACK\n", requestId.c_str());
+        String originalAckJson = Services::journal.getAckJson(requestId);
+        if (originalAckJson.length() > 0) {
+          Services::journal.queueAck(requestId, originalAckJson);
+        } else {
+          _publishAck(requestId, true, "Duplicate command (already executed)");
+        }
+        return;
       }
-      return;
-    }
 
-    if (state == Services::TransactionState::FAILED) {
-      // Reconciled at boot — GPIO doesn't match desired. Execute didn't happen.
-      // Clear the FAILED entry and allow retry with same requestId.
-      Serial.printf("[MQTT] Duplicate (FAILED): %s — execute didn't happen, allowing retry\n",
-                    requestId.c_str());
-      Services::Log.append(Core::LogType::Error,
-        "FAILED transaction retried (GPIO didn't match desired at boot): " + requestId, 0);
-      Services::journal.clearEntry(requestId);
-      // Fall through to normal execution below.
-    } else {
-      // PENDING or EXECUTING — command was in-flight during crash.
-      // CYCLE-8A: Reconcile NOW (not just at boot) in case state changed since boot.
-      Serial.printf("[MQTT] Duplicate (%s): %s — reconciling with current GPIO state\n",
-                    state == Services::TransactionState::EXECUTING ? "EXECUTING" : "PENDING",
-                    requestId.c_str());
-      Services::TransactionState reconciled = Services::journal.reconcileEntry(requestId);
-
-      if (reconciled == Services::TransactionState::COMMITTED_UNKNOWN) {
+      if (state == Services::TransactionState::COMMITTED_UNKNOWN) {
+        // Reconciled at boot — GPIO matches desired, but no durable proof.
+        Serial.printf("[MQTT] Duplicate (COMMITTED_UNKNOWN): %s — replaying ACK with disclaimer\n",
+                      requestId.c_str());
         String originalAckJson = Services::journal.getAckJson(requestId);
         if (originalAckJson.length() > 0) {
           Services::journal.queueAck(requestId, originalAckJson);
         } else {
           _publishAck(requestId, true,
-            "Command may have executed (reconciled — GPIO matches desired, physical state unknown)");
+            "Command may have executed (reconciled — GPIO matches desired, physical contact state unknown)");
         }
         return;
       }
-      if (reconciled == Services::TransactionState::FAILED) {
-        // GPIO doesn't match — execute didn't happen. Allow retry.
-        Serial.printf("[MQTT] Reconciled as FAILED: %s — allowing retry\n", requestId.c_str());
-        Services::journal.clearEntry(requestId);
+
+      if (state == Services::TransactionState::FAILED) {
+        // Proven not executed — clear and allow retry.
+        Serial.printf("[MQTT] Duplicate (FAILED): %s — proven not executed, allowing retry\n",
+                      requestId.c_str());
+        Services::Log.append(Core::LogType::Error,
+          "FAILED transaction retried (proven not executed): " + requestId, 0);
+        if (!Services::journal.clearEntry(requestId)) {
+          // CYCLE-8B-Rev1 (C8B-007): clearEntry failed — NVS write error.
+          // Do NOT proceed with retry — entry may still be in NVS and could
+          // cause confusion. Surface error to PWA.
+          _publishAck(requestId, false,
+            "Internal error: cannot clear FAILED transaction (NVS write failure) — please retry");
+          return;
+        }
         // Fall through to normal execution below.
-      } else {
-        // Still PENDING/EXECUTING after reconcile (shouldn't happen for relay commands).
-        // Return in-progress ACK to be safe.
-        _publishAck(requestId, true,
-          "Command already received (in-progress). Wait and retry if needed.");
+      } else if (state == Services::TransactionState::UNKNOWN) {
+        // CYCLE-8B-Rev1 (fixes C8B-002): UNKNOWN means "cannot determine if execute ran".
+        //   Do NOT auto-retry — could double-execute.
+        //   Surface to PWA with specific message so operator/user can decide.
+        Serial.printf("[MQTT] Duplicate (UNKNOWN): %s — cannot determine if executed, surfacing to PWA\n",
+                      requestId.c_str());
+        Services::Log.append(Core::LogType::Error,
+          "UNKNOWN transaction retried (cannot determine if executed — NOT auto-retrying): " + requestId, 0);
+        _publishAck(requestId, false,
+          "AMBIGUOUS: transaction state is UNKNOWN (cannot determine if previously executed). "
+          "For idempotent commands (relay ON/OFF), retry is safe. For other commands, "
+          "verify device state before retrying.");
         return;
+      } else {
+        // PENDING or EXECUTING — command was in-flight during crash.
+        // CYCLE-8B-Rev1: reconcile now (during RUNNING, this produces UNKNOWN).
+        Serial.printf("[MQTT] Duplicate (%s): %s — reconciling\n",
+                      state == Services::TransactionState::EXECUTING ? "EXECUTING" : "PENDING",
+                      requestId.c_str());
+        Services::TransactionState reconciled = Services::journal.reconcileEntry(requestId);
+
+        // reconcileEntry now always returns UNKNOWN (fixes C8B-004)
+        if (reconciled == Services::TransactionState::UNKNOWN) {
+          _publishAck(requestId, false,
+            "AMBIGUOUS: transaction was in-flight during crash, cannot determine if executed. "
+            "For idempotent commands, retry is safe. For other commands, verify device state.");
+          return;
+        }
+        // For any other state, fall through (shouldn't happen with monotonicity check)
       }
     }
   }
