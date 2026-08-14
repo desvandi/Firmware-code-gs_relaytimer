@@ -212,9 +212,11 @@ namespace Core {
   constexpr size_t MAX_TRACKED_IPS = 8;
   constexpr uint16_t CSRF_TOKEN_LEN = 32;                  // hex chars (16 bytes random)
   constexpr unsigned long CSRF_TOKEN_TTL_MS = 900000;      // 15 min (matches access token)
-  constexpr uint16_t JWT_ACCESS_TTL_SECONDS = 900;         // 15 min (access token)
-  constexpr uint16_t JWT_REFRESH_TTL_SECONDS = 604800;     // 7 days (refresh token)
-  constexpr uint16_t JWT_TTL_SECONDS = JWT_ACCESS_TTL_SECONDS;  // alias for legacy code
+  constexpr uint32_t JWT_ACCESS_TTL_SECONDS = 900;         // 15 min (access token)
+  constexpr uint32_t JWT_REFRESH_TTL_SECONDS = 604800;    // 7 days (refresh token)
+  // audit-fixes: JWT_REFRESH_TTL_SECONDS was previously uint16_t which
+  //   overflows at 65535. 604800 = 7 days exceeds that. Changed to uint32_t.
+  constexpr uint32_t JWT_TTL_SECONDS = JWT_ACCESS_TTL_SECONDS;  // alias for legacy code
   constexpr size_t JWT_MAX_LEN = 512;
   constexpr size_t REFRESH_TOKEN_LEN = 32;                 // hex chars (16 bytes random)
   constexpr uint8_t MAX_REFRESH_TOKENS = 4;                // cap per device (LRU)

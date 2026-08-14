@@ -5,6 +5,7 @@
 #include "Config.h"
 #include "Globals.h"
 #include "LogService.h"
+#include "Crypto.h"  // audit-fixes: Utils::sha256Hex / generateRandomBytes / bytesToHex live here
 #include <esp_task_wdt.h>
 #include <Preferences.h>
 #include <WebServer.h>

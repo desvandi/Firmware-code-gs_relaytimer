@@ -87,8 +87,10 @@ void OtaManager::begin() {
       "Boot failed " + String(_bootAttempts) + " times — rolling back to previous firmware", 0);
 
     #ifdef ESP32
-    // Mark current firmware invalid + trigger rollback on next boot
-    esp_ota_mark_app_invalid_rollback_and_restart();
+    // Mark current firmware invalid + trigger rollback on next boot.
+    // audit-fixes: function name in ESP-IDF is
+    //   esp_ota_mark_app_invalid_rollback_and_reboot() (not _restart).
+    esp_ota_mark_app_invalid_rollback_and_reboot();
     // Function above restarts — if it returns, force restart
     delay(500);
     ESP.restart();
@@ -189,8 +191,9 @@ bool OtaManager::checkUpdateAvailable() const {
   return String(Core::FIRMWARE_VERSION) != String(LATEST_VERSION);
 }
 
-bool OtaManager::isUpdating() const { return _updating; }
-size_t OtaManager::getProgress() const { return _totalReceived; }
+// audit-fixes: isUpdating() and getProgress() are declared inline in the header
+//   (OtaManager.h:59/62). Previously also defined here → redefinition error.
+//   Removed the duplicate definitions — the inline header versions are used.
 
 // audit-fixes: REST OTA upload handler. Called per-chunk by ESP32 WebServer.
 // NOTE: REST OTA is only available on LAN/Cloudflare Tunnel mode and is

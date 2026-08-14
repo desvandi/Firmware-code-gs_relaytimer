@@ -7,20 +7,30 @@
 #include "LogService.h"
 #include "RelayEngine.h"
 #include "Scheduler.h"
-#include "AuthManager.h"
 #include "RtcDriver.h"
 #include "RelayDriver.h"
 #include "PirDriver.h"
 #include "PzemDriver.h"
+#include "AuthManager.h"
+#include "TransactionJournal.h"
 #include "WifiManager.h"
-#include "ConfigStore.h"
-#include "Json.h"
 #include "Crypto.h"
-#include "TransactionJournal.h"  // R10G-1/R10G-2: NVS journal + ACK retry
+#include "Json.h"
 #include <ArduinoJson.h>
-#include <esp_task_wdt.h>
+#include <PubSubClient.h>
+#include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Update.h>
+#include <esp_task_wdt.h>
+
+// audit-fixes: forward declaration for static helper (was defined AFTER use).
+//   C++ requires declaration before use. The static function _computeCommandHash
+//   was defined at the bottom of the file but called from _handleCommand() and
+//   _handleOta() above. Must be placed AFTER ArduinoJson.h include so that
+//   DynamicJsonDocument is visible in the signature.
+static String _computeCommandHash(const DynamicJsonDocument& doc);
+#include "ConfigStore.h"
 #include <mbedtls/sha256.h>
 #include <algorithm>
 #include <vector>
@@ -1391,14 +1401,20 @@ void MqttClient::_handleOta(const String& json) {
   //
   //   If OTA_ALLOWED_HOSTS is empty, the allowlist is DISABLED (backward-
   //   compatible with dev builds). PRODUCTION_BUILD should always set it.
+  //
+  //   Note: `url` is a const char* here (parsed from JSON), not a String.
+  //   We wrap it in a local String for the substring operations below.
+  String urlString(url);
   if (strlen(Core::OTA_ALLOWED_HOSTS) > 0) {
-    // Extract host from URL: skip "https://" then read until '/' or ':' or end
-    const char* hostStart = url.c_str() + 8;
+    // Extract host from URL: skip "https://" then read until '/', ':', '?', '#', or end
+    // audit-fixes: include '#' in stop chars so fragments (https://host#frag)
+    //   don't get parsed as part of the host.
+    const char* hostStart = urlString.c_str() + 8;
     const char* hostEnd = hostStart;
-    while (*hostEnd != '\0' && *hostEnd != '/' && *hostEnd != ':' && *hostEnd != '?') {
+    while (*hostEnd != '\0' && *hostEnd != '/' && *hostEnd != ':' && *hostEnd != '?' && *hostEnd != '#') {
       hostEnd++;
     }
-    String host = url.substring(hostStart - url.c_str(), hostEnd - url.c_str());
+    String host = urlString.substring(hostStart - urlString.c_str(), hostEnd - urlString.c_str());
     host.toLowerCase();
 
     // Check against comma-separated allowlist (suffix match)
