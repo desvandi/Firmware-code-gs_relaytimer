@@ -1,3 +1,16 @@
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  Superseded by Rev19 for: cleanup≠eviction boundary, publish()≠PUBACK,  ║ -->
+<!-- ║  lastAttemptTs initial value, semantic cross-product sweep.  ║ -->
+<!-- ║  Refer to:                                                ║ -->
+<!-- ║    - CYCLE-8C-REV19-SEMANTIC-BOUNDARY-CLOSURE.md            ║ -->
+<!-- ║  for the authoritative supplement.                          ║ -->
+<!-- ║  Rev18 remains authoritative for cleanup predicate and retryCount definition.  ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
 # CYCLE-8C-Rev18: Transaction Journal v4 — Cleanup Boundary & Final Sweep
 
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
