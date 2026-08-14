@@ -1,3 +1,16 @@
+<!-- SUPERSEDED BANNER -->
+<!-- ╔══════════════════════════════════════════════════════════╗ -->
+<!-- ║  ⚠️  SUPERSEDED — HISTORICAL DOCUMENT — DO NOT IMPLEMENT  ║ -->
+<!-- ║  This document has been superseded by Rev17 for ACK verification ordering,  ║ -->
+<!-- ║  retry phase semantics, operator cleanup safety, and state matrix.  ║ -->
+<!-- ║  Refer to:                                                ║ -->
+<!-- ║    - CYCLE-8C-REV17-ACK-SEMANTICS-CLOSURE.md               ║ -->
+<!-- ║  for the authoritative supplement.                          ║ -->
+<!-- ║  Rev16 remains authoritative for transition graph (PWA from BROKER only).  ║ -->
+<!-- ╚══════════════════════════════════════════════════════════╝ -->
+<!-- END SUPERSEDED BANNER -->
+
+
 # CYCLE-8C-Rev16: Transaction Journal v4 — ACK State Machine & Retention Closure
 
 **Status**: DESIGN ONLY — NO CODE IMPLEMENTATION
