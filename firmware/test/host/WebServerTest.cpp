@@ -53,6 +53,7 @@
 #include "Common.h"
 #include "RelayHandlers.h"  // handleRelay — the function under test
 #include "ScheduleHandlers.h"  // P2-2 F-P0-2 C3: handleScheduleUpsert/Delete
+#include "ChannelHandlers.h"  // P2-2 F-P0-2 C4: handleChannelRename
 
 #include <cstdio>
 #include <cstring>
@@ -140,6 +141,15 @@ static void sendScheduleDelete(const char* id, const char* channelId, const char
   if (channelId) Web::http._setTestQueryParam("channelId", channelId);
   Web::http._setTestQueryParam("requestId", requestId);
   Web::Handlers::handleScheduleDelete();
+}
+
+// P2-2 F-P0-2 C4: Helper: send a channel rename via the REST handler
+static void sendChannelRename(const char* jsonBody) {
+  Web::http._resetTestState();
+  Web::http._setTestBody(jsonBody);
+  Web::http._setTestAuth("Bearer valid-jwt");
+  Web::http._setTestCsrf("valid-csrf-token");
+  Web::Handlers::handleChannelRename();
 }
 
 int main() {
@@ -700,6 +710,162 @@ int main() {
   }
 
   // =====================================================================
+  // P2-2 F-P0-2 C4: CHANNEL RENAME PRODUCTION-PATH TESTS (P15-P18)
+  // =====================================================================
+  // Validates that /api/channel POST (rename) goes through the
+  // TransactionJournal with FROM_PENDING commit mode — same pattern as C3
+  // schedule. Channel names are persisted via saveScheduleWithResult(true)
+  // because they are stored in schedule.json alongside schedules.
+
+  // ---- P15: channel rename → COMMITTED + name updated ----
+  printf("\n[P15] channel rename → COMMITTED + name updated\n");
+  {
+    resetEnv();
+    sendChannelRename(R"({"channelId":1,"name":"Kitchen","requestId":"req-chan-1"})");
+    CHECK_EQ(Web::http._respCode, 200, "P15: HTTP 200 for valid rename");
+    CHECK(journal.isCommitted("req-chan-1"),
+          "P15: journal COMMITTED for req-chan-1");
+    CHECK(strcmp(Core::channels[0].name, "Kitchen") == 0,
+          "P15: channels[0].name == 'Kitchen' (RAM updated)");
+    // Verify response shape includes requestId + data.channel
+    CHECK(Web::http._respBody.indexOf("\"requestId\":\"req-chan-1\"") >= 0,
+          "P15: response body contains requestId");
+    CHECK(Web::http._respBody.indexOf("\"channelId\":1") >= 0,
+          "P15: response body contains channelId");
+    CHECK(Web::http._respBody.indexOf("\"name\":\"Kitchen\"") >= 0,
+          "P15: response body contains updated name");
+  }
+
+  // ---- P16: channel rename different channel → COMMITTED ----
+  printf("\n[P16] channel rename CH5 → COMMITTED + name updated\n");
+  {
+    resetEnv();
+    sendChannelRename(R"({"channelId":5,"name":"Garage","requestId":"req-chan-5"})");
+    CHECK_EQ(Web::http._respCode, 200, "P16: HTTP 200 for CH5 rename");
+    CHECK(journal.isCommitted("req-chan-5"),
+          "P16: journal COMMITTED for req-chan-5");
+    CHECK(strcmp(Core::channels[4].name, "Garage") == 0,
+          "P16: channels[4].name == 'Garage'");
+  }
+
+  // ---- P17: duplicate requestId (same hash) → HTTP 200 + byte-identical ACK replay ----
+  printf("\n[P17] duplicate requestId (same hash) → replay ACK\n");
+  {
+    resetEnv();
+    // First rename — should succeed
+    sendChannelRename(R"({"channelId":2,"name":"Bedroom","requestId":"req-chan-dup"})");
+    CHECK_EQ(Web::http._respCode, 200, "P17: first rename HTTP 200");
+    CHECK(journal.isCommitted("req-chan-dup"),
+          "P17: first rename COMMITTED");
+    String firstAck = Web::http._respBody;
+    uint8_t sizeAfterFirst = journal.getJournalSize();
+
+    // Second rename with SAME requestId + SAME body → should replay, not re-execute
+    sendChannelRename(R"({"channelId":2,"name":"Bedroom","requestId":"req-chan-dup"})");
+    CHECK_EQ(Web::http._respCode, 200, "P17: duplicate HTTP 200 (replay)");
+    CHECK(journal.isCommitted("req-chan-dup"),
+          "P17: duplicate still COMMITTED");
+    CHECK_EQ(journal.getJournalSize(), sizeAfterFirst,
+          "P17: journal size unchanged (no new slot for duplicate)");
+    // Byte-identical ACK replay (same requestId + same data shape)
+    CHECK(Web::http._respBody.indexOf("\"requestId\":\"req-chan-dup\"") >= 0,
+          "P17: replayed ACK contains requestId");
+    CHECK(Web::http._respBody.indexOf("\"name\":\"Bedroom\"") >= 0,
+          "P17: replayed ACK contains name");
+  }
+
+  // ---- P18: duplicate requestId (different hash) → HTTP 409 + no mutation ----
+  printf("\n[P18] duplicate requestId (different name) → HTTP 409\n");
+  {
+    resetEnv();
+    // First rename — succeeds, name = "Original"
+    sendChannelRename(R"({"channelId":3,"name":"Original","requestId":"req-chan-reuse"})");
+    CHECK_EQ(Web::http._respCode, 200, "P18: first rename HTTP 200");
+    CHECK(strcmp(Core::channels[2].name, "Original") == 0,
+          "P18: first rename set name='Original'");
+    uint8_t sizeAfterFirst = journal.getJournalSize();
+
+    // Second rename with SAME requestId but DIFFERENT name → security rejection
+    sendChannelRename(R"({"channelId":3,"name":"Attacker","requestId":"req-chan-reuse"})");
+    CHECK_EQ(Web::http._respCode, 409,
+          "P18: HTTP 409 for requestId reuse with different command");
+    // Name should NOT have changed (no mutation)
+    CHECK(strcmp(Core::channels[2].name, "Original") == 0,
+          "P18: name unchanged (no mutation on reuse rejection)");
+    // Journal size unchanged (no new slot, first entry still COMMITTED)
+    CHECK_EQ(journal.getJournalSize(), sizeAfterFirst,
+          "P18: journal size unchanged");
+    CHECK(journal.isCommitted("req-chan-reuse"),
+          "P18: first command journal entry still COMMITTED (not cleared)");
+  }
+
+  // =====================================================================
+  // P2-2 F-P0-2 C4: CHANNEL RENAME FAILURE-PATH TESTS (F12-F14)
+  // =====================================================================
+
+  // ---- F12: channel rename missing requestId → HTTP 400 ----
+  printf("\n[F12] channel rename missing requestId → HTTP 400\n");
+  {
+    resetEnv();
+    uint8_t sizeBefore = journal.getJournalSize();
+    sendChannelRename(R"({"channelId":1,"name":"Test"})");
+    CHECK_EQ(Web::http._respCode, 400, "F12: HTTP 400 for missing requestId");
+    CHECK_EQ(journal.getJournalSize(), sizeBefore,
+          "F12: journal size unchanged (no entry created)");
+  }
+
+  // ---- F13: channel rename invalid channelId → HTTP 400 + no journal entry (pre-store) ----
+  printf("\n[F13] channel rename invalid channelId (0) → HTTP 400\n");
+  {
+    resetEnv();
+    uint8_t sizeBefore = journal.getJournalSize();
+    sendChannelRename(R"({"channelId":0,"name":"Bad","requestId":"req-chan-bad-ch"})");
+    CHECK_EQ(Web::http._respCode, 400, "F13: HTTP 400 for invalid channelId");
+    CHECK(!journal.isProcessed("req-chan-bad-ch"),
+          "F13: no journal entry (pre-store validation)");
+    CHECK_EQ(journal.getJournalSize(), sizeBefore,
+          "F13: journal size unchanged");
+  }
+
+  // ---- F14: channel rename saveSchedule failure → HTTP 503 + journal PENDING (INVARIANT B) ----
+  //
+  // CRITICAL C4 TEST (Phase B REV.3 §7.3 + §9.5):
+  //   Validates the synchronous saveSchedule fix for channel rename.
+  //   When saveScheduleWithResult returns false (atomicWrite fails), the
+  //   handler MUST:
+  //     - Send HTTP 503 (DURABILITY_FAILURE)
+  //     - NOT call commitTransactionFromPending (journal stays PENDING)
+  //     - NOT call clearEntry (INVARIANT B — RAM mutation occurred)
+  //   This proves the RAM/NVS divergence race is fixed: journal will NOT
+  //   say COMMITTED while channel rename failed to persist.
+  printf("\n[F14] channel rename saveSchedule failure → HTTP 503 + journal PENDING (INVARIANT B)\n");
+  {
+    resetEnv();
+    // Arm: next atomicWrite call will fail
+    Storage::fs.setFailNextAtomicWrite();
+
+    sendChannelRename(R"({"channelId":1,"name":"Lost","requestId":"req-chan-save-fail"})");
+
+    CHECK_EQ(Web::http._respCode, 503, "F14: HTTP 503 (saveSchedule failed)");
+    // RAM mutation DID occur (channel name was set before saveSchedule)
+    CHECK(strcmp(Core::channels[0].name, "Lost") == 0,
+          "F14: RAM mutation occurred (channels[0].name == 'Lost')");
+    // Journal stays PENDING — NOT COMMITTED (commit was skipped)
+    CHECK(!journal.isCommitted("req-chan-save-fail"),
+          "F14: journal NOT COMMITTED (commit skipped after save failure)");
+    // Journal entry still exists — NOT cleared (INVARIANT B)
+    CHECK(journal.isProcessed("req-chan-save-fail"),
+          "F14: journal entry preserved (clearEntry NOT called — INVARIANT B)");
+    // Specifically, state is PENDING (not EXECUTING, not COMMITTED)
+    CHECK(journal.getTransactionState("req-chan-save-fail") == TransactionState::PENDING,
+          "F14: journal state == PENDING (evidence preserved, not committed)");
+    // Response body mentions DURABILITY_FAILURE
+    CHECK(Web::http._respBody.indexOf("DURABILITY_FAILURE") >=0 ||
+          Web::http._respBody.indexOf("persistence failed") >= 0,
+          "F14: response body mentions DURABILITY_FAILURE");
+  }
+
+  // =====================================================================
   // HARD INVARIANT VERIFICATION (Phase B REV.3 §9.4)
   // =====================================================================
   printf("\n[HARD INVARIANT] HTTP 200 implies journal == COMMITTED\n");
@@ -730,11 +896,15 @@ int main() {
   printf("\n==========================================================\n");
   printf("RESULTS: %d passed, %d failed\n", g_passCount, g_failCount);
   printf("==========================================================\n");
-  printf("\nF-P0-2 C2 Test Summary:\n");
-  printf("  Production-path: P1-P8 (8 tests) — relay ON/OFF/set_mode, response shape, duplicate handling\n");
-  printf("  Failure-path:   F1-F8 (8 tests) — missing/malformed requestId, invalid fields, NVS failure\n");
+  printf("\nF-P0-2 C2/C3/C4 Test Summary:\n");
+  printf("  C2 Production-path: P1-P8 (8 tests) — relay ON/OFF/set_mode, response shape, duplicate handling\n");
+  printf("  C2 Failure-path:   F1-F8 (8 tests) — missing/malformed requestId, invalid fields, NVS failure\n");
+  printf("  C3 Production-path: P9-P14 (6 tests) — schedule upsert/delete, response shape, duplicate handling\n");
+  printf("  C3 Failure-path:   F9-F11 (3 tests) — missing requestId, invalid time, saveSchedule failure\n");
+  printf("  C4 Production-path: P15-P18 (4 tests) — channel rename, response shape, duplicate handling\n");
+  printf("  C4 Failure-path:   F12-F14 (3 tests) — missing requestId, invalid channelId, saveSchedule failure\n");
   printf("  Hard invariant:  HTTP 200 implies journal == COMMITTED\n");
   printf("\nF-P0-1 Regression: see MqttClientTest (31/31 PASS) for MQTT path proof.\n");
-  printf("Cross-ingress contract: REST /api/relay now uses same journal API as MQTT path.\n");
+  printf("Cross-ingress contract: REST /api/relay + /api/schedule + /api/channel use same journal API as MQTT path.\n");
   return (g_failCount == 0) ? 0 : 1;
 }
