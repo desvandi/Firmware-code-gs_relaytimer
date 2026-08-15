@@ -506,7 +506,7 @@ void MqttClient::publishLog(Core::LogType type, const String& message, int8_t ch
 // ============================================================================
 void MqttClient::_finalizeAndPublishAck(const String& requestId, bool success,
                                          const String& preBuiltJson, const String& commandHash,
-                                         bool fromPending) {
+                                         CommitMode commitMode) {
   if (!_mqtt.connected()) {
     Serial.printf("[MQTT ACK] %s: MQTT not connected — ACK queued for retry\n", requestId.c_str());
     // For success ACKs, the journal's queueAck() (called by commitTransaction)
@@ -524,11 +524,21 @@ void MqttClient::_finalizeAndPublishAck(const String& requestId, bool success,
   }
 
   // SUCCESS ACK with commandHash: must commit to journal first.
-  // P2-2 F-P0-1: Use commitTransactionFromPending for atomic config commands,
-  //   commitTransaction for relay/OTA (requires EXECUTING state).
+  // P2-2 F-P0-1: CommitMode determines which commit path to use.
+  //   NONE        — read-only: skip commit, just publish ACK
+  //   FROM_PENDING — atomic config: PENDING → COMMITTED
+  //   EXECUTING    — physical mutation: EXECUTING → COMMITTED
   // CYCLE-7 fix for F-002: CHECK return value. If commit fails, do NOT claim success.
+  if (commitMode == CommitMode::NONE) {
+    // Read-only command — no journal entry exists, just publish ACK
+    _mqtt.publish(_topicAck.c_str(), (const uint8_t*)preBuiltJson.c_str(),
+                  preBuiltJson.length(), false);
+    Serial.printf("[MQTT ACK] %s: OK (read-only, no commit)\n", requestId.c_str());
+    return;
+  }
+
   bool committed;
-  if (fromPending) {
+  if (commitMode == CommitMode::FROM_PENDING) {
     committed = Services::journal.commitTransactionFromPending(requestId, preBuiltJson);
   } else {
     committed = Services::journal.commitTransaction(requestId, preBuiltJson);
@@ -572,7 +582,8 @@ void MqttClient::_finalizeAndPublishAck(const String& requestId, bool success,
 // Generic ACK — used for failures and generic successes.
 // If commandHash is non-empty AND success=true → store in NVS journal.
 void MqttClient::_publishAck(const String& requestId, bool success, const char* message,
-                              const String& dataJson, const String& commandHash) {
+                              const String& dataJson, const String& commandHash,
+                              CommitMode commitMode) {
   if (requestId.length() == 0) return;
 
   StaticJsonDocument<512> doc;
@@ -596,7 +607,7 @@ void MqttClient::_publishAck(const String& requestId, bool success, const char* 
   serializeJson(doc, json);
 
   // CYCLE-7: delegate to _finalizeAndPublishAck for commit + publish + dequeue.
-  _finalizeAndPublishAck(requestId, success, json, commandHash, true);
+  _finalizeAndPublishAck(requestId, success, json, commandHash, commitMode);
 }
 
 // Relay ACK: includes actual relay state.
@@ -627,7 +638,7 @@ void MqttClient::_publishRelayAck(const String& requestId, bool success, const c
   serializeJson(doc, json);
 
   // CYCLE-7: delegate to _finalizeAndPublishAck for commit + publish + dequeue.
-  _finalizeAndPublishAck(requestId, success, json, commandHash);
+  _finalizeAndPublishAck(requestId, success, json, commandHash, CommitMode::EXECUTING);
   Serial.printf("[MQTT ACK] %s: %s (relay CH%d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", channelId,
                 commandHash.length() > 0 ? " (committed)" : "");
@@ -654,7 +665,7 @@ void MqttClient::_publishScheduleAck(const String& requestId, bool success, cons
   serializeJson(doc, json);
 
   // CYCLE-7: delegate to _finalizeAndPublishAck for commit + publish + dequeue.
-  _finalizeAndPublishAck(requestId, success, json, commandHash, true);
+  _finalizeAndPublishAck(requestId, success, json, commandHash, CommitMode::FROM_PENDING);
   Serial.printf("[MQTT ACK] %s: %s (schedule CH%d id=%d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", channelId, scheduleId,
                 commandHash.length() > 0 ? " (committed)" : "");
@@ -686,7 +697,7 @@ void MqttClient::_publishPirAck(const String& requestId, bool success, const cha
   serializeJson(doc, json);
 
   // CYCLE-7: delegate to _finalizeAndPublishAck for commit + publish + dequeue.
-  _finalizeAndPublishAck(requestId, success, json, commandHash, true);
+  _finalizeAndPublishAck(requestId, success, json, commandHash, CommitMode::FROM_PENDING);
   Serial.printf("[MQTT ACK] %s: %s (pir %d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", pirId,
                 commandHash.length() > 0 ? " (committed)" : "");
@@ -714,7 +725,7 @@ void MqttClient::_publishChannelAck(const String& requestId, bool success, const
   serializeJson(doc, json);
 
   // CYCLE-7: delegate to _finalizeAndPublishAck for commit + publish + dequeue.
-  _finalizeAndPublishAck(requestId, success, json, commandHash, true);
+  _finalizeAndPublishAck(requestId, success, json, commandHash, CommitMode::FROM_PENDING);
   Serial.printf("[MQTT ACK] %s: %s (channel CH%d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", channelId,
                 commandHash.length() > 0 ? " (committed)" : "");
@@ -722,8 +733,9 @@ void MqttClient::_publishChannelAck(const String& requestId, bool success, const
 
 // Generic ACK for time/system/config mutations.
 void MqttClient::_publishGenericAck(const String& requestId, bool success, const char* message,
-                                    const String& dataJson, const String& commandHash) {
-  _publishAck(requestId, success, message, dataJson, commandHash);
+                                    const String& dataJson, const String& commandHash,
+                                    CommitMode commitMode) {
+  _publishAck(requestId, success, message, dataJson, commandHash, commitMode);
 }
 
 void MqttClient::publishOnline() {
@@ -1133,7 +1145,7 @@ void MqttClient::_handleCommand(const String& json) {
         requestId, failJson, Services::TransactionState::EXECUTION_FAILED_OUTPUT_MISMATCH);
 
       // Publish failure ACK immediately
-      _finalizeAndPublishAck(requestId, false, failJson, "");
+      _finalizeAndPublishAck(requestId, false, failJson, "", CommitMode::EXECUTING);
     }
   }
 
@@ -1379,7 +1391,7 @@ void MqttClient::_handleCommand(const String& json) {
     } else if (strcmp(action, "getStatus") == 0) {
       publishStatus();
       if (requestId.length() > 0) {
-        _publishGenericAck(requestId, true, "Status published", commandHash);
+        _publishGenericAck(requestId, true, "Status published", "", commandHash, CommitMode::NONE);
       }
     } else if (strcmp(action, "resetEnergyStats") == 0) {
       for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {

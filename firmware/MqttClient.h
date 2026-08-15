@@ -81,9 +81,16 @@ private:
   // For FAILURE ACKs (success=false), commandHash is "" — failure ACKs are
   // NOT stored in dedup buffer (failed commands can be retried).
 
+  // P2-2 F-P0-1: CommitMode for _finalizeAndPublishAck
+  //   NONE        — read-only command (getStatus): publish ACK, no journal commit
+  //   FROM_PENDING — atomic config mutation (schedule/PIR/channel/time/system/config): PENDING → COMMITTED
+  //   EXECUTING    — physical mutation (relay/OTA): EXECUTING → COMMITTED
+  enum class CommitMode { NONE, FROM_PENDING, EXECUTING };
+
   // Generic ACK — failure ACKs (no commandHash = not stored for replay)
   void _publishAck(const String& requestId, bool success, const char* message,
-                   const String& dataJson = "", const String& commandHash = "");
+                   const String& dataJson = "", const String& commandHash = "",
+                   CommitMode commitMode = CommitMode::FROM_PENDING);
 
   // Success ACKs with type-specific data — all accept commandHash for atomic store
   void _publishRelayAck(const String& requestId, bool success, const char* message,
@@ -99,7 +106,8 @@ private:
                           uint8_t channelId, const String& commandHash = "");
 
   void _publishGenericAck(const String& requestId, bool success, const char* message,
-                          const String& dataJson = "", const String& commandHash = "");
+                          const String& dataJson = "", const String& commandHash = "",
+                          CommitMode commitMode = CommitMode::FROM_PENDING);
 
   // CYCLE-7 (fixes F-001 + F-002 + F-006): Finalize + publish ACK with proper
   // transaction semantics.
@@ -120,7 +128,7 @@ private:
   //     - If immediate publish fails: leave in queue (processPendingAcks retries).
   void _finalizeAndPublishAck(const String& requestId, bool success,
                                const String& preBuiltJson, const String& commandHash,
-                               bool fromPending = false);
+                               CommitMode commitMode = CommitMode::EXECUTING);
 
   void _buildTopics();
   // audit-fixes: removed _isDuplicate() and _addProcessed() declarations.

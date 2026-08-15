@@ -1460,6 +1460,97 @@ static void test_reconcile_entry_behavioral_gen() {
           "recovered generation is execGen+1 (proves reconcileEntry incremented gen)");
 }
 
+// =============================================================================
+// P2-2 F-P0-1 CORRECTION — commitTransactionFromPending behavioral tests
+// ============================================================================
+
+// TEST 51 — commitTransactionFromPending success (R6/P2-2-C2)
+static void test_commit_from_pending_success() {
+    printf("\n[TEST 51] commitTransactionFromPending success (C2)\n");
+    resetJournal(); journal.begin();
+    journal.storeIntent("req-cfp-1", "set_state|ch=1|state=on", 1, true, false);
+    CHECK(journal.getTransactionState("req-cfp-1") == TransactionState::PENDING,
+          "state is PENDING before commit");
+
+    bool ok = journal.commitTransactionFromPending("req-cfp-1", "{\"ok\":true}");
+    CHECK(ok, "commitTransactionFromPending succeeds");
+    CHECK(journal.isCommitted("req-cfp-1"), "state is COMMITTED after commit");
+    CHECK(journal.getAckJson("req-cfp-1") == "{\"ok\":true}", "ackJson stored correctly");
+    CHECK_EQ(journal.getPendingAckCount(), (uint8_t)1, "ACK queued");
+}
+
+// TEST 52 — commitTransactionFromPending A failure → RAM unchanged (R6/P2-2-C2)
+static void test_commit_from_pending_a_failure() {
+    printf("\n[TEST 52] commitTransactionFromPending A failure (C2)\n");
+    resetJournal(); journal.begin();
+    journal.storeIntent("req-cfp-2", "set_state|ch=1|state=on", 1, true, false);
+    Preferences::setFailNextPut("tj_slot_0_a");
+    bool ok = journal.commitTransactionFromPending("req-cfp-2", "{\"ok\":true}");
+    CHECK(!ok, "commit fails when A write fails");
+    CHECK(journal.getTransactionState("req-cfp-2") == TransactionState::PENDING,
+          "RAM unchanged (still PENDING) after A failure");
+    Preferences::clearFailMode();
+}
+
+// TEST 53 — commitTransactionFromPending B failure → RAM unchanged (R6/P2-2-C2)
+static void test_commit_from_pending_b_failure() {
+    printf("\n[TEST 53] commitTransactionFromPending B failure (C2)\n");
+    resetJournal(); journal.begin();
+    journal.storeIntent("req-cfp-3", "set_state|ch=1|state=on", 1, true, false);
+    Preferences::setFailNextPut("tj_slot_0_b");
+    bool ok = journal.commitTransactionFromPending("req-cfp-3", "{\"ok\":true}");
+    CHECK(!ok, "commit fails when B write fails");
+    CHECK(journal.getTransactionState("req-cfp-3") == TransactionState::PENDING,
+          "RAM unchanged (still PENDING) after B failure");
+    Preferences::clearFailMode();
+}
+
+// TEST 54 — commitTransactionFromPending reload after partial write (R6/P2-2-C2)
+static void test_commit_from_pending_reload() {
+    printf("\n[TEST 54] commitTransactionFromPending reload after success (C2)\n");
+    resetJournal(); journal.begin();
+    journal.storeIntent("req-cfp-4", "set_state|ch=1|state=on", 1, true, false);
+    journal.commitTransactionFromPending("req-cfp-4", "{\"ok\":true}");
+    journal.~TransactionJournal(); new (&journal) TransactionJournal(); journal.begin();
+    CHECK(journal.isCommitted("req-cfp-4"), "COMMITTED persisted across reload");
+    CHECK(journal.getAckJson("req-cfp-4") == "{\"ok\":true}", "ackJson survived reload");
+}
+
+// TEST 55 — commitTransactionFromPending wrong state rejection (R6/P2-2-C2)
+static void test_commit_from_pending_wrong_state() {
+    printf("\n[TEST 55] commitTransactionFromPending wrong state (C2)\n");
+    resetJournal(); journal.begin();
+    journal.storeIntent("req-cfp-5", "set_state|ch=1|state=on", 1, true, false);
+    journal.markExecuting("req-cfp-5");  // now EXECUTING
+    bool ok = journal.commitTransactionFromPending("req-cfp-5", "{\"ok\":true}");
+    CHECK(!ok, "commit from PENDING rejected when state is EXECUTING");
+    CHECK(journal.getTransactionState("req-cfp-5") == TransactionState::EXECUTING,
+          "state unchanged (EXECUTING) after rejected commit");
+}
+
+// TEST 56 — commitTransactionFromPending missing requestId (R6/P2-2-C2)
+static void test_commit_from_pending_missing() {
+    printf("\n[TEST 56] commitTransactionFromPending missing requestId (C2)\n");
+    resetJournal(); journal.begin();
+    bool ok = journal.commitTransactionFromPending("nonexistent", "{\"ok\":true}");
+    CHECK(!ok, "commit fails for missing requestId");
+}
+
+// TEST 57 — clearEntry failure handling (R6/P2-2-C3)
+static void test_clear_entry_failure_handling() {
+    printf("\n[TEST 57] clearEntry failure handling (C3)\n");
+    resetJournal(); journal.begin();
+    journal.storeIntent("req-ce-1", "set_state|ch=1|state=on", 1, true, false);
+    // Simulate NVS failure during clearEntry
+    Preferences::setFailMode(true);
+    bool cleared = journal.clearEntry("req-ce-1");
+    Preferences::setFailMode(false);
+    CHECK(!cleared, "clearEntry fails when NVS unavailable");
+    // Entry should still be PENDING (not cleared)
+    CHECK(journal.isProcessed("req-ce-1"),
+          "entry still exists after failed clearEntry (not silently lost)");
+}
+
 // ============================================================================
 // main
 // ============================================================================
@@ -1526,6 +1617,15 @@ int main() {
     // CP-R6 CORRECTION PASS 7 — auditor targeted tests
     test_reconcile_torn_write_recovery();      // TEST 49: CP-R6.1+R6.5 reconcile gen (classifier proof)
     test_reconcile_entry_behavioral_gen();      // TEST 50: R6-C1 behavioral reconcileEntry gen proof
+
+    // P2-2 F-P0-1 CORRECTION — commitTransactionFromPending tests
+    test_commit_from_pending_success();          // TEST 51: C2 success
+    test_commit_from_pending_a_failure();        // TEST 52: C2 A failure
+    test_commit_from_pending_b_failure();        // TEST 53: C2 B failure
+    test_commit_from_pending_reload();           // TEST 54: C2 reload
+    test_commit_from_pending_wrong_state();     // TEST 55: C2 wrong state
+    test_commit_from_pending_missing();         // TEST 56: C2 missing requestId
+    test_clear_entry_failure_handling();        // TEST 57: C3 clearEntry failure
 
     printf("\n==========================================================\n");
     printf("RESULTS: %d passed, %d failed\n", g_passCount, g_failCount);
