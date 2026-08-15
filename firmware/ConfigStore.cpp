@@ -239,7 +239,24 @@ void ConfigStore::loadSchedule() {
 }
 
 void ConfigStore::saveSchedule(bool force) {
-  if (!force && !Core::scheduleDirty) return;
+  // P2-2 F-P0-2 C3: delegate to saveScheduleWithResult, ignore result.
+  // Existing callers (MQTT path, periodic save) don't check the result —
+  // they rely on Core::scheduleDirty staying true for retry. Preserved
+  // for backward compatibility.
+  saveScheduleWithResult(force);
+}
+
+// P2-2 F-P0-2 C3: saveSchedule with explicit bool result.
+// REST schedule handlers (handleScheduleUpsert, handleScheduleDelete) need
+// to know if the save succeeded so they can decide whether to commit the
+// journal entry (COMMITTED) or preserve PENDING evidence (INVARIANT B:
+// RAM mutation occurred, persistence failed → journal stays PENDING, NO
+// clearEntry).
+//
+// Returns true if atomicWrite succeeded (schedule.json written + renamed).
+// Returns false if atomicWrite failed (NVS/FS write error).
+bool ConfigStore::saveScheduleWithResult(bool force) {
+  if (!force && !Core::scheduleDirty) return true;  // nothing to do, "success"
   StaticJsonDocument<16384> doc;
   doc["configVersion"] = Core::CONFIG_VERSION;
   JsonArray arr = doc.createNestedArray("channels");
@@ -262,7 +279,8 @@ void ConfigStore::saveSchedule(bool force) {
   Utils::appendCRC(doc);
   String out;
   serializeJson(doc, out);
-  if (Storage::fs.atomicWrite(Core::PATH_SCHEDULE_JSON, out)) {
+  bool ok = Storage::fs.atomicWrite(Core::PATH_SCHEDULE_JSON, out);
+  if (ok) {
     Core::scheduleDirty = false;
     Core::firstDirtySet = false;
   } else {
@@ -270,6 +288,7 @@ void ConfigStore::saveSchedule(bool force) {
     Core::lastSaveTime = millis() - Core::SAVE_DELAY_MS + 5000;
   }
   esp_task_wdt_reset();
+  return ok;
 }
 
 void ConfigStore::markDirty() {

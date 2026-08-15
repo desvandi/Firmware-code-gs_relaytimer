@@ -118,6 +118,10 @@ inline void handleRelay() {
   requestId = String(doc["requestId"] | "");
 
   // ---- [helper] command hash (uses shared Utils::computeCommandHash) ----
+  // REST relay body includes "action" but not "type" (MQTT convention).
+  // Inject type="relay" so the hash matches the MQTT canonical schema
+  // for relay commands (cross-ingress contract symmetry per §11).
+  doc["type"] = "relay";
   String commandHash = Web::Rest::computeCommandHash(doc);
 
   // ---- [helper] duplicate check + ACK replay ----

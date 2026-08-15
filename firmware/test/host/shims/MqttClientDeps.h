@@ -747,6 +747,15 @@ public:
   String _testBody;
   bool _testHasBody = false;
 
+  // ---- Query parameter state (P2-2 F-P0-2 C3: for DELETE handlers) ----
+  // Test sets query params via _setTestQueryParam(). Handlers read via
+  // hasArg(name) + arg(name).toInt() for non-"plain" args.
+  // Stored as parallel arrays (name, value) — simple linear scan.
+  static constexpr int MAX_QUERY_PARAMS = 16;
+  String _queryParams[MAX_QUERY_PARAMS];
+  String _queryValues[MAX_QUERY_PARAMS];
+  int _queryParamCount = 0;
+
   // ---- Header state ----
   // Test sets headers via setTestHeader(). Handlers read via hasHeader() + header().
   // Common headers: Authorization, X-CSRF-Token, Content-Length, Origin, Cookie
@@ -792,6 +801,10 @@ public:
   String uri() { return ""; }
   String arg(const String& name) {
     if (name == "plain" && _testHasBody) return _testBody;
+    // P2-2 F-P0-2 C3: query parameter support
+    for (int i = 0; i < _queryParamCount; i++) {
+      if (_queryParams[i] == name) return _queryValues[i];
+    }
     return "";
   }
   String arg(int /*i*/) { return ""; }
@@ -800,7 +813,7 @@ public:
     if (name == "X-CSRF-Token") return _testHasCsrf;
     if (name == "Content-Length") return _testHasContentLength;
     if (name == "Origin") return _testHasOrigin;
-    if (name == "Cookie") return false;  // not used in C2 tests
+    if (name == "Cookie") return false;  // not used in C2/C3 tests
     return false;
   }
   String header(const String& name) {
@@ -812,6 +825,10 @@ public:
   }
   bool hasArg(const String& name) {
     if (name == "plain") return _testHasBody;
+    // P2-2 F-P0-2 C3: query parameter support
+    for (int i = 0; i < _queryParamCount; i++) {
+      if (_queryParams[i] == name) return true;
+    }
     return false;
   }
   bool hasArg(int /*i*/) { return false; }
@@ -823,6 +840,12 @@ public:
   void _resetTestState() {
     _testBody = "";
     _testHasBody = false;
+    // P2-2 F-P0-2 C3: reset query params
+    _queryParamCount = 0;
+    for (int i = 0; i < MAX_QUERY_PARAMS; i++) {
+      _queryParams[i] = "";
+      _queryValues[i] = "";
+    }
     _testAuthHeader = "";
     _testCsrfHeader = "";
     _testContentLength = "";
@@ -851,6 +874,14 @@ public:
   void _setTestCsrf(const char* token) {
     _testCsrfHeader = String(token);
     _testHasCsrf = true;
+  }
+  // P2-2 F-P0-2 C3: set query parameter (for DELETE handlers)
+  void _setTestQueryParam(const char* name, const char* value) {
+    if (_queryParamCount < MAX_QUERY_PARAMS) {
+      _queryParams[_queryParamCount] = String(name);
+      _queryValues[_queryParamCount] = String(value);
+      _queryParamCount++;
+    }
   }
 };
 
@@ -1210,8 +1241,41 @@ namespace Drivers {
 // ============================================================================
 namespace Storage {
 
+  // ---- FileSystem.h ---- (moved BEFORE ConfigStore — ConfigStore::saveScheduleWithResult uses fs)
+  // LittleFS wrapper. MqttClient.cpp does NOT directly use Storage::fs, but
+  // provided for completeness. The real FileSystem.h returns `File` (from
+  // LittleFS) — we omit that method to avoid needing a File shim.
+  //
+  // P2-2 F-P0-2 C3: atomicWrite now returns TRUE by default (simulates
+  // successful file write). Tests can inject failure via setFailNextAtomicWrite().
+  class FileSystem {
+  public:
+    bool begin() { return true; }
+    void cleanupTempFiles() {}
+    bool exists(const char*) { return false; }
+    bool remove(const char*) { return false; }
+    bool rename(const char*, const char*) { return false; }
+    bool atomicWrite(const char* path, const String& content) {
+      (void)path;
+      (void)content;
+      // P2-2 F-P0-2 C3: failure injection for saveSchedule tests
+      if (_failNextAtomicWrite) {
+        _failNextAtomicWrite = false;  // fail once, then auto-clear
+        return false;
+      }
+      return true;  // default: success
+    }
+    String readAll(const char*) { return ""; }
+
+    // P2-2 F-P0-2 C3: test-only failure injection
+    bool _failNextAtomicWrite = false;
+    void setFailNextAtomicWrite() { _failNextAtomicWrite = true; }
+  };
+  inline FileSystem fs;
+
   // ---- ConfigStore.h ----
   // MqttClient.cpp uses markDirty() and saveDeviceConfig(). Stub provided.
+  // P2-2 F-P0-2 C3: saveScheduleWithResult added — returns bool from atomicWrite.
   class ConfigStore {
   public:
     void loadUserConfig() {}
@@ -1219,6 +1283,40 @@ namespace Storage {
     void initDefaultUserConfig() {}
     void loadSchedule() {}
     void saveSchedule(bool /*force*/ = false) {}
+    // P2-2 F-P0-2 C3: returns true if atomicWrite succeeded, false if failed.
+    // Calls Storage::fs.atomicWrite which has failure injection support.
+    bool saveScheduleWithResult(bool /*force*/ = false) {
+      StaticJsonDocument<16384> doc;
+      doc["configVersion"] = Core::CONFIG_VERSION;
+      JsonArray arr = doc.createNestedArray("channels");
+      for (int i = 0; i < Core::NUM_CHANNELS; i++) {
+        JsonObject ch = arr.createNestedObject();
+        ch["name"] = Core::channels[i].name;
+        ch["modeAuto"] = Core::channels[i].modeAuto;
+        ch["manualState"] = Core::channels[i].manualState;
+        ch["pirEnabled"] = Core::channels[i].pirEnabled;
+        ch["pirHoldTime"] = Core::channels[i].pirHoldTime;
+        JsonArray schedArr = ch.createNestedArray("schedules");
+        for (int j = 0; j < Core::channels[i].schedCount; j++) {
+          JsonObject entry = schedArr.createNestedObject();
+          entry["on"] = Core::channels[i].sched[j].onTime;
+          entry["off"] = Core::channels[i].sched[j].offTime;
+          entry["day"] = Core::channels[i].sched[j].dayMask;
+          entry["enabled"] = Core::channels[i].sched[j].enabled;
+        }
+      }
+      Utils::appendCRC(doc);
+      String out;
+      serializeJson(doc, out);
+      bool ok = Storage::fs.atomicWrite(Core::PATH_SCHEDULE_JSON, out);
+      if (ok) {
+        Core::scheduleDirty = false;
+        Core::firstDirtySet = false;
+      } else {
+        Core::scheduleDirty = true;
+      }
+      return ok;
+    }
     void resetChannels() {}
     void markDirty() {}
     void clearDirty() {}
@@ -1228,22 +1326,6 @@ namespace Storage {
     bool importAll(const String&) { return false; }
   };
   inline ConfigStore config;
-
-  // ---- FileSystem.h ----
-  // LittleFS wrapper. MqttClient.cpp does NOT directly use Storage::fs, but
-  // provided for completeness. The real FileSystem.h returns `File` (from
-  // LittleFS) — we omit that method to avoid needing a File shim.
-  class FileSystem {
-  public:
-    bool begin() { return true; }
-    void cleanupTempFiles() {}
-    bool exists(const char*) { return false; }
-    bool remove(const char*) { return false; }
-    bool rename(const char*, const char*) { return false; }
-    bool atomicWrite(const char*, const String&) { return false; }
-    String readAll(const char*) { return ""; }
-  };
-  inline FileSystem fs;
 
 } // namespace Storage
 

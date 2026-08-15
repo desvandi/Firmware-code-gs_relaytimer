@@ -52,6 +52,7 @@
 #include "RestJournalHelper.h"
 #include "Common.h"
 #include "RelayHandlers.h"  // handleRelay — the function under test
+#include "ScheduleHandlers.h"  // P2-2 F-P0-2 C3: handleScheduleUpsert/Delete
 
 #include <cstdio>
 #include <cstring>
@@ -99,6 +100,9 @@ static void resetEnv() {
     Core::channels[i].manualState = false;
     strncpy(Core::channels[i].name, "", 1);
   }
+  // P2-2 F-P0-2 C3: reset FileSystem failure injection + schedule dirty flag
+  Storage::fs._failNextAtomicWrite = false;
+  Core::scheduleDirty = false;
   // Reset Web::http test state
   Web::http._resetTestState();
   // Reconstruct journal
@@ -115,6 +119,27 @@ static void sendRelayCommand(const char* jsonBody) {
   Web::http._setTestAuth("Bearer valid-jwt");
   Web::http._setTestCsrf("valid-csrf-token");
   Web::Handlers::handleRelay();
+}
+
+// P2-2 F-P0-2 C3: Helper: send a schedule upsert via the REST handler
+static void sendScheduleUpsert(const char* jsonBody) {
+  Web::http._resetTestState();
+  Web::http._setTestBody(jsonBody);
+  Web::http._setTestAuth("Bearer valid-jwt");
+  Web::http._setTestCsrf("valid-csrf-token");
+  Web::Handlers::handleScheduleUpsert();
+}
+
+// P2-2 F-P0-2 C3: Helper: send a schedule delete via the REST handler
+// Query params: id, channelId, requestId
+static void sendScheduleDelete(const char* id, const char* channelId, const char* requestId) {
+  Web::http._resetTestState();
+  Web::http._setTestAuth("Bearer valid-jwt");
+  Web::http._setTestCsrf("valid-csrf-token");
+  Web::http._setTestQueryParam("id", id);
+  if (channelId) Web::http._setTestQueryParam("channelId", channelId);
+  Web::http._setTestQueryParam("requestId", requestId);
+  Web::Handlers::handleScheduleDelete();
 }
 
 int main() {
@@ -488,6 +513,190 @@ int main() {
     CHECK(Web::http._respBody.indexOf("DURABILITY_FAILURE") >= 0 ||
           Web::http._respBody.indexOf("could not be committed") >= 0,
           "F8: response body mentions DURABILITY_FAILURE");
+  }
+
+  // =====================================================================
+  // P2-2 F-P0-2 C3: SCHEDULE PRODUCTION-PATH TESTS (P9-P14)
+  // =====================================================================
+  // These test /api/schedule POST (upsert) and DELETE using the same
+  // RestJournalHelper pattern as relay, but with FROM_PENDING commit mode
+  // (no markExecuting — schedule is atomic config mutation, no physical
+  // execution phase).
+  //
+  // Critical C3 fix: synchronous saveScheduleWithResult(true) BEFORE commit.
+  // If saveSchedule fails → HTTP 503, journal stays PENDING (INVARIANT B).
+
+  // ---- P9: schedule upsert (add new) → COMMITTED ----
+  printf("\n[P9] schedule upsert (add new) via /api/schedule\n");
+  {
+    resetEnv();
+    const char* json = R"({"channelId":1,"onTime":"07:00","offTime":"18:00","dayMask":127,"enabled":true,"requestId":"req-sched-add"})";
+    sendScheduleUpsert(json);
+
+    CHECK_EQ(Web::http._respCode, 200, "P9: HTTP 200 returned");
+    CHECK(journal.isCommitted("req-sched-add"),
+          "P9: journal state == COMMITTED (PENDING → COMMITTED via FROM_PENDING)");
+    CHECK(Core::channels[0].schedCount == 1,
+          "P9: schedule added (schedCount == 1)");
+    CHECK(strcmp(Core::channels[0].sched[0].onTime, "07:00") == 0,
+          "P9: onTime == 07:00");
+  }
+
+  // ---- P10: schedule upsert (update existing) → COMMITTED ----
+  printf("\n[P10] schedule upsert (update existing) via /api/schedule\n");
+  {
+    resetEnv();
+    // First add a schedule
+    sendScheduleUpsert(R"({"channelId":1,"onTime":"07:00","offTime":"18:00","dayMask":127,"enabled":true,"requestId":"req-sched-1"})");
+    CHECK(Core::channels[0].schedCount == 1, "P10 PRE: schedule added");
+
+    // Now update it (id=1)
+    sendScheduleUpsert(R"({"channelId":1,"id":1,"onTime":"08:30","offTime":"17:00","dayMask":31,"enabled":false,"requestId":"req-sched-update"})");
+    CHECK_EQ(Web::http._respCode, 200, "P10: HTTP 200 returned for update");
+    CHECK(journal.isCommitted("req-sched-update"),
+          "P10: journal state == COMMITTED");
+    CHECK(strcmp(Core::channels[0].sched[0].onTime, "08:30") == 0,
+          "P10: onTime updated to 08:30");
+    CHECK(Core::channels[0].sched[0].enabled == false,
+          "P10: enabled updated to false");
+    CHECK(Core::channels[0].schedCount == 1,
+          "P10: schedCount still 1 (update, not add)");
+  }
+
+  // ---- P11: schedule delete → COMMITTED ----
+  printf("\n[P11] schedule delete via /api/schedule DELETE\n");
+  {
+    resetEnv();
+    // First add a schedule
+    sendScheduleUpsert(R"({"channelId":1,"onTime":"07:00","offTime":"18:00","dayMask":127,"enabled":true,"requestId":"req-sched-pre-delete"})");
+    CHECK(Core::channels[0].schedCount == 1, "P11 PRE: schedule added");
+
+    // Now delete it
+    sendScheduleDelete("1", "1", "req-sched-delete");
+    CHECK_EQ(Web::http._respCode, 200, "P11: HTTP 200 returned for delete");
+    CHECK(journal.isCommitted("req-sched-delete"),
+          "P11: journal state == COMMITTED");
+    CHECK(Core::channels[0].schedCount == 0,
+          "P11: schedCount == 0 (schedule deleted)");
+  }
+
+  // ---- P12: schedule response shape includes requestId + success + data ----
+  printf("\n[P12] schedule response shape verification\n");
+  {
+    resetEnv();
+    const char* json = R"({"channelId":1,"onTime":"07:00","offTime":"18:00","dayMask":127,"enabled":true,"requestId":"req-sched-shape"})";
+    sendScheduleUpsert(json);
+
+    const String& body = Web::http._respBody;
+    CHECK(body.indexOf("\"requestId\":\"req-sched-shape\"") >= 0,
+          "P12: response body contains requestId");
+    CHECK(body.indexOf("\"success\":true") >= 0,
+          "P12: response body contains success:true");
+    CHECK(body.indexOf("\"schedule\":") >= 0,
+          "P12: response data contains schedule object");
+    CHECK(body.indexOf("\"channelId\":1") >= 0,
+          "P12: response schedule contains channelId");
+  }
+
+  // ---- P13: schedule duplicate requestId (COMMITTED) → replay ACK byte-identical ----
+  printf("\n[P13] schedule duplicate requestId → replay ACK (byte-identical)\n");
+  {
+    resetEnv();
+    sendScheduleUpsert(R"({"channelId":1,"onTime":"07:00","offTime":"18:00","dayMask":127,"enabled":true,"requestId":"req-sched-dup"})");
+    CHECK_EQ(Web::http._respCode, 200, "P13: first command HTTP 200");
+    String firstAck = Web::http._respBody;
+    uint8_t sizeBefore = journal.getJournalSize();
+
+    // Duplicate
+    sendScheduleUpsert(R"({"channelId":1,"onTime":"07:00","offTime":"18:00","dayMask":127,"enabled":true,"requestId":"req-sched-dup"})");
+    CHECK_EQ(Web::http._respCode, 200, "P13: duplicate HTTP 200 (replayed)");
+    CHECK(journal.isCommitted("req-sched-dup"), "P13: still COMMITTED");
+    CHECK_EQ(journal.getJournalSize(), sizeBefore,
+          "P13: journal size unchanged (no new slot)");
+    CHECK_STR_EQ(Web::http._respBody, firstAck,
+                 "P13: replayed ACK byte-identical to original");
+  }
+
+  // ---- P14: schedule duplicate with different hash → HTTP 409 + no mutation ----
+  printf("\n[P14] schedule duplicate with different hash → security reject\n");
+  {
+    resetEnv();
+    sendScheduleUpsert(R"({"channelId":1,"onTime":"07:00","offTime":"18:00","dayMask":127,"enabled":true,"requestId":"req-sched-reuse"})");
+    CHECK_EQ(Web::http._respCode, 200, "P14: first command HTTP 200");
+    uint8_t schedCountAfterFirst = Core::channels[0].schedCount;
+
+    // Different command (different onTime) with same requestId
+    sendScheduleUpsert(R"({"channelId":1,"onTime":"09:00","offTime":"18:00","dayMask":127,"enabled":true,"requestId":"req-sched-reuse"})");
+    CHECK_EQ(Web::http._respCode, 409, "P14: reuse with different hash HTTP 409");
+    CHECK(Core::channels[0].schedCount == schedCountAfterFirst,
+          "P14: no mutation (schedCount unchanged)");
+    CHECK(journal.isCommitted("req-sched-reuse"),
+          "P14: first command journal entry still COMMITTED (not cleared)");
+  }
+
+  // =====================================================================
+  // P2-2 F-P0-2 C3: SCHEDULE FAILURE-PATH TESTS (F9-F11)
+  // =====================================================================
+
+  // ---- F9: schedule missing requestId → HTTP 400 ----
+  printf("\n[F9] schedule missing requestId → HTTP 400\n");
+  {
+    resetEnv();
+    uint8_t sizeBefore = journal.getJournalSize();
+    sendScheduleUpsert(R"({"channelId":1,"onTime":"07:00","offTime":"18:00","dayMask":127,"enabled":true})");
+    CHECK_EQ(Web::http._respCode, 400, "F9: HTTP 400 for missing requestId");
+    CHECK_EQ(journal.getJournalSize(), sizeBefore,
+          "F9: journal size unchanged (no entry created)");
+  }
+
+  // ---- F10: schedule invalid time format → HTTP 400 + no journal entry (pre-store) ----
+  printf("\n[F10] schedule invalid time format → HTTP 400\n");
+  {
+    resetEnv();
+    uint8_t sizeBefore = journal.getJournalSize();
+    sendScheduleUpsert(R"({"channelId":1,"onTime":"invalid","offTime":"18:00","dayMask":127,"enabled":true,"requestId":"req-sched-badtime"})");
+    CHECK_EQ(Web::http._respCode, 400, "F10: HTTP 400 for invalid time");
+    CHECK(!journal.isProcessed("req-sched-badtime"),
+          "F10: no journal entry (pre-store validation)");
+    CHECK_EQ(journal.getJournalSize(), sizeBefore,
+          "F10: journal size unchanged");
+  }
+
+  // ---- F11: saveSchedule failure → HTTP 503 + journal PENDING + NO clearEntry ----
+  //
+  // CRITICAL C3 TEST (Phase B REV.3 §7.3 + §9.5):
+  //   Validates the synchronous saveSchedule fix. When saveScheduleWithResult
+  //   returns false (atomicWrite fails), the handler MUST:
+  //     - Send HTTP 503 (DURABILITY_FAILURE)
+  //     - NOT call commitTransactionFromPending (journal stays PENDING)
+  //     - NOT call clearEntry (INVARIANT B — RAM mutation occurred)
+  //   This proves the RAM/NVS divergence race is fixed: journal will NOT
+  //   say COMMITTED while schedule.json failed to persist.
+  printf("\n[F11] saveSchedule failure → HTTP 503 + journal PENDING (INVARIANT B)\n");
+  {
+    resetEnv();
+    // Arm: next atomicWrite call will fail
+    Storage::fs.setFailNextAtomicWrite();
+
+    sendScheduleUpsert(R"({"channelId":1,"onTime":"07:00","offTime":"18:00","dayMask":127,"enabled":true,"requestId":"req-sched-save-fail"})");
+
+    CHECK_EQ(Web::http._respCode, 503, "F11: HTTP 503 (saveSchedule failed)");
+    // RAM mutation DID occur (schedule was added to RAM before saveSchedule)
+    CHECK(Core::channels[0].schedCount == 1,
+          "F11: RAM mutation occurred (schedCount == 1 — schedule in RAM)");
+    // Journal stays PENDING — NOT COMMITTED (commit was skipped)
+    CHECK(!journal.isCommitted("req-sched-save-fail"),
+          "F11: journal NOT COMMITTED (commit skipped after save failure)");
+    // Journal entry still exists — NOT cleared (INVARIANT B)
+    CHECK(journal.isProcessed("req-sched-save-fail"),
+          "F11: journal entry preserved (clearEntry NOT called — INVARIANT B)");
+    // Specifically, state is PENDING (not EXECUTING, not COMMITTED)
+    CHECK(journal.getTransactionState("req-sched-save-fail") == TransactionState::PENDING,
+          "F11: journal state == PENDING (evidence preserved, not committed)");
+    // Response body mentions DURABILITY_FAILURE
+    CHECK(Web::http._respBody.indexOf("DURABILITY_FAILURE") >=0 ||
+          Web::http._respBody.indexOf("persistence failed") >= 0,
+          "F11: response body mentions DURABILITY_FAILURE");
   }
 
   // =====================================================================

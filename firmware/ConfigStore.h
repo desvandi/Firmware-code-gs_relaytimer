@@ -20,6 +20,10 @@ public:
   // ---------- SCHEDULE / CHANNEL CONFIG ----------
   void loadSchedule();
   void saveSchedule(bool force = false);
+  // P2-2 F-P0-2 C3: returns true if save succeeded, false if failed.
+  // Callers (REST schedule handlers) need this to decide whether to
+  // commit the journal entry or preserve PENDING evidence.
+  bool saveScheduleWithResult(bool force = false);
   void resetChannels();
   void markDirty();
   void clearDirty();
