@@ -20,9 +20,13 @@
 # sources needed. The -include MqttClientDeps.h provides everything.
 #
 # Usage:
+#     ./setup_host_env.sh          # one-time: install ArduinoJson + compat header
 #     make -f Makefile.che           # build
 #     make -f Makefile.che run       # build + run
 #     make -f Makefile.che clean     # clean
+#
+# C3-GATE-002 TEST-INFRA: requires ArduinoJson v6.18.2 (NOT v6.19+) +
+# shims/arduinojson_compat.h. Run ./setup_host_env.sh once before first build.
 
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Werror
@@ -42,12 +46,13 @@ BIN      := command_hash_equivalence_test_bin
 all: $(BIN)
 
 $(BIN): $(TEST_SRC) \
-        $(SHIM_DIR)/MqttClientDeps.h $(SHIM_DIR)/Arduino.h \
-        $(SRC_DIR)/CommandHash.h
+	$(SHIM_DIR)/MqttClientDeps.h $(SHIM_DIR)/Arduino.h \
+	$(SRC_DIR)/CommandHash.h $(SHIM_DIR)/arduinojson_compat.h
 	$(CXX) $(CXXFLAGS) $(SUPPRESS) \
 	    -I$(SHIM_DIR) \
 	    -I$(SRC_DIR) \
 	    -I$(JSON_DIR) \
+	    -include $(SHIM_DIR)/arduinojson_compat.h \
 	    -include $(SHIM_DIR)/MqttClientDeps.h \
 	    $(TEST_SRC) \
 	    -lcrypto \

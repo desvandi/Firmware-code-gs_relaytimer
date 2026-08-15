@@ -5,9 +5,13 @@
 # against comprehensive shims. Test calls actual _handleCommand() and _handleOta().
 #
 # Usage:
+#     ./setup_host_env.sh          # one-time: install ArduinoJson + compat header
 #     make -f Makefile.mc           # build
 #     make -f Makefile.mc run       # build + run
 #     make -f Makefile.mc clean     # clean
+#
+# C3-GATE-002 TEST-INFRA: requires ArduinoJson v6.18.2 (NOT v6.19+) +
+# shims/arduinojson_compat.h. Run ./setup_host_env.sh once before first build.
 # =============================================================================
 
 CXX      ?= g++
@@ -35,11 +39,12 @@ all: $(BIN)
 
 $(BIN): $(TEST_SRC) $(FIRMWARE1) $(FIRMWARE2) $(FIRMWARE3) \
        $(SHIM_DIR)/MqttClientDeps.h $(SHIM_DIR)/Arduino.h $(SHIM_DIR)/Preferences.h \
-       $(SHIM_DIR)/esp_crc.h $(SHIM_DIR)/Config.h
+       $(SHIM_DIR)/esp_crc.h $(SHIM_DIR)/Config.h $(SHIM_DIR)/arduinojson_compat.h
 	$(CXX) $(CXXFLAGS) $(SUPPRESS) \
 	    -I$(SHIM_DIR) \
 	    -I$(SRC_DIR) \
 	    -I$(JSON_DIR) \
+	    -include $(SHIM_DIR)/arduinojson_compat.h \
 	    -include $(SHIM_DIR)/MqttClientDeps.h \
 	    $(TEST_SRC) $(FIRMWARE1) $(FIRMWARE2) $(FIRMWARE3) \
 	    -lcrypto \

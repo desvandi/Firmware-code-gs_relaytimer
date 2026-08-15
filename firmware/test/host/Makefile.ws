@@ -8,9 +8,13 @@
 # Test calls actual Web::Handlers::handleRelay() with JSON body via WebServer shim.
 #
 # Usage:
+#     ./setup_host_env.sh          # one-time: install ArduinoJson + compat header
 #     make -f Makefile.ws           # build
 #     make -f Makefile.ws run       # build + run
 #     make -f Makefile.ws clean     # clean
+#
+# C3-GATE-002 TEST-INFRA: requires ArduinoJson v6.18.2 (NOT v6.19+) +
+# shims/arduinojson_compat.h. Run ./setup_host_env.sh once before first build.
 
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Werror
@@ -33,14 +37,15 @@ BIN      := web_server_test_bin
 all: $(BIN)
 
 $(BIN): $(TEST_SRC) $(FIRMWARE1) $(FIRMWARE2) $(FIRMWARE3) \
-        $(SHIM_DIR)/MqttClientDeps.h $(SHIM_DIR)/Arduino.h $(SHIM_DIR)/Preferences.h \
-        $(SHIM_DIR)/esp_crc.h $(SHIM_DIR)/Config.h \
-        $(SRC_DIR)/RestJournalHelper.h $(SRC_DIR)/Common.h $(SRC_DIR)/RelayHandlers.h \
-        $(SRC_DIR)/CommandHash.h
+	$(SHIM_DIR)/MqttClientDeps.h $(SHIM_DIR)/Arduino.h $(SHIM_DIR)/Preferences.h \
+	$(SHIM_DIR)/esp_crc.h $(SHIM_DIR)/Config.h \
+	$(SRC_DIR)/RestJournalHelper.h $(SRC_DIR)/Common.h $(SRC_DIR)/RelayHandlers.h \
+	$(SRC_DIR)/CommandHash.h $(SHIM_DIR)/arduinojson_compat.h
 	$(CXX) $(CXXFLAGS) $(SUPPRESS) \
 	    -I$(SHIM_DIR) \
 	    -I$(SRC_DIR) \
 	    -I$(JSON_DIR) \
+	    -include $(SHIM_DIR)/arduinojson_compat.h \
 	    -include $(SHIM_DIR)/MqttClientDeps.h \
 	    $(TEST_SRC) $(FIRMWARE1) $(FIRMWARE2) $(FIRMWARE3) \
 	    -lcrypto \
