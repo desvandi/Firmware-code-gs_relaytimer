@@ -136,6 +136,37 @@ public:
         return it->second[0];
     }
 
+    // uint32_t (used by MqttClient.cpp OTA rate-limiting window timestamp).
+    size_t putULong(const char* key, uint32_t value) {
+        if (!started_ || !key || readOnly_) return 0;
+        if (failModeRef() == FAIL_PUT_KEY && failKeyRef() == std::string(key)) {
+            failModeRef() = FAIL_NONE;
+            failKeyRef().clear();
+            return 0;
+        }
+        std::vector<uint8_t> v(4);
+        v[0] = (uint8_t)(value & 0xFF);
+        v[1] = (uint8_t)((value >> 8) & 0xFF);
+        v[2] = (uint8_t)((value >> 16) & 0xFF);
+        v[3] = (uint8_t)((value >> 24) & 0xFF);
+        storage()[ns_ + key] = v;
+        return 4;
+    }
+
+    uint32_t getULong(const char* key, uint32_t defaultValue = 0) {
+        if (!started_ || !key) return defaultValue;
+        if (failModeRef() == FAIL_GET_KEY && failKeyRef() == std::string(key)) {
+            failModeRef() = FAIL_NONE;
+            failKeyRef().clear();
+            return defaultValue;
+        }
+        auto it = storage().find(ns_ + key);
+        if (it == storage().end() || it->second.size() < 4) return defaultValue;
+        const std::vector<uint8_t>& v = it->second;
+        return (uint32_t)v[0] | ((uint32_t)v[1] << 8) |
+               ((uint32_t)v[2] << 16) | ((uint32_t)v[3] << 24);
+    }
+
     bool remove(const char* key) {
         if (!started_ || !key || readOnly_) return false;
         auto it = storage().find(ns_ + key);

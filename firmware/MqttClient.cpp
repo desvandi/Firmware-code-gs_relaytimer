@@ -1367,7 +1367,7 @@ void MqttClient::_handleCommand(const String& json) {
       Drivers::rtc.adjust(y, m, d, h, mi, s);
       Services::Log.append(Core::LogType::TimeSync, "RTC set via MQTT", 0);
 
-      _publishGenericAck(requestId, true, "RTC time set", commandHash);
+      _publishGenericAck(requestId, true, "RTC time set", "", commandHash);
     } else {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, "Invalid time action (use set)");
@@ -1438,14 +1438,14 @@ void MqttClient::_handleCommand(const String& json) {
       }
       Services::Log.append(Core::LogType::ConfigChange, "Energy stats reset via MQTT", 0);
       publishStatus();
-      _publishGenericAck(requestId, true, "Energy stats reset", commandHash);
+      _publishGenericAck(requestId, true, "Energy stats reset", "", commandHash);
     } else if (strcmp(action, "resetDailyStats") == 0) {
       if (Drivers::pzem.isAvailable()) {
         Drivers::pzem.resetDailyStats();
       }
       Services::Log.append(Core::LogType::ConfigChange, "Daily stats reset via MQTT", 0);
       publishStatus();
-      _publishGenericAck(requestId, true, "Daily stats reset", commandHash);
+      _publishGenericAck(requestId, true, "Daily stats reset", "", commandHash);
     } else {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, "Invalid system action (use reboot/getStatus/resetEnergyStats/resetDailyStats)");
@@ -1487,7 +1487,7 @@ void MqttClient::_handleCommand(const String& json) {
       Storage::config.saveDeviceConfig();
       Services::Log.append(Core::LogType::ConfigChange, "Device config updated via MQTT", 0);
       publishStatus();
-      _publishGenericAck(requestId, true, "Device config updated", commandHash);
+      _publishGenericAck(requestId, true, "Device config updated", "", commandHash);
     } else {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, "Invalid config action (use setDevice)");
