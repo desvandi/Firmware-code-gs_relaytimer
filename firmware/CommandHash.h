@@ -64,6 +64,28 @@ namespace Utils {
 //              (NOTE: OTA commands have empty "type" field — see _handleOta)
 //   (other)  : "<type>|<action>"  (no per-type fields — hash binds only type+action)
 //
+// KNOWN LIMITATION / FOLLOW-UP AUDIT ITEM (auditor C1 re-audit directive #5):
+//
+//   The original comment (preserved verbatim above) says "Unknown fields
+//   cause the command to be REJECTED (not silently ignored)." This is
+//   accurate for the COMMAND VALIDATION layer (MqttClient::_handleCommand
+//   lines 822-873), but NOT for this function — computeCommandHash() only
+//   SELECTS the canonical fields per type and IGNORES unknown fields.
+//
+//   This was true in the original static impl and is preserved verbatim
+//   in this extraction (per auditor guardrail: do not change behavior in C1).
+//
+//   Cross-ingress contract concern: if REST path (C2+) does NOT implement
+//   the same unknown-field rejection that MQTT path does (in _handleCommand
+//   lines 822-873), then an attacker could send REST commands with extra
+//   fields that affect REST execution but don't affect the hash. This would
+//   be a §11 cross-ingress contract violation.
+//
+//   Resolution: C2+ MUST include unknown-field rejection in REST handlers
+//   (or in RestJournalHelper) to match MQTT semantics. This is tracked as
+//   a follow-up audit item, NOT a C1 fix.
+//
+// =============================================================================
 inline String computeCommandHash(const DynamicJsonDocument& doc) {
   const char* type = doc["type"] | "";
   const char* action = doc["action"] | "";

@@ -16,6 +16,7 @@
 #undef private
 
 #include "MqttClientDeps.h"
+#include "CommandHash.h"  // shared function under test (for edge case vectors)
 #include "TransactionJournal.h"
 #include "JournalRecord.h"
 #include <cstdio>
@@ -159,5 +160,61 @@ int main() {
   }
 
   printf("\n=== End of baseline vectors ===\n");
+
+  // ---- EDGE CASE VECTORS (for failure/edge-path proof) ----
+  // These exercise boundary inputs that production may not normally send,
+  // but the shared function MUST handle deterministically (no crash, no
+  // semantic drift) so the cross-ingress contract is robust.
+  printf("\n=== Edge Case Vectors ===\n");
+  printf("(Boundary inputs — shared function must produce deterministic output)\n\n");
+
+  // F1: empty document — most degenerate input
+  {
+    DynamicJsonDocument doc(64);
+    deserializeJson(doc, "{}");
+    String h = Utils::computeCommandHash(doc);
+    printf("edge_empty_doc: %s\n", h.c_str());
+  }
+  // F2: relay without optional fields (mode, manualState absent — should use defaults)
+  {
+    DynamicJsonDocument doc(512);
+    // Same as TEST 1 (relay_on_ch1) but WITHOUT mode/manualState — defaults
+    // should produce identical hash to TEST 1 because the original function
+    // uses `doc["mode"] | ""` and `doc["manualState"] | false` defaults.
+    deserializeJson(doc, R"({"type":"relay","action":"on","channelId":1})");
+    String h = Utils::computeCommandHash(doc);
+    printf("edge_relay_on_ch1_no_optional: %s\n", h.c_str());
+  }
+  // F3: type present, action missing — action defaults to ""
+  {
+    DynamicJsonDocument doc(512);
+    deserializeJson(doc, R"({"type":"relay","channelId":1})");
+    String h = Utils::computeCommandHash(doc);
+    printf("edge_relay_no_action: %s\n", h.c_str());
+  }
+  // F4: known type with extra junk fields — must NOT affect hash
+  // (Canonical schema selects only known fields, ignores others.)
+  // The hash should match VEC_RELAY_ON_CH1.
+  {
+    DynamicJsonDocument doc(512);
+    deserializeJson(doc, R"({"type":"relay","action":"on","channelId":1,"junkField":"attacker_payload","extra":999})");
+    String h = Utils::computeCommandHash(doc);
+    printf("edge_relay_on_ch1_with_junk: %s\n", h.c_str());
+  }
+  // F5: very large string field (within JsonDocument budget) — no crash
+  {
+    DynamicJsonDocument doc(4096);
+    // Build a large name with 2000 'X' chars (Arduino String doesn't have
+    // the (size_t, char) fill constructor — use repeated append).
+    String largeName;
+    largeName.reserve(2000);
+    for (int i = 0; i < 2000; i++) largeName += 'X';
+    String json = "{\"type\":\"channel\",\"action\":\"rename\",\"channelId\":1,\"name\":\"" + largeName + "\"}";
+    deserializeJson(doc, json);
+    String h = Utils::computeCommandHash(doc);
+    printf("edge_large_name_field: %s\n", h.c_str());
+  }
+
+  printf("\n=== End of edge case vectors ===\n");
   return 0;
 }
