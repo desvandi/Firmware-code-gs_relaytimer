@@ -22,13 +22,19 @@
 #   1. TransactionJournalTest   (Makefile.tj)   — binary RESULTS: 194 passed
 #   2. CommandRoutingTest       (Makefile.cr)   — binary RESULTS: 133 passed
 #   3. CommandHashEquivalenceTest (Makefile.che) — binary RESULTS: 26 passed
-#   4. WebServerTest            (Makefile.ws)   — binary RESULTS: 144 passed (C2-C5)
+#   4. WebServerTest            (Makefile.ws)   — binary RESULTS: 183 passed (C2-C5)
 #   5. MqttClientTest           (Makefile.mc)   — binary RESULTS: 31 passed
 #   6. CommandHashBaseline      (Makefile.chb)  — 14 vectors captured (no RESULTS line)
 #
-# Authoritative total: 194 + 133 + 26 + 144 + 31 = 528 assertions + 14 vectors.
-# (Previous versions incorrectly claimed 540 due to grep over-counting
-#  CommandRoutingTest's routing-matrix summary lines as assertions.)
+# Authoritative total (computed programmatically from binary RESULTS lines):
+#   194 + 133 + 26 + 183 + 31 = 567 assertions + 14 baseline vectors
+#
+# NOTE: Previous versions hardcoded "528" or "540" in the final echo — those
+# were wrong. 528 was a stale value from before C5 added 39 WebServerTest
+# assertions (144→183). 540 was from grep over-counting CommandRoutingTest's
+# routing-matrix summary lines (12 extra [PASS] lines that are post-test
+# summaries, not individual assertions). The runner now computes the total
+# from actual binary RESULTS lines — no hardcoded numbers.
 #
 # USAGE:
 #   cd firmware/test/host
@@ -54,6 +60,7 @@ fi
 OVERALL_EXIT=0
 TOTAL_PASS=0
 TOTAL_FAIL=0
+TOTAL_VECTORS=0
 RESULTS=()
 
 # Helper: classify exit code (handles signal terminations)
@@ -166,6 +173,7 @@ run_suite() {
   echo "Assertions (from binary RESULTS line): PASS=${pass_count} FAIL=${fail_count} VECTORS=${vec_count} (expected: ${expected})"
   TOTAL_PASS=$((TOTAL_PASS + pass_count))
   TOTAL_FAIL=$((TOTAL_FAIL + fail_count))
+  TOTAL_VECTORS=$((TOTAL_VECTORS + vec_count))
 
   # Classification logic (R2-aware):
   #   PASS requires: exit == 0 AND fail_count == 0 AND (pass_count > 0 OR vectors > 0)
@@ -189,7 +197,7 @@ run_suite() {
 run_suite Makefile.tj  "TransactionJournalTest"      "194"
 run_suite Makefile.cr  "CommandRoutingTest"          "133"
 run_suite Makefile.che "CommandHashEquivalenceTest"  "26"
-run_suite Makefile.ws  "WebServerTest"               "144"
+run_suite Makefile.ws  "WebServerTest"               "183"
 run_suite Makefile.mc  "MqttClientTest"              "31"
 run_suite Makefile.chb "CommandHashBaseline"         "14 vectors"
 
@@ -202,12 +210,13 @@ for r in "${RESULTS[@]}"; do
   echo "  ${r}"
 done
 echo ""
-echo "Total PASS: ${TOTAL_PASS}"
-echo "Total FAIL: ${TOTAL_FAIL}"
+echo "Total assertions (from binary RESULTS lines): ${TOTAL_PASS}"
+echo "Total vectors (from grep 64-hex matches):     ${TOTAL_VECTORS:-0}"
+echo "Total failures:                               ${TOTAL_FAIL}"
 echo ""
 
 if [ "${OVERALL_EXIT}" -eq 0 ]; then
-  echo "[ALL GREEN] 528 assertions + 14 baseline vectors (authoritative, from binary RESULTS lines)"
+  echo "[ALL GREEN] ${TOTAL_PASS} assertions + ${TOTAL_VECTORS:-0} baseline vectors (computed from actual binary output)"
   exit 0
 else
   echo "[FAILED] one or more suites did not pass cleanly"
