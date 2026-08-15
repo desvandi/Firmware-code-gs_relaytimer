@@ -176,18 +176,156 @@ int main() {
           "ESP.restart() was called (after durable commit)");
   }
 
-  // ---- TEST 10: OTA via _handleOta (failure path — no HTTPS server) ----
-  printf("\n[TEST 10] OTA via _handleOta() (failure path)\n");
+  // ---- TEST 10: OTA via _handleOta() — PENDING → EXECUTING behavioral proof ----
+  //
+  // AUDITOR REQUIREMENT (F-P0-1-C4 → C5): the previous TEST 10 asserted
+  //   `EXECUTING || COMMITTED`, which is too permissive — a COMMITTED state
+  //   would also satisfy the assertion without proving markExecuting() was
+  //   called. The auditor requires strict behavioral proof that captures the
+  //   PENDING → EXECUTING transition.
+  //
+  // CORRECTED DESIGN — Option C (auditor's "cleanest proof"):
+  //   Failure injection INSIDE _downloadAndVerifyOta() — production code
+  //   reaches the download function, fails at the root CA check, and
+  //   returns false. State stays EXECUTING (commitTransaction is only
+  //   called on success).
+  //
+  //   PRE-CONDITION : requestId not in journal (no entry)
+  //   FAILURE POINT : OTA_HTTPS_ROOT_CA is "" (shim default) → line 1923
+  //                   inside _downloadAndVerifyOta() returns false
+  //   POST-CONDITION: state is EXACTLY EXECUTING (strict equality)
+  //
+  // Production path exercised (MqttClient.cpp):
+  //   line 1586  storeIntent()           → PENDING  (gen=N)
+  //   line 1595  markExecuting()          → EXECUTING (gen=N+1)
+  //   line 1603  action == "update"      ✓
+  //   line 1617  url not empty + https   ✓
+  //   line 1622  expectedSize 1..2MB     ✓
+  //   line 1627  expectedSha256 len == 64 ✓
+  //   line 1653  version X.Y.Z format    ✓
+  //   line 1682  version > current        ✓ (4.1.0 > 4.0.0)
+  //   line 1695  ED25519_PUBLIC_KEY set   ✓ (set to "00" by test)
+  //   line 1704  signatureHex len == 128 ✓ (128 chars)
+  //   line 1711  url starts with https:// ✓
+  //   line 1729  host allowlist          — skipped (OTA_ALLOWED_HOSTS empty)
+  //   line 1797  _downloadAndVerifyOta() → enters function
+  //   line 1923  OTA_HTTPS_ROOT_CA == "" → return false ← INJECTION POINT
+  //   line 1800  success == false         → publish fail ACK
+  //   line 1812  commitTransaction()    ✗ NOT REACHED
+  //
+  // Strict equality with EXECUTING proves:
+  //   (a) storeIntent was called (otherwise isProcessed would be false)
+  //   (b) markExecuting was called (otherwise state would be PENDING)
+  //   (c) commitTransaction was NOT called (otherwise state would be COMMITTED)
+  printf("\n[TEST 10] OTA via _handleOta() — PENDING → EXECUTING behavioral proof\n");
   {
     resetEnv();
-    const char* json = R"({"action":"update","requestId":"req-ota-1","url":"https://example.com/fw.bin","version":"4.1.0","size":100000,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","signature":"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"})";
+
+    // ARM failure injection:
+    //   - OTA_ED25519_PUBLIC_KEY_HEX must be NON-EMPTY so production validation
+    //     at line 1695 passes and we actually reach the download function.
+    //   - OTA_HTTPS_ROOT_CA stays empty (shim default) → triggers failure
+    //     INSIDE _downloadAndVerifyOta() at line 1923.
+    Core::OTA_ED25519_PUBLIC_KEY_HEX = "00";  // any non-empty string
+    // OTA_HTTPS_ROOT_CA already "" by shim default — failure injection armed
+
+    // PRE-CONDITION 1: requestId not in journal (no PENDING entry exists)
+    CHECK(!journal.isProcessed("req-ota-1"),
+          "PRE: requestId 'req-ota-1' not in journal — no PENDING entry exists");
+
+    // PRE-CONDITION 2: getTransactionState returns PENDING for unknown requestId
+    // (this is the sentinel value returned by _findSlot miss — see line 1531)
+    CHECK(journal.getTransactionState("req-ota-1") == TransactionState::PENDING,
+          "PRE: getTransactionState returns PENDING for unknown requestId (sentinel)");
+
+    // Valid OTA JSON — passes ALL pre-download validations.
+    // Signature is exactly 128 hex chars (64 bytes * 2) — passes line 1704.
+    // Signature VALUE is bogus, but signature verification only runs AFTER
+    // download succeeds (line 2064), so it's irrelevant for this failure path.
+    const char* json = R"({"action":"update","requestId":"req-ota-1","url":"https://example.com/fw.bin","version":"4.1.0","size":100000,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","signature":"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"})";
+
+    // Execute PRODUCTION _handleOta() — calls real storeIntent/markExecuting
+    // against real TransactionJournal compiled from production source.
     mqtt._handleOta(json);
-    // OTA download will fail (no real HTTPS server) — verify markExecuting was called
-    CHECK(journal.getTransactionState("req-ota-1") == TransactionState::EXECUTING ||
-          journal.getTransactionState("req-ota-1") == TransactionState::COMMITTED,
-          "OTA entry exists (EXECUTING or COMMITTED — markExecuting was called by production code)");
+
+    // POST-CONDITION 1: requestId IS now in journal — storeIntent was called.
+    // Without storeIntent, isProcessed would still be false (no entry created).
     CHECK(journal.isProcessed("req-ota-1"),
-          "OTA requestId is in journal (production _handleOta created entry)");
+          "POST: requestId IS in journal — storeIntent() was called (PENDING entry created)");
+
+    // POST-CONDITION 2 (KEY BEHAVIORAL PROOF): state is EXACTLY EXECUTING.
+    //
+    // This is the strict assertion the auditor required:
+    //   - State != PENDING  → markExecuting was called (PENDING → EXECUTING transition)
+    //   - State != COMMITTED → commitTransaction was NOT called (download failed)
+    //   - State == EXECUTING → markExecuting WAS called AND commitTransaction was NOT
+    //
+    // No OR-clause, no COMMITTED escape hatch. Deterministic behavioral proof.
+    CHECK(journal.getTransactionState("req-ota-1") == TransactionState::EXECUTING,
+          "POST: state == EXECUTING (strict) — PENDING → EXECUTING transitioned by markExecuting()");
+
+    // POST-CONDITION 3 (defense-in-depth): state is NOT COMMITTED.
+    // Confirms download did not succeed (commitTransaction was not called).
+    CHECK(journal.getTransactionState("req-ota-1") != TransactionState::COMMITTED,
+          "POST: state is NOT COMMITTED — commitTransaction() was not called (download failed)");
+
+    // POST-CONDITION 4 (defense-in-depth): state is NOT PENDING.
+    // Confirms markExecuting was actually called (otherwise state would be PENDING).
+    // Note: getTransactionState returns PENDING for both EMPTY and PENDING records,
+    // but POST-CONDITION 1 already confirmed the entry exists — so PENDING here
+    // would mean "entry exists in PENDING state" (markExecuting not called).
+    CHECK(journal.getTransactionState("req-ota-1") != TransactionState::PENDING,
+          "POST: state is NOT PENDING — markExecuting() transitioned it to EXECUTING");
+
+    // Reset OTA constant for subsequent tests
+    Core::OTA_ED25519_PUBLIC_KEY_HEX = "";
+  }
+
+  // ---- TEST 10b: OTA via _handleOta() — Option A (pre-download validation) ----
+  //
+  // Defense-in-depth: a SECOND failure injection point at a DIFFERENT location
+  // in the production validation chain. This proves the PENDING → EXECUTING
+  // transition is robust regardless of WHERE the failure occurs after
+  // markExecuting() was called.
+  //
+  // AUDITOR'S OPTION A (auditor called this "paling kuat" / strongest):
+  //   Inject failure AFTER markExecuting() but BEFORE download begins — at
+  //   the Ed25519 public key check (line 1695). Production returns at line
+  //   1702, never reaching _downloadAndVerifyOta().
+  printf("\n[TEST 10b] OTA via _handleOta() — PENDING → EXECUTING (Option A: pre-download validation)\n");
+  {
+    resetEnv();
+
+    // ARM failure injection: OTA_ED25519_PUBLIC_KEY_HEX is empty (shim default).
+    // Production _handleOta() fails at line 1695 — AFTER markExecuting was
+    // called at line 1595, BEFORE _downloadAndVerifyOta() is reached.
+    Core::OTA_ED25519_PUBLIC_KEY_HEX = "";  // explicit — failure injection armed
+    CHECK(strlen(Core::OTA_ED25519_PUBLIC_KEY_HEX) == 0,
+          "PRE: failure injection armed — OTA_ED25519_PUBLIC_KEY_HEX is empty");
+
+    // PRE-CONDITION: requestId not in journal
+    CHECK(!journal.isProcessed("req-ota-1"),
+          "PRE: requestId 'req-ota-1' not in journal");
+
+    // Same JSON as TEST 10 — failure happens earlier in validation chain
+    // (signature length doesn't matter; Ed25519 key check fails first).
+    const char* json = R"({"action":"update","requestId":"req-ota-1","url":"https://example.com/fw.bin","version":"4.1.0","size":100000,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","signature":"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"})";
+
+    // Execute PRODUCTION _handleOta()
+    mqtt._handleOta(json);
+
+    // Same strict behavioral proof as TEST 10:
+    //   - isProcessed == true  → storeIntent was called
+    //   - state == EXECUTING  → markExecuting was called, PENDING → EXECUTING
+    //   - state != COMMITTED   → commitTransaction was NOT called
+    CHECK(journal.isProcessed("req-ota-1"),
+          "POST: requestId IS in journal — storeIntent() was called");
+    CHECK(journal.getTransactionState("req-ota-1") == TransactionState::EXECUTING,
+          "POST: state == EXECUTING (strict) — markExecuting was called before validation failure");
+    CHECK(journal.getTransactionState("req-ota-1") != TransactionState::COMMITTED,
+          "POST: state is NOT COMMITTED — validation failed, no commitTransaction");
+    CHECK(journal.getTransactionState("req-ota-1") != TransactionState::PENDING,
+          "POST: state is NOT PENDING — markExecuting transitioned it to EXECUTING");
   }
 
   // ---- TEST 11: Non-relay commands don't fill journal with PENDING ----
