@@ -54,6 +54,7 @@
 #include "RelayHandlers.h"  // handleRelay — the function under test
 #include "ScheduleHandlers.h"  // P2-2 F-P0-2 C3: handleScheduleUpsert/Delete
 #include "ChannelHandlers.h"  // P2-2 F-P0-2 C4: handleChannelRename
+#include "PirHandlers.h"  // P2-2 F-P0-2 C5: handlePirConfig
 
 #include <cstdio>
 #include <cstring>
@@ -150,6 +151,15 @@ static void sendChannelRename(const char* jsonBody) {
   Web::http._setTestAuth("Bearer valid-jwt");
   Web::http._setTestCsrf("valid-csrf-token");
   Web::Handlers::handleChannelRename();
+}
+
+// P2-2 F-P0-2 C5: Helper: send a PIR config update via the REST handler
+static void sendPirConfig(const char* jsonBody) {
+  Web::http._resetTestState();
+  Web::http._setTestBody(jsonBody);
+  Web::http._setTestAuth("Bearer valid-jwt");
+  Web::http._setTestCsrf("valid-csrf-token");
+  Web::Handlers::handlePirConfig();
 }
 
 int main() {
@@ -866,6 +876,166 @@ int main() {
   }
 
   // =====================================================================
+  // P2-2 F-P0-2 C5: PIR CONFIG PRODUCTION-PATH TESTS (P19-P22)
+  // =====================================================================
+  // Validates that /api/pir POST (config) goes through the TransactionJournal
+  // with FROM_PENDING commit mode — same pattern as C3 schedule + C4 channel.
+  // PIR config (pirEnabled, pirHoldTime) is persisted via
+  // saveScheduleWithResult(true) because it's stored in schedule.json
+  // alongside channel names and schedules.
+
+  // ---- P19: PIR config enable → COMMITTED + config updated ----
+  printf("\n[P19] PIR config enable → COMMITTED + config updated\n");
+  {
+    resetEnv();
+    sendPirConfig(R"({"id":1,"enabled":true,"holdTime":120,"requestId":"req-pir-1"})");
+    CHECK_EQ(Web::http._respCode, 200, "P19: HTTP 200 for valid PIR config");
+    CHECK(journal.isCommitted("req-pir-1"),
+          "P19: journal COMMITTED for req-pir-1");
+    // PIR 1 maps to channels[PIR_CHANNEL_OFFSET + 0] = channels[8]
+    CHECK(Core::channels[8].pirEnabled == true,
+          "P19: channels[8].pirEnabled == true (RAM updated)");
+    CHECK(Core::channels[8].pirHoldTime == 120,
+          "P19: channels[8].pirHoldTime == 120");
+    // Verify response shape
+    CHECK(Web::http._respBody.indexOf("\"requestId\":\"req-pir-1\"") >= 0,
+          "P19: response body contains requestId");
+    CHECK(Web::http._respBody.indexOf("\"id\":1") >= 0,
+          "P19: response body contains pir id");
+    CHECK(Web::http._respBody.indexOf("\"enabled\":true") >= 0,
+          "P19: response body contains enabled");
+  }
+
+  // ---- P20: PIR config partial update (holdTime only) → COMMITTED ----
+  printf("\n[P20] PIR config partial update (holdTime only) → COMMITTED\n");
+  {
+    resetEnv();
+    // First set enabled=true + holdTime=60
+    sendPirConfig(R"({"id":2,"enabled":true,"holdTime":60,"requestId":"req-pir-2a"})");
+    CHECK_EQ(Web::http._respCode, 200, "P20: first config HTTP 200");
+    CHECK(Core::channels[9].pirEnabled == true, "P20: pirEnabled set to true");
+    CHECK(Core::channels[9].pirHoldTime == 60, "P20: holdTime set to 60");
+
+    // Now partial update: only holdTime (enabled should remain true)
+    sendPirConfig(R"({"id":2,"holdTime":300,"requestId":"req-pir-2b"})");
+    CHECK_EQ(Web::http._respCode, 200, "P20: partial update HTTP 200");
+    CHECK(journal.isCommitted("req-pir-2b"),
+          "P20: partial update COMMITTED");
+    CHECK(Core::channels[9].pirHoldTime == 300,
+          "P20: holdTime updated to 300");
+    CHECK(Core::channels[9].pirEnabled == true,
+          "P20: pirEnabled unchanged (partial update doesn't clear)");
+  }
+
+  // ---- P21: duplicate requestId (same hash) → HTTP 200 + ACK replay ----
+  printf("\n[P21] PIR duplicate requestId (same hash) → replay ACK\n");
+  {
+    resetEnv();
+    sendPirConfig(R"({"id":3,"enabled":false,"holdTime":30,"requestId":"req-pir-dup"})");
+    CHECK_EQ(Web::http._respCode, 200, "P21: first config HTTP 200");
+    CHECK(journal.isCommitted("req-pir-dup"), "P21: first config COMMITTED");
+    uint8_t sizeAfterFirst = journal.getJournalSize();
+
+    // Duplicate with same body → replay, not re-execute
+    sendPirConfig(R"({"id":3,"enabled":false,"holdTime":30,"requestId":"req-pir-dup"})");
+    CHECK_EQ(Web::http._respCode, 200, "P21: duplicate HTTP 200 (replay)");
+    CHECK(journal.isCommitted("req-pir-dup"), "P21: duplicate still COMMITTED");
+    CHECK_EQ(journal.getJournalSize(), sizeAfterFirst,
+          "P21: journal size unchanged (no new slot)");
+    CHECK(Web::http._respBody.indexOf("\"requestId\":\"req-pir-dup\"") >= 0,
+          "P21: replayed ACK contains requestId");
+  }
+
+  // ---- P22: duplicate requestId (different hash) → HTTP 409 + no mutation ----
+  printf("\n[P22] PIR duplicate requestId (different config) → HTTP 409\n");
+  {
+    resetEnv();
+    sendPirConfig(R"({"id":1,"enabled":true,"holdTime":60,"requestId":"req-pir-reuse"})");
+    CHECK_EQ(Web::http._respCode, 200, "P22: first config HTTP 200");
+    CHECK(Core::channels[8].pirEnabled == true, "P22: first set pirEnabled=true");
+    CHECK(Core::channels[8].pirHoldTime == 60, "P22: first set holdTime=60");
+    uint8_t sizeAfterFirst = journal.getJournalSize();
+
+    // Same requestId but different holdTime → security rejection
+    sendPirConfig(R"({"id":1,"enabled":true,"holdTime":600,"requestId":"req-pir-reuse"})");
+    CHECK_EQ(Web::http._respCode, 409,
+          "P22: HTTP 409 for requestId reuse with different command");
+    // Config should NOT have changed
+    CHECK(Core::channels[8].pirHoldTime == 60,
+          "P22: holdTime unchanged (no mutation on reuse rejection)");
+    CHECK_EQ(journal.getJournalSize(), sizeAfterFirst,
+          "P22: journal size unchanged");
+    CHECK(journal.isCommitted("req-pir-reuse"),
+          "P22: first command journal entry still COMMITTED");
+  }
+
+  // =====================================================================
+  // P2-2 F-P0-2 C5: PIR CONFIG FAILURE-PATH TESTS (F15-F17)
+  // =====================================================================
+
+  // ---- F15: PIR config missing requestId → HTTP 400 ----
+  printf("\n[F15] PIR config missing requestId → HTTP 400\n");
+  {
+    resetEnv();
+    uint8_t sizeBefore = journal.getJournalSize();
+    sendPirConfig(R"({"id":1,"enabled":true,"holdTime":120})");
+    CHECK_EQ(Web::http._respCode, 400, "F15: HTTP 400 for missing requestId");
+    CHECK_EQ(journal.getJournalSize(), sizeBefore,
+          "F15: journal size unchanged (no entry created)");
+  }
+
+  // ---- F16: PIR config invalid id (0) → HTTP 400 + no journal entry (pre-store) ----
+  printf("\n[F16] PIR config invalid id (0) → HTTP 400\n");
+  {
+    resetEnv();
+    uint8_t sizeBefore = journal.getJournalSize();
+    sendPirConfig(R"({"id":0,"enabled":true,"requestId":"req-pir-bad-id"})");
+    CHECK_EQ(Web::http._respCode, 400, "F16: HTTP 400 for invalid id");
+    CHECK(!journal.isProcessed("req-pir-bad-id"),
+          "F16: no journal entry (pre-store validation)");
+    CHECK_EQ(journal.getJournalSize(), sizeBefore,
+          "F16: journal size unchanged");
+  }
+
+  // ---- F17: PIR config saveSchedule failure → HTTP 503 + journal PENDING (INVARIANT B) ----
+  //
+  // CRITICAL C5 TEST (Phase B REV.3 §7.3 + §9.5):
+  //   Validates the synchronous saveSchedule fix for PIR config.
+  //   When saveScheduleWithResult returns false (atomicWrite fails), the
+  //   handler MUST:
+  //     - Send HTTP 503 (DURABILITY_FAILURE)
+  //     - NOT call commitTransactionFromPending (journal stays PENDING)
+  //     - NOT call clearEntry (INVARIANT B — RAM mutation occurred)
+  printf("\n[F17] PIR config saveSchedule failure → HTTP 503 + journal PENDING (INVARIANT B)\n");
+  {
+    resetEnv();
+    // Arm: next atomicWrite call will fail
+    Storage::fs.setFailNextAtomicWrite();
+
+    sendPirConfig(R"({"id":1,"enabled":true,"holdTime":90,"requestId":"req-pir-save-fail"})");
+
+    CHECK_EQ(Web::http._respCode, 503, "F17: HTTP 503 (saveSchedule failed)");
+    // RAM mutation DID occur (pirEnabled was set before saveSchedule)
+    CHECK(Core::channels[8].pirEnabled == true,
+          "F17: RAM mutation occurred (channels[8].pirEnabled == true)");
+    CHECK(Core::channels[8].pirHoldTime == 90,
+          "F17: RAM mutation occurred (channels[8].pirHoldTime == 90)");
+    // Journal stays PENDING — NOT COMMITTED (commit was skipped)
+    CHECK(!journal.isCommitted("req-pir-save-fail"),
+          "F17: journal NOT COMMITTED (commit skipped after save failure)");
+    // Journal entry still exists — NOT cleared (INVARIANT B)
+    CHECK(journal.isProcessed("req-pir-save-fail"),
+          "F17: journal entry preserved (clearEntry NOT called — INVARIANT B)");
+    // Specifically, state is PENDING
+    CHECK(journal.getTransactionState("req-pir-save-fail") == TransactionState::PENDING,
+          "F17: journal state == PENDING (evidence preserved, not committed)");
+    // Response body mentions DURABILITY_FAILURE
+    CHECK(Web::http._respBody.indexOf("DURABILITY_FAILURE") >=0 ||
+          Web::http._respBody.indexOf("persistence failed") >= 0,
+          "F17: response body mentions DURABILITY_FAILURE");
+  }
+
+  // =====================================================================
   // HARD INVARIANT VERIFICATION (Phase B REV.3 §9.4)
   // =====================================================================
   printf("\n[HARD INVARIANT] HTTP 200 implies journal == COMMITTED\n");
@@ -896,15 +1066,17 @@ int main() {
   printf("\n==========================================================\n");
   printf("RESULTS: %d passed, %d failed\n", g_passCount, g_failCount);
   printf("==========================================================\n");
-  printf("\nF-P0-2 C2/C3/C4 Test Summary:\n");
+  printf("\nF-P0-2 C2/C3/C4/C5 Test Summary:\n");
   printf("  C2 Production-path: P1-P8 (8 tests) — relay ON/OFF/set_mode, response shape, duplicate handling\n");
   printf("  C2 Failure-path:   F1-F8 (8 tests) — missing/malformed requestId, invalid fields, NVS failure\n");
   printf("  C3 Production-path: P9-P14 (6 tests) — schedule upsert/delete, response shape, duplicate handling\n");
   printf("  C3 Failure-path:   F9-F11 (3 tests) — missing requestId, invalid time, saveSchedule failure\n");
   printf("  C4 Production-path: P15-P18 (4 tests) — channel rename, response shape, duplicate handling\n");
   printf("  C4 Failure-path:   F12-F14 (3 tests) — missing requestId, invalid channelId, saveSchedule failure\n");
+  printf("  C5 Production-path: P19-P22 (4 tests) — PIR config, partial update, duplicate handling\n");
+  printf("  C5 Failure-path:   F15-F17 (3 tests) — missing requestId, invalid id, saveSchedule failure\n");
   printf("  Hard invariant:  HTTP 200 implies journal == COMMITTED\n");
   printf("\nF-P0-1 Regression: see MqttClientTest (31/31 PASS) for MQTT path proof.\n");
-  printf("Cross-ingress contract: REST /api/relay + /api/schedule + /api/channel use same journal API as MQTT path.\n");
+  printf("Cross-ingress contract: REST /api/relay + /api/schedule + /api/channel + /api/pir use same journal API as MQTT path.\n");
   return (g_failCount == 0) ? 0 : 1;
 }
