@@ -107,6 +107,56 @@ inline bool requireBody(size_t maxSize) {
   return true;
 }
 
+// P2-2 F-P0-2 C2: requestId validation (charset + length).
+//
+// Rules (mirror MqttClient.cpp _handleCommand lines 876-898 for cross-ingress
+// contract symmetry):
+//   - Must be present (non-empty)
+//   - Max 64 chars
+//   - Only [a-zA-Z0-9-_]
+//
+// Returns true if valid. On false, sends HTTP 400 to client.
+//
+// This is the REST-side analog of MQTT's requestId requirement — both
+// paths now reject commands without a valid requestId.
+inline bool validateRequestId(const String& requestId) {
+  if (requestId.length() == 0) {
+    sendError(400, "requestId required");
+    return false;
+  }
+  if (requestId.length() > 64) {
+    sendError(400, "requestId too long (max 64 chars)");
+    return false;
+  }
+  for (size_t i = 0; i < requestId.length(); i++) {
+    char c = requestId[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+      sendError(400, "requestId contains invalid characters (use UUID format: [a-zA-Z0-9-_])");
+      return false;
+    }
+  }
+  return true;
+}
+
+// P2-2 F-P0-2 C2: Extract requestId from JSON body and validate.
+//
+// Convenience wrapper around Web::validateRequestId(). Extracts the
+// "requestId" field from the parsed JSON document, validates charset/length
+// per the cross-ingress contract (mirrors MqttClient.cpp lines 876-898),
+// and stores it in `out`.
+//
+// Returns true if valid. On false, sends HTTP 400 to client.
+//
+// Pre-condition: `doc` has been parsed from the request body via
+//                deserializeJson(doc, Web::http.arg("plain")).
+// Post-condition on success: `out` contains the validated requestId string.
+inline bool requireRequestId(const DynamicJsonDocument& doc, String& out) {
+  const char* rid = doc["requestId"] | "";
+  out = String(rid);
+  return validateRequestId(out);
+}
+
 } // namespace Web
 
 #endif

@@ -732,23 +732,126 @@ public:
 
 // ---------------------------------------------------------------------------
 // WebServer stub (AuthManager.h includes <WebServer.h>)
+//
+// P2-2 F-P0-2 C2: Extended with state capture for WebServerTest.
+// Default state is empty/false — MqttClientTest (which never touches
+// WebServer) is unaffected. WebServerTest sets state via the helper
+// functions below before calling handlers.
 // ---------------------------------------------------------------------------
 class WebServer {
 public:
   WebServer(int /*port*/ = 80) {}
-  void send(int, const String&, const String&) {}
-  void send(int, const String&, const uint8_t*, size_t) {}
-  void sendHeader(const String&, const String&) {}
+
+  // ---- Request body state ----
+  // Test sets body via setTestBody(). Handlers read via hasArg("plain") + arg("plain").
+  String _testBody;
+  bool _testHasBody = false;
+
+  // ---- Header state ----
+  // Test sets headers via setTestHeader(). Handlers read via hasHeader() + header().
+  // Common headers: Authorization, X-CSRF-Token, Content-Length, Origin, Cookie
+  String _testAuthHeader;
+  String _testCsrfHeader;
+  String _testContentLength;
+  String _testOrigin;
+  bool _testHasAuth = false;
+  bool _testHasCsrf = false;
+  bool _testHasContentLength = false;
+  bool _testHasOrigin = false;
+
+  // ---- Response capture state ----
+  int _respCode = 0;
+  String _respBody;
+  String _respAcaoHeader;
+  bool _respHasAcao = false;
+
+  // ---- send() methods (capture response) ----
+  void send(int code, const String& contentType, const String& body) {
+    (void)contentType;
+    _respCode = code;
+    _respBody = body;
+  }
+  void send(int code, const String& contentType, const uint8_t* body, size_t len) {
+    (void)contentType;
+    _respCode = code;
+    _respBody = String((const char*)body).substring(0, len);
+  }
+  void send(int code) {
+    _respCode = code;
+    _respBody = "";
+  }
+  void sendHeader(const String& name, const String& value) {
+    if (name == "Access-Control-Allow-Origin") {
+      _respAcaoHeader = value;
+      _respHasAcao = true;
+    }
+    // Other headers ignored for test purposes
+  }
+
+  // ---- Request methods (read from state) ----
   String uri() { return ""; }
-  String arg(const String&) { return ""; }
-  String arg(int) { return ""; }
-  bool hasHeader(const String&) { return false; }
-  String header(const String&) { return ""; }
-  bool hasArg(const String&) { return false; }
-  bool hasArg(int) { return false; }
+  String arg(const String& name) {
+    if (name == "plain" && _testHasBody) return _testBody;
+    return "";
+  }
+  String arg(int /*i*/) { return ""; }
+  bool hasHeader(const String& name) {
+    if (name == "Authorization") return _testHasAuth;
+    if (name == "X-CSRF-Token") return _testHasCsrf;
+    if (name == "Content-Length") return _testHasContentLength;
+    if (name == "Origin") return _testHasOrigin;
+    if (name == "Cookie") return false;  // not used in C2 tests
+    return false;
+  }
+  String header(const String& name) {
+    if (name == "Authorization" && _testHasAuth) return _testAuthHeader;
+    if (name == "X-CSRF-Token" && _testHasCsrf) return _testCsrfHeader;
+    if (name == "Content-Length" && _testHasContentLength) return _testContentLength;
+    if (name == "Origin" && _testHasOrigin) return _testOrigin;
+    return "";
+  }
+  bool hasArg(const String& name) {
+    if (name == "plain") return _testHasBody;
+    return false;
+  }
+  bool hasArg(int /*i*/) { return false; }
   int args() { return 0; }
-  String argName(int) { return ""; }
+  String argName(int /*i*/) { return ""; }
   void stop() {}
+
+  // ---- Test helper methods (called by WebServerTest, not by production code) ----
+  void _resetTestState() {
+    _testBody = "";
+    _testHasBody = false;
+    _testAuthHeader = "";
+    _testCsrfHeader = "";
+    _testContentLength = "";
+    _testOrigin = "";
+    _testHasAuth = false;
+    _testHasCsrf = false;
+    _testHasContentLength = false;
+    _testHasOrigin = false;
+    _respCode = 0;
+    _respBody = "";
+    _respAcaoHeader = "";
+    _respHasAcao = false;
+  }
+  void _setTestBody(const char* body) {
+    _testBody = String(body);
+    _testHasBody = true;
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%u", (unsigned)strlen(body));
+    _testContentLength = String(buf);
+    _testHasContentLength = true;
+  }
+  void _setTestAuth(const char* token) {
+    _testAuthHeader = String(token);
+    _testHasAuth = true;
+  }
+  void _setTestCsrf(const char* token) {
+    _testCsrfHeader = String(token);
+    _testHasCsrf = true;
+  }
 };
 
 // ============================================================================
