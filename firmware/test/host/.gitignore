@@ -4,3 +4,9 @@ journal_journal_test_bin
 transaction_journal_test
 *.o
 *.obj
+# P2-2 F-P0-2: test binaries (do not commit)
+command_hash_baseline_bin
+command_hash_equivalence_test_bin
+command_routing_test_bin
+mqtt_client_test_bin
+web_server_test_bin
