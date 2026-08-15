@@ -24,26 +24,13 @@
 #include <Update.h>
 #include <esp_task_wdt.h>
 #include <Preferences.h>  // CYCLE-7: for OTA attempt rate limiting counter
-
-// audit-fixes: forward declaration for static helper (was defined AFTER use).
-//   C++ requires declaration before use. The static function _computeCommandHash
-//   was defined at the bottom of the file but called from _handleCommand() and
-//   _handleOta() above. Must be placed AFTER ArduinoJson.h include so that
-//   DynamicJsonDocument is visible in the signature.
-//
-// CYCLE-7 FIX (pre-existing bug): the forward declaration was OUTSIDE
-//   `namespace Services` but the definition was INSIDE. This caused a linker
-//   error (undefined reference). Moved the forward declaration INSIDE the
-//   namespace below so it matches the definition's scope.
+#include "CommandHash.h"  // P2-2 F-P0-2 C1: shared computeCommandHash (extracted verbatim)
 #include "ConfigStore.h"
 #include <mbedtls/sha256.h>
 #include <algorithm>
 #include <vector>
 
 namespace Services {
-
-// Forward declaration of static helper (defined at bottom of file).
-static String _computeCommandHash(const DynamicJsonDocument& doc);
 
 MqttClient mqtt;
 
@@ -898,7 +885,7 @@ void MqttClient::_handleCommand(const String& json) {
   }
 
   // Step 3: Compute command fingerprint (AFTER validation passes).
-  String commandHash = _computeCommandHash(doc);
+  String commandHash = Utils::computeCommandHash(doc);
 
   // ===========================================================================
   // CYCLE-8B-Rev1: Monotonic state machine duplicate handling
@@ -1543,9 +1530,11 @@ void MqttClient::_handleOta(const String& json) {
   String requestId = doc["requestId"] | "";
 
   // R10C-1 FIX: Compute OTA command hash HERE (was undefined before — compile error).
-  // Uses the same _computeCommandHash() helper as _handleCommand(), with OTA-specific
-  // canonical fields: url, version, size, sha256, signature.
-  String commandHash = _computeCommandHash(doc);
+  // P2-2 F-P0-2 C1: Now uses shared Utils::computeCommandHash() — same canonical
+  //   schema as _handleCommand(), with OTA-specific fields: url, version, size,
+  //   sha256, signature. Byte-identical to previous static impl (verified by
+  //   CommandHashEquivalenceTest baseline vectors).
+  String commandHash = Utils::computeCommandHash(doc);
 
   // CYCLE-7 (fixes I-004): OTA commands now go through TransactionJournal for
   //   dedup, just like regular commands. Previously _onMessage() routed OTA
@@ -2095,83 +2084,4 @@ bool MqttClient::_downloadAndVerifyOta(const String& url, size_t expectedSize,
 }
 
 // ---------------------------------------------------------------------------
-// audit-fixes: REMOVED legacy in-memory dedup ring buffer.
-//
-// Previously there were TWO dedup mechanisms:
-//   1. In-memory ring buffer (_processedIds[64] etc., 15min TTL) — REMOVED.
-//   2. NVS-persisted TransactionJournal (64 entries, CRC32, 2-phase commit) — KEPT.
-//
-// The in-memory buffer was declared and partially implemented but NEVER called
-// from the command path — only the NVS journal is consulted (see
-// Services::journal.isProcessed() in _handleCommand). Keeping dead dedup code
-// around was an architecture-debt trap: a future engineer might "fix" a dedup
-// bug by wiring up the dead code, unintentionally creating two sources of truth.
-//
-// All dedup is now authoritative via TransactionJournal. See TransactionJournal.{h,cpp}
-// for the NVS-backed 64-entry ring with CRC32 + magic + two-phase commit.
-// ---------------------------------------------------------------------------
-
-// R10A-3 / R10C-1 (audit round 10C): Compute a deterministic command fingerprint.
-//
-// ENGINEER AUDIT FIX: Previous generic JSON-key iterator only handled string/int/bool.
-// Other JSON types (float, array, object) were silently DROPPED from the hash,
-// meaning requestId+commandHash binding was incomplete — attacker could add
-// extra fields that don't affect the hash but DO affect execution.
-//
-// FIX: Per-command-type canonical schema. Each command type has a FIXED set
-// of fields that are hashed in a DETERMINISTIC ORDER. Unknown fields cause
-// the command to be REJECTED (not silently ignored).
-//
-// Canonical format: "type|action|field1=val1|field2=val2|..."
-static String _computeCommandHash(const DynamicJsonDocument& doc) {
-  const char* type = doc["type"] | "";
-  const char* action = doc["action"] | "";
-
-  String canonical = String(type) + "|" + String(action);
-
-  // Per-command-type: extract ONLY the fields that affect execution.
-  if (strcmp(type, "relay") == 0) {
-    canonical += "|channelId=" + String(doc["channelId"] | 0);
-    canonical += "|mode=" + String(doc["mode"] | "");
-    canonical += "|manualState=" + String(doc["manualState"] | false ? "true" : "false");
-  }
-  else if (strcmp(type, "schedule") == 0) {
-    canonical += "|channelId=" + String(doc["channelId"] | 0);
-    canonical += "|id=" + String(doc["id"] | 0);
-    canonical += "|onTime=" + String(doc["onTime"] | "");
-    canonical += "|offTime=" + String(doc["offTime"] | "");
-    canonical += "|dayMask=" + String(doc["dayMask"] | 0);
-    canonical += "|enabled=" + String(doc["enabled"] | true ? "true" : "false");
-  }
-  else if (strcmp(type, "pir") == 0) {
-    canonical += "|id=" + String(doc["id"] | 0);
-    canonical += "|enabled=" + String(doc["enabled"] | false ? "true" : "false");
-    canonical += "|holdTime=" + String(doc["holdTime"] | 0);
-  }
-  else if (strcmp(type, "channel") == 0) {
-    canonical += "|channelId=" + String(doc["channelId"] | 0);
-    canonical += "|name=" + String(doc["name"] | "");
-  }
-  else if (strcmp(type, "time") == 0) {
-    canonical += "|datetime=" + String(doc["datetime"] | "");
-  }
-  else if (strcmp(type, "system") == 0) {
-    // system commands: action only (reboot, getStatus, resetEnergyStats, resetDailyStats)
-  }
-  else if (strcmp(type, "config") == 0) {
-    canonical += "|deviceName=" + String(doc["deviceName"] | "");
-    canonical += "|timezone=" + String(doc["timezone"] | "");
-  }
-  else if (strcmp(type, "ota") == 0) {
-    // R10C-1 FIX: OTA command hash — was UNDEFINED in _handleOta() (compile error).
-    canonical += "|url=" + String(doc["url"] | "");
-    canonical += "|version=" + String(doc["version"] | "");
-    canonical += "|size=" + String((unsigned long)(doc["size"] | 0));
-    canonical += "|sha256=" + String(doc["sha256"] | "");
-    canonical += "|signature=" + String(doc["signature"] | "");
-  }
-
-  return Utils::sha256Hex(canonical);
-}
-
 } // namespace Services

@@ -1,0 +1,60 @@
+# =============================================================================
+# Makefile.che — host-side CommandHashEquivalenceTest
+# =============================================================================
+# Compiles CommandHashEquivalenceTest.cpp + minimal firmware sources to verify
+# that the shared Utils::computeCommandHash() function (extracted in C1)
+# produces byte-identical hashes to the baseline vectors captured before
+# extraction.
+#
+# This test calls Utils::computeCommandHash() DIRECTLY — simulating the way
+# REST RestJournalHelper.h will call it once built (C2). It does NOT need
+# MqttClient.cpp (the shared function lives in CommandHash.h header).
+#
+# However, it DOES need:
+#   - Crypto.cpp / Crypto.h shim (provides Utils::sha256Hex)
+#   - TransactionJournal.cpp + JournalRecord.cpp (for ArduinoJson setup)
+#     Actually no — let's check if we really need them.
+#
+# Simplification: we only need Utils::sha256Hex (provided by MqttClientDeps.h
+# shim) and ArduinoJson. So we compile ONLY the test .cpp — no firmware
+# sources needed. The -include MqttClientDeps.h provides everything.
+#
+# Usage:
+#     make -f Makefile.che           # build
+#     make -f Makefile.che run       # build + run
+#     make -f Makefile.che clean     # clean
+
+CXX      ?= g++
+CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Werror
+SUPPRESS = -Wno-unused-parameter -Wno-array-bounds -Wno-stringop-truncation -Wno-unused-variable
+
+ROOT_DIR := $(CURDIR)
+SRC_DIR  := $(ROOT_DIR)/../..
+SHIM_DIR := $(ROOT_DIR)/shims
+JSON_DIR := $(SRC_DIR)/.pio/libdeps/development/ArduinoJson/src
+
+TEST_SRC := $(ROOT_DIR)/CommandHashEquivalenceTest.cpp
+
+BIN      := command_hash_equivalence_test_bin
+
+.PHONY: all run clean
+
+all: $(BIN)
+
+$(BIN): $(TEST_SRC) \
+        $(SHIM_DIR)/MqttClientDeps.h $(SHIM_DIR)/Arduino.h \
+        $(SRC_DIR)/CommandHash.h
+	$(CXX) $(CXXFLAGS) $(SUPPRESS) \
+	    -I$(SHIM_DIR) \
+	    -I$(SRC_DIR) \
+	    -I$(JSON_DIR) \
+	    -include $(SHIM_DIR)/MqttClientDeps.h \
+	    $(TEST_SRC) \
+	    -lcrypto \
+	    -o $(BIN)
+
+run: $(BIN)
+	./$(BIN)
+
+clean:
+	rm -f $(BIN)

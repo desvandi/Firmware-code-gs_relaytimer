@@ -1,0 +1,43 @@
+# =============================================================================
+# Makefile.chb — host-side CommandHashBaseline (capture current hashes)
+# =============================================================================
+# Compiles MqttClient.cpp + TransactionJournal.cpp + JournalRecord.cpp (same as
+# MqttClientTest) and links against CommandHashBaseline.cpp to dump hash vectors.
+
+CXX      ?= g++
+CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Werror
+SUPPRESS = -Wno-unused-parameter -Wno-array-bounds -Wno-stringop-truncation -Wno-unused-variable
+
+ROOT_DIR := $(CURDIR)
+SRC_DIR  := $(ROOT_DIR)/../..
+SHIM_DIR := $(ROOT_DIR)/shims
+JSON_DIR := $(SRC_DIR)/.pio/libdeps/development/ArduinoJson/src
+
+TEST_SRC  := $(ROOT_DIR)/CommandHashBaseline.cpp
+FIRMWARE1 := $(SRC_DIR)/MqttClient.cpp
+FIRMWARE2 := $(SRC_DIR)/TransactionJournal.cpp
+FIRMWARE3 := $(SRC_DIR)/JournalRecord.cpp
+
+BIN      := command_hash_baseline_bin
+
+.PHONY: all run clean
+
+all: $(BIN)
+
+$(BIN): $(TEST_SRC) $(FIRMWARE1) $(FIRMWARE2) $(FIRMWARE3) \
+        $(SHIM_DIR)/MqttClientDeps.h $(SHIM_DIR)/Arduino.h $(SHIM_DIR)/Preferences.h \
+        $(SHIM_DIR)/esp_crc.h $(SHIM_DIR)/Config.h
+	$(CXX) $(CXXFLAGS) $(SUPPRESS) \
+	    -I$(SHIM_DIR) \
+	    -I$(SRC_DIR) \
+	    -I$(JSON_DIR) \
+	    -include $(SHIM_DIR)/MqttClientDeps.h \
+	    $(TEST_SRC) $(FIRMWARE1) $(FIRMWARE2) $(FIRMWARE3) \
+	    -lcrypto \
+	    -o $(BIN)
+
+run: $(BIN)
+	./$(BIN)
+
+clean:
+	rm -f $(BIN)
