@@ -121,8 +121,17 @@ inline String computeCommandHash(const DynamicJsonDocument& doc) {
 // Mirrors MqttClient.cpp lines 911-1012 for cross-ingress contract symmetry.
 // =============================================================================
 inline bool checkDuplicateAndRespond(const String& requestId, const String& commandHash) {
-  // isProcessed() returns true only for COMMITTED / COMMITTED_UNKNOWN.
-  // For PENDING/EXECUTING/UNKNOWN/FAILED, we need explicit checks below.
+  // NOTE: isProcessed() returns true for ANY non-EMPTY slot state (PENDING,
+  // EXECUTING, COMMITTED, COMMITTED_UNKNOWN, FAILED, UNKNOWN) — see
+  // TransactionJournal.cpp:1511-1517 (`return _slots[slotIdx].inUse`).
+  // It does NOT mean "successfully committed". To discriminate states, use
+  // getTransactionState() (returns the full TransactionState enum).
+  //
+  // This function uses getCommandHash() first (returns empty string if
+  // requestId not in journal) as the freshness check, then calls
+  // getTransactionState() to determine the appropriate response for each
+  // possible existing state (COMMITTED → replay ACK, PENDING/EXECUTING →
+  // 409 in-progress, FAILED → clear + retry, UNKNOWN → 409 ambiguous).
   String existingHash = Services::journal.getCommandHash(requestId);
   if (existingHash.length() == 0) {
     // requestId not in journal — fresh command, fall through to execution

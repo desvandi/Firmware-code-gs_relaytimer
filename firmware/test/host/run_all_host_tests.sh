@@ -19,14 +19,16 @@
 #     5. Does NOT emit [ALL GREEN] if ANY suite fails or crashes
 #
 # Runs all 6 host-side test binaries + 1 baseline capture tool:
-#   1. TransactionJournalTest   (Makefile.tj)   — expected 194/194 PASS
-#   2. CommandRoutingTest       (Makefile.cr)   — expected 133/133 PASS
-#   3. CommandHashEquivalenceTest (Makefile.che) — expected 26/26 PASS
-#   4. WebServerTest            (Makefile.ws)   — expected 111/111 PASS
-#   5. MqttClientTest           (Makefile.mc)   — expected 31/31 PASS
-#   6. CommandHashBaseline      (Makefile.chb)  — expected 14 vectors captured
+#   1. TransactionJournalTest   (Makefile.tj)   — binary RESULTS: 194 passed
+#   2. CommandRoutingTest       (Makefile.cr)   — binary RESULTS: 133 passed
+#   3. CommandHashEquivalenceTest (Makefile.che) — binary RESULTS: 26 passed
+#   4. WebServerTest            (Makefile.ws)   — binary RESULTS: 144 passed (C2-C5)
+#   5. MqttClientTest           (Makefile.mc)   — binary RESULTS: 31 passed
+#   6. CommandHashBaseline      (Makefile.chb)  — 14 vectors captured (no RESULTS line)
 #
-# Total expected: 495 assertions + 14 baseline vectors.
+# Authoritative total: 194 + 133 + 26 + 144 + 31 = 528 assertions + 14 vectors.
+# (Previous versions incorrectly claimed 540 due to grep over-counting
+#  CommandRoutingTest's routing-matrix summary lines as assertions.)
 #
 # USAGE:
 #   cd firmware/test/host
@@ -132,15 +134,36 @@ run_suite() {
   echo ""
   echo "Exit: ${exit_class}"
 
-  # Count assertions — use awk to avoid grep -c exit-code-1 issue when count is 0
-  # (grep -c returns exit 1 for zero matches, which combined with `|| echo 0`
-  # produces "0\n0" — corrupted value that breaks arithmetic)
-  local pass_count fail_count vec_count
-  pass_count=$(awk 'END{print NR}' <(grep "\[PASS\]" "${out_file}" 2>/dev/null))
-  fail_count=$(awk 'END{print NR}' <(grep "\[FAIL\]" "${out_file}" 2>/dev/null))
-  vec_count=$(awk 'END{print NR}' <(grep -E "[0-9a-f]{64}" "${out_file}" 2>/dev/null))
+  # COUNT ASSERTIONS — AUTHORITATIVE SOURCE IS BINARY's RESULTS LINE.
+  #
+  # Previous versions used `grep "[PASS]"` which OVER-COUNTS because some
+  # test binaries (e.g. CommandRoutingTest) print summary [PASS] lines
+  # like "[PASS] all routing-matrix cases pass (12 command types)" that
+  # are NOT individual assertions — they are post-test summaries printed
+  # AFTER the binary's own RESULTS: line. This caused a 12-count
+  # discrepancy (grep=145 vs binary RESULTS=133) for CommandRoutingTest,
+  # which the auditor caught during C4 re-gate.
+  #
+  # Fix: parse the binary's own "RESULTS: N passed, M failed" line.
+  # This is the count the binary itself reports — it is authoritative.
+  # Fallback to grep only if no RESULTS line exists (e.g. CommandHashBaseline,
+  # which is a baseline capture tool, not a pass/fail test suite).
+  local pass_count fail_count vec_count results_line
+  results_line=$(grep -E "^RESULTS: [0-9]+ passed, [0-9]+ failed" "${out_file}" 2>/dev/null | tail -1)
+  if [ -n "${results_line}" ]; then
+    # Binary reports its own RESULTS line — use it as authoritative source
+    pass_count=$(echo "${results_line}" | sed -E 's/^RESULTS: ([0-9]+) passed.*/\1/')
+    fail_count=$(echo "${results_line}" | sed -E 's/^RESULTS: [0-9]+ passed, ([0-9]+) failed.*/\1/')
+    vec_count=0  # baseline capture tools don't print RESULTS line
+  else
+    # No RESULTS line (e.g. CommandHashBaseline) — fall back to grep
+    # for vectors count. pass_count/fail_count remain 0.
+    pass_count=0
+    fail_count=0
+    vec_count=$(awk 'END{print NR}' <(grep -E "[0-9a-f]{64}" "${out_file}" 2>/dev/null))
+  fi
 
-  echo "Assertions: PASS=${pass_count} FAIL=${fail_count} (expected: ${expected})"
+  echo "Assertions (from binary RESULTS line): PASS=${pass_count} FAIL=${fail_count} VECTORS=${vec_count} (expected: ${expected})"
   TOTAL_PASS=$((TOTAL_PASS + pass_count))
   TOTAL_FAIL=$((TOTAL_FAIL + fail_count))
 
@@ -166,7 +189,7 @@ run_suite() {
 run_suite Makefile.tj  "TransactionJournalTest"      "194"
 run_suite Makefile.cr  "CommandRoutingTest"          "133"
 run_suite Makefile.che "CommandHashEquivalenceTest"  "26"
-run_suite Makefile.ws  "WebServerTest"               "111"
+run_suite Makefile.ws  "WebServerTest"               "144"
 run_suite Makefile.mc  "MqttClientTest"              "31"
 run_suite Makefile.chb "CommandHashBaseline"         "14 vectors"
 
@@ -184,7 +207,7 @@ echo "Total FAIL: ${TOTAL_FAIL}"
 echo ""
 
 if [ "${OVERALL_EXIT}" -eq 0 ]; then
-  echo "[ALL GREEN] 495/495 + 14 baseline vectors (every binary exit == 0)"
+  echo "[ALL GREEN] 528 assertions + 14 baseline vectors (authoritative, from binary RESULTS lines)"
   exit 0
 else
   echo "[FAILED] one or more suites did not pass cleanly"
