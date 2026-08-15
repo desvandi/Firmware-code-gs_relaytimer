@@ -1237,16 +1237,24 @@ static void test_commit_a_success_b_failure() {
     CHECK(journal.isCommitted("req-cab"), "state is COMMITTED after retry");
 }
 
-// TEST 47 — commit succeeds, ACK queue fails → reload → exactly one ACK for req-caf (R5-C3, CP-R6.3)
-//   CP-R6.3: Auditor found previous version only checked getPendingAckCount() >= 1,
-//   which doesn't prove req-caf's ACK was reconstructed. Now verifies SPECIFIC identity.
+// TEST 47 — Genuine partial-success: journal COMMITTED + ACK queue full → reload → boot merge reconstructs (R6-C2)
+//   R6-C2: Auditor found previous version dequeued ACKs BEFORE commit, eliminating
+//   the partial-success failure mode. This version keeps queue full during commit,
+//   then makes room for boot merge AFTER commit (simulating eviction/retry on next boot).
+//
+//   What it proves:
+//     1. commitTransaction() succeeds for journal (durable) even when queueAck fails
+//     2. queueAck returns false because queue is full with active ACKs
+//     3. journal state == COMMITTED despite ACK persistence failure
+//     4. After reload, boot merge reconstructs req-caf's ACK from journal
+//     5. Specific ACK identity verified (not just count >= 1)
 static void test_commit_success_ack_fail_reload() {
-    printf("\n[TEST 47] commit success + ACK fail -> reload -> req-caf ACK exists (CP-R6.3)\n");
+    printf("\n[TEST 47] Genuine partial-success: journal COMMITTED + ACK full -> boot merge (R6-C2)\n");
     resetJournal(); journal.begin();
     journal.storeIntent("req-caf", "set_state|ch=1|state=on", 1, true, false);
     journal.markExecuting("req-caf");
 
-    // Fill ACK queue to 8 (full) so queueAck will fail for req-caf
+    // Fill ACK queue to 8 (full) — ALL active, none evictable
     for (uint8_t i = 0; i < 8; i++) {
         char rid[16]; snprintf(rid, sizeof(rid), "req-fill-%u", i);
         char hash[32]; snprintf(hash, sizeof(hash), "set_state|ch=%u|state=on", i);
@@ -1254,36 +1262,36 @@ static void test_commit_success_ack_fail_reload() {
         journal.markExecuting(rid);
         journal.commitTransaction(rid, "{\"ok\":true}");
     }
+    CHECK_EQ(journal.getPendingAckCount(), (uint8_t)8, "ACK queue full at 8 active ACKs");
 
-    // CP-R6.3: Dequeue first 2 ACKs to make room for boot merge.
-    // Without this, queue is full with 8 active ACKs → merge cannot add req-caf.
-    journal.dequeueAck("req-fill-0");
-    journal.dequeueAck("req-fill-1");
-
-    // Now commit req-caf — journal succeeds, queueAck succeeds (6 slots free now)
+    // R6-C2: Do NOT dequeue before commit. Commit req-caf with full queue.
+    // Journal write succeeds (both copies). queueAck fails (queue full).
+    // commitTransaction returns false (partial-success case b).
     bool ok = journal.commitTransaction("req-caf", "{\"ok\":true}");
-    CHECK(ok, "commit succeeds (ACK queue has room after dequeue)");
-    CHECK(journal.isCommitted("req-caf"), "journal IS committed (durable)");
+    CHECK(!ok, "commit returns false (ACK queue full — partial success case b)");
+    CHECK(journal.isCommitted("req-caf"), "journal IS COMMITTED (durable) despite ACK queue failure");
 
-    // Reload — boot merge should reconstruct req-caf's ACK from journal
+    // Verify req-caf is NOT in ACK queue before reload
+    bool ackBefore = journal.updateAckDeliveryState("req-caf",
+        Services::AckDeliveryState::ACK_BROKER_CONFIRMED);
+    CHECK(!ackBefore, "req-caf ACK NOT in queue before reload (persistence failed)");
+
+    // Make room for boot merge: dequeue one fill ACK (simulating delivery/eviction between boots).
+    // On real hardware, this would happen naturally as ACKs get delivered.
+    journal.dequeueAck("req-fill-0");
+
+    // Reload — boot merge should find req-caf COMMITTED in journal but missing from ACK queue.
+    // Since there's now room (7/8), merge reconstructs req-caf's ACK.
     journal.~TransactionJournal(); new (&journal) TransactionJournal(); journal.begin();
 
-    CHECK(journal.isCommitted("req-caf"), "journal still committed after reload");
+    CHECK(journal.isCommitted("req-caf"), "journal still COMMITTED after reload");
 
-    // CP-R6.3: Verify SPECIFIC ACK identity — not just count >= 1.
-    // Use _findAckInQueue to check that req-caf's ACK was reconstructed.
-    // We need to access the private _findAckInQueue — use the test helper
-    // _findSlotByRequestId which searches active journal (not ACK queue).
-    // Instead, verify via updateAckDeliveryState (returns false if not found).
-    bool ackExists = journal.updateAckDeliveryState("req-caf",
+    // R6-C2 proof: Verify SPECIFIC ACK identity — req-caf's ACK was reconstructed by boot merge.
+    bool ackAfter = journal.updateAckDeliveryState("req-caf",
         Services::AckDeliveryState::ACK_BROKER_CONFIRMED);
-    CHECK(ackExists, "req-caf ACK EXISTS in queue after boot merge (specific identity verified)");
+    CHECK(ackAfter, "req-caf ACK EXISTS in queue after boot merge (specific identity reconstructed)");
 
-    // Verify exactly one ACK for req-caf (no duplicates)
-    // updateAckDeliveryState returns true if found (and updates). We can't
-    // easily count duplicates via public API, but the boot merge logic
-    // checks _findAckInQueue before adding, so duplicates are impossible
-    // by construction.
+    // Boot merge checks _findAckInQueue before adding, so duplicates are impossible by construction.
 }
 
 // TEST 48 — Structural proof: observation phase has no mutation path (CP-R6.4)
@@ -1387,6 +1395,71 @@ static void test_reconcile_torn_write_recovery() {
           "generation is origGen+1 (incremented by reconcile)");
 }
 
+// TEST 50 — Behavioral: reconcileEntry() generation increment via actual call (R6-C1)
+//   Calls reconcileEntry() (NOT manual candidate construction), injects B write
+//   failure, verifies RAM unchanged + generation incremented in copy A.
+static void test_reconcile_entry_behavioral_gen() {
+    printf("\n[TEST 50] Behavioral: reconcileEntry() gen increment (R6-C1)\n");
+    resetJournal(); journal.begin();
+
+    // Create a PENDING entry
+    journal.storeIntent("req-r50", "set_state|ch=1|state=on", 1, true, false);
+    uint8_t slotIdx = journal._findSlotByRequestId("req-r50");
+    CHECK(slotIdx != 64, "req-r50 found");
+    uint32_t origGen = journal._getSlotGeneration(slotIdx);
+    CHECK(origGen > 0, "original generation > 0");
+
+    // Mark EXECUTING so reconcile will target it
+    journal.markExecuting("req-r50");
+    CHECK(journal.getTransactionState("req-r50") == TransactionState::EXECUTING,
+          "state is EXECUTING before reconcile");
+    uint32_t execGen = journal._getSlotGeneration(slotIdx);
+
+    // R6-C1: Call actual reconcileEntry() — NOT manual candidate.
+    // Inject B write failure so we can inspect the torn state.
+    // The key for copy B of slot 0 is "timer12/tj_slot_0_b" in the shim's
+    // internal storage, but putBytes is called with the bare key "tj_slot_0_b".
+    // So we use setFailNextPut with the bare key.
+    char failKey[32];
+    snprintf(failKey, sizeof(failKey), "tj_slot_%u_b", slotIdx);
+    Preferences::setFailNextPut(failKey);
+
+    // Call reconcileEntry — should write copy A (UNKNOWN gen=N+1) then fail on B.
+    TransactionState result = journal.reconcileEntry("req-r50");
+
+    // R6-C1 proof #4: RAM authoritative must NOT have changed (candidate discarded on B failure)
+    CHECK(result != TransactionState::UNKNOWN,
+          "reconcileEntry returns ACTUAL state (not UNKNOWN) when B write fails");
+    CHECK(journal.getTransactionState("req-r50") == TransactionState::EXECUTING,
+          "RAM unchanged (still EXECUTING) after B write failure — candidate pattern works");
+
+    // R6-C1 proof #1+2+3: Copy A should have UNKNOWN with gen=execGen+1,
+    // Copy B should still have EXECUTING with gen=execGen.
+    // We verify this by reloading — 9-row recovery should see:
+    //   A = UNKNOWN gen=execGen+1, B = EXECUTING gen=execGen
+    //   → GEN_NEWER_A → load A → UNKNOWN (not CORRUPTED)
+    // This proves reconcileEntry() actually wrote gen+1 to copy A.
+
+    // Clear failure mode before reload
+    Preferences::clearFailMode();
+
+    // R6-C1 proof #5+6+7: Reload and verify recovery picks copy A (NEWER) → UNKNOWN
+    journal.~TransactionJournal();
+    new (&journal) TransactionJournal();
+    journal.begin();
+
+    SlotDurability d = journal._getSlotDurability(slotIdx);
+    CHECK(d == SlotDurability::SLOT_VALID,
+          "slot SLOT_VALID after torn reconcile (GEN_NEWER_A, not QUARANTINED)");
+
+    CHECK(journal.getTransactionState("req-r50") == TransactionState::UNKNOWN,
+          "state is UNKNOWN after reload (recovery picked NEWER_A, not CORRUPTED)");
+
+    uint32_t recoveredGen = journal._getSlotGeneration(slotIdx);
+    CHECK(recoveredGen == execGen + 1,
+          "recovered generation is execGen+1 (proves reconcileEntry incremented gen)");
+}
+
 // ============================================================================
 // main
 // ============================================================================
@@ -1451,7 +1524,8 @@ int main() {
     test_observation_phase_has_no_mutation_path(); // TEST 48: CP-R6.4 structural I0a proof
 
     // CP-R6 CORRECTION PASS 7 — auditor targeted tests
-    test_reconcile_torn_write_recovery();      // TEST 49: CP-R6.1+R6.5 reconcile gen
+    test_reconcile_torn_write_recovery();      // TEST 49: CP-R6.1+R6.5 reconcile gen (classifier proof)
+    test_reconcile_entry_behavioral_gen();      // TEST 50: R6-C1 behavioral reconcileEntry gen proof
 
     printf("\n==========================================================\n");
     printf("RESULTS: %d passed, %d failed\n", g_passCount, g_failCount);
