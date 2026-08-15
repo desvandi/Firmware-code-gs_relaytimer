@@ -74,6 +74,17 @@ static int g_failCount = 0;
   else { printf("  [FAIL] %s (got=%d, expected=%d, line %d)\n", msg, (int)_a, (int)_e, __LINE__); g_failCount++; } \
 } while(0)
 
+#define CHECK_STR_EQ(actual, expected, msg) do { \
+  String _a = (actual); String _e = (expected); \
+  if (_a == _e) { printf("  [PASS] %s\n", msg); g_passCount++; } \
+  else { \
+    printf("  [FAIL] %s (line %d)\n", msg, __LINE__); \
+    printf("         expected: %s\n", _e.c_str()); \
+    printf("         actual:   %s\n", _a.c_str()); \
+    g_failCount++; \
+  } \
+} while(0)
+
 // --- Reset helpers ---
 static void resetNVS() { Preferences::clearAllStorage(); }
 
@@ -234,17 +245,20 @@ int main() {
     }
   }
 
-  // ---- P7: duplicate requestId (COMMITTED) → HTTP 200 + replayed ACK ----
-  printf("\n[P7] duplicate requestId (COMMITTED) → replay ACK\n");
+  // ---- P7: duplicate requestId (COMMITTED) → HTTP 200 + replayed ACK byte-identical ----
+  //
+  // Auditor directive CORR-C2-6: "perkuat P7 dengan assertion ACK duplicate
+  // identik dengan ACK pertama."
+  printf("\n[P7] duplicate requestId (COMMITTED) → replay ACK (byte-identical)\n");
   {
     resetEnv();
-    // First command — succeeds
+    // First command — succeeds, stores ACK in journal
     sendRelayCommand(R"({"channelId":1,"action":"on","requestId":"req-dup-1"})");
     CHECK_EQ(Web::http._respCode, 200, "first command: HTTP 200");
     CHECK(journal.isCommitted("req-dup-1"), "first command: COMMITTED");
     String firstAckBody = Web::http._respBody;
-    int firstStateChanges = 0;  // track if relayState changes on duplicate
     bool stateBefore = Core::relayState[0];
+    uint8_t journalSizeBefore = journal.getJournalSize();
 
     // Second command — SAME requestId + same hash → should replay ACK
     sendRelayCommand(R"({"channelId":1,"action":"on","requestId":"req-dup-1"})");
@@ -254,26 +268,57 @@ int main() {
     CHECK(Core::relayState[0] == stateBefore,
           "duplicate: no double-mutation (relayState unchanged)");
     // Journal size should not have grown (no new slot for duplicate)
-    // (We can't easily check this without getJournalSize, but the fact that
-    // isCommitted returns true for the same requestId confirms no new entry)
+    CHECK_EQ(journal.getJournalSize(), journalSizeBefore,
+          "duplicate: journal size unchanged (no new slot created)");
+    // CORR-C2-6: replayed ACK must be BYTE-IDENTICAL to the first ACK
+    // (journal stores the original ackJson and replays it verbatim)
+    CHECK_STR_EQ(Web::http._respBody, firstAckBody,
+                 "CORR-C2-6: replayed ACK is byte-identical to original ACK");
   }
 
-  // ---- P8: duplicate requestId with DIFFERENT hash → HTTP 409 + security reject ----
-  printf("\n[P8] duplicate requestId with different hash → security reject\n");
+  // ---- P8: duplicate requestId with DIFFERENT hash → HTTP 409 + no mutation + journal intact ----
+  //
+  // Auditor directive CORR-C2-7: "perkuat P8 dengan bukti bahwa command kedua
+  // tidak menyebabkan mutation dan journal command pertama tetap utuh."
+  printf("\n[P8] duplicate requestId with different hash → security reject (no mutation, journal intact)\n");
   {
     resetEnv();
-    // First command — relay ON ch1
+    // First command — relay ON ch1 (succeeds, COMMITTED)
     sendRelayCommand(R"({"channelId":1,"action":"on","requestId":"req-reuse-1"})");
     CHECK_EQ(Web::http._respCode, 200, "first command: HTTP 200");
+    CHECK(journal.isCommitted("req-reuse-1"), "first command: COMMITTED");
+    String firstAckBody = Web::http._respBody;
+    bool stateAfterFirst = Core::relayState[0];  // should be true
+    String firstCommandHash = journal.getCommandHash("req-reuse-1");
+    CHECK(stateAfterFirst == true, "first command: relayState[0] == true (mutation occurred)");
 
-    // Second command — SAME requestId but different command (relay OFF ch1)
-    // This produces a different commandHash → security rejection
+    // Second command — SAME requestId but DIFFERENT command (relay OFF ch1)
+    // Different command → different commandHash → security rejection
     sendRelayCommand(R"({"channelId":1,"action":"off","requestId":"req-reuse-1"})");
     CHECK_EQ(Web::http._respCode, 409, "reuse with different hash: HTTP 409");
     // Verify response mentions security rejection
     CHECK(Web::http._respBody.indexOf("requestId reuse") >= 0 ||
           Web::http._respBody.indexOf("rejected") >= 0,
           "response body mentions requestId reuse rejection");
+
+    // CORR-C2-7: second command MUST NOT have caused any mutation
+    // relayState should still be true (from first command), NOT false (which OFF would set)
+    CHECK(Core::relayState[0] == stateAfterFirst,
+          "CORR-C2-7: second command caused NO mutation (relayState unchanged from first command)");
+    CHECK(Core::relayState[0] == true,
+          "CORR-C2-7: relayState[0] still true (OFF command did not execute)");
+
+    // CORR-C2-7: first command's journal entry MUST be intact
+    // (same requestId, same commandHash, still COMMITTED, ACK still present)
+    CHECK(journal.isCommitted("req-reuse-1"),
+          "CORR-C2-7: first command journal entry still COMMITTED (not cleared)");
+    CHECK(journal.getCommandHash("req-reuse-1") == firstCommandHash,
+          "CORR-C2-7: first command commandHash unchanged (not overwritten)");
+    String storedAck = journal.getAckJson("req-reuse-1");
+    CHECK(storedAck.length() > 0,
+          "CORR-C2-7: first command ACK JSON still present in journal");
+    CHECK(storedAck == firstAckBody,
+          "CORR-C2-7: first command ACK JSON byte-identical (not modified)");
   }
 
   // =====================================================================
@@ -357,80 +402,92 @@ int main() {
           "relayState unchanged (no mutation occurred)");
   }
 
-  // ---- F7: markExecuting failure → HTTP 503 + clearEntry + no mutation ----
-  printf("\n[F7] markExecuting failure → HTTP 503 + clearEntry\n");
+  // ---- F7: markExecuting failure (after storeIntent success) → HTTP 503 + no mutation + journal EMPTY/cleared ----
+  //
+  // Auditor directive CORR-C2-1/CORR-C2-3: "implementasikan deterministic
+  // multi-write failure injection pada host Preferences shim sehingga F7
+  // benar-benar gagal di markExecuting() setelah storeIntent() berhasil."
+  // "F7 wajib membuktikan HTTP 503 + no mutation + journal EMPTY/cleared."
+  //
+  // Write sequence for slot 0:
+  //   storeIntent:  put #1 to tj_slot_0_a, put #1 to tj_slot_0_b
+  //   markExecuting: put #2 to tj_slot_0_a, put #2 to tj_slot_0_b
+  //   commitTransaction: put #3 to tj_slot_0_a, put #3 to tj_slot_0_b
+  //
+  // F7 injects failure on the 2nd put to tj_slot_0_a → markExecuting's copy A
+  // write fails → markExecuting returns false → handler calls clearEntry →
+  // journal slot becomes EMPTY (no mutation occurred).
+  printf("\n[F7] markExecuting failure (NVS slot A write fail on 2nd put) → HTTP 503 + clearEntry\n");
   {
     resetEnv();
-    // storeIntent will succeed (slot 0 PENDING), but markExecuting will fail
-    // because we inject failure on the NEXT write to slot A (which is the
-    // markExecuting write, not the storeIntent write).
-    // Strategy: let storeIntent write both copies successfully, then inject
-    // failure for the markExecuting write.
-    //
-    // Actually, setFailNextPut only fails the NEXT put. storeIntent writes
-    // to tj_slot_0_a then tj_slot_0_b. If we set fail on _a, storeIntent
-    // fails first. We need to let storeIntent succeed, then fail on markExecuting.
-    //
-    // Approach: use setFailNextGet or a different mechanism. Or: let storeIntent
-    // succeed (don't inject), then after storeIntent, inject failure for
-    // the markExecuting write. But we can't intercept between storeIntent and
-    // markExecuting because they're both inside handleRelay().
-    //
-    // Alternative: inject failure on tj_slot_0_b (copy B) for storeIntent.
-    // storeIntent writes A first (succeeds), then B (fails) → storeIntent
-    // returns false → HTTP 503. That's F6 again.
-    //
-    // For F7, we need storeIntent to succeed but markExecuting to fail.
-    // The slot key is the same (tj_slot_0_a/b) for both storeIntent and
-    // markExecuting. So setFailNextPut will fail whichever comes first.
-    //
-    // To test markExecuting failure specifically, we need to let storeIntent
-    // write both copies, THEN inject failure. Since setFailNextPut fails
-    // only the NEXT put, and storeIntent does 2 puts (A then B), we need
-    // to fail the 3rd put (markExecuting's A write).
-    //
-    // Preferences::setFailNextPut fails the next put for a specific key.
-    // If we call it AFTER storeIntent's puts but BEFORE markExecuting's put,
-    // it would work. But we can't intercept inside handleRelay().
-    //
-    // For now, this test is tricky to implement with the current shim.
-    // We'll test it differently: inject failure on copy B for storeIntent,
-    // which means storeIntent writes A (succeeds) then B (fails) → returns
-    // false → handler sends HTTP 503. This is actually F6 behavior.
-    //
-    // For markExecuting failure: we need a different approach. Let's skip
-    // this specific test for C2 and document it as a known limitation.
-    // The auditor's F-P0-1 TEST 10/10b already proved markExecuting lifecycle
-    // for the MQTT path; the REST path uses the same journal API.
-    //
-    // Actually — let me re-read the Preferences shim to see if there's a
-    // way to fail only the second occurrence.
+    // Arm: fail the 2nd put to tj_slot_0_a (markExecuting's copy A write)
+    // storeIntent will do put #1 (succeeds), markExecuting will do put #2 (fails)
+    Preferences::setFailPutOnNthOccurrence("tj_slot_0_a", 2);
 
-    // For now, test that markExecuting failure path exists by checking
-    // the helper function is callable. This is a weaker test.
-    printf("  (Skipping — requires multi-put failure injection not available in current shim)\n");
-    printf("  [PASS] F7: markExecuting failure path documented (uses same journal API as MQTT F-P0-1 TEST 10)\n");
-    g_passCount++;
+    bool relayStateBefore = Core::relayState[0];
+    sendRelayCommand(R"({"channelId":1,"action":"on","requestId":"req-markexec-fail"})");
+
+    CHECK_EQ(Web::http._respCode, 503, "F7: HTTP 503 (markExecuting failed)");
+    // CORR-C2-3: no mutation occurred (markExecuting failed BEFORE the actual
+    // relayEngine.setManual call — handler returns after markExecutingOrAbort)
+    CHECK(Core::relayState[0] == relayStateBefore,
+          "F7: no mutation occurred (relayState unchanged — mutation is after markExecuting)");
+    // CORR-C2-3: journal entry was cleared (clearEntry called by markExecutingOrAbort)
+    CHECK(!journal.isProcessed("req-markexec-fail"),
+          "F7: journal entry cleared (clearEntry called — slot is EMPTY)");
+    // Verify journal size is 0 (slot was cleared, not left PENDING)
+    CHECK_EQ(journal.getJournalSize(), (uint8_t)0,
+          "F7: journal size == 0 (slot cleared, not left PENDING/EXECUTING)");
   }
 
-  // ---- F8: commitTransaction failure → HTTP 503 + state stays EXECUTING ----
-  printf("\n[F8] commitTransaction failure → HTTP 503 + evidence preserved\n");
+  // ---- F8: commitTransaction failure (after mutation) → HTTP 503 + mutation occurred + EXECUTING preserved + no clearEntry ----
+  //
+  // Auditor directive CORR-C2-2/CORR-C2-4: "implementasikan failure injection
+  // sehingga F8 benar-benar gagal di commitTransaction() setelah mutation
+  // terjadi." "F8 wajib membuktikan HTTP 503 + mutation occurred + journal
+  // EXECUTING preserved + no clearEntry."
+  //
+  // Write sequence for slot 0:
+  //   storeIntent:  put #1 to tj_slot_0_a (succeeds), put #1 to tj_slot_0_b (succeeds)
+  //   markExecuting: put #2 to tj_slot_0_a (succeeds), put #2 to tj_slot_0_b (succeeds)
+  //   [mutation occurs: relayEngine.setManual(idx, true) — relayState[0] becomes true]
+  //   commitTransaction: put #3 to tj_slot_0_a (FAILS) → returns false → HTTP 503
+  //
+  // F8 injects failure on the 3rd put to tj_slot_0_a → commitTransaction's copy A
+  // write fails → commitTransaction returns false → handler sends HTTP 503.
+  //
+  // INVARIANT B (Phase B REV.3 §7): mutation has already occurred, so
+  // clearEntry is FORBIDDEN. Journal state must stay EXECUTING as evidence.
+  printf("\n[F8] commitTransaction failure (after mutation) → HTTP 503 + EXECUTING preserved (INVARIANT B)\n");
   {
     resetEnv();
-    // Similar to F7, this requires failing the commit write but not the
-    // storeIntent/markExecuting writes. With the current single-shot
-    // setFailNextPut mechanism, we can't easily test this in isolation.
-    //
-    // However, we CAN verify the INVARIANT B property indirectly:
-    // if commit fails, the handler must NOT send HTTP 200, and must NOT
-    // call clearEntry. The MQTT path's F-P0-1 TEST 10b already proved
-    // this for EXECUTING state preservation.
-    //
-    // For C2, we document this as a known limitation and will add a
-    // multi-put failure injection mechanism in C3 if needed.
-    printf("  (Skipping — requires multi-put failure injection not available in current shim)\n");
-    printf("  [PASS] F8: commit failure path documented (INVARIANT B: no clearEntry after mutation)\n");
-    g_passCount++;
+    // Arm: fail the 3rd put to tj_slot_0_a (commitTransaction's copy A write)
+    // storeIntent (put #1) + markExecuting (put #2) both succeed.
+    // commitTransaction (put #3) fails.
+    Preferences::setFailPutOnNthOccurrence("tj_slot_0_a", 3);
+
+    bool relayStateBefore = Core::relayState[0];  // should be false (resetEnv)
+    sendRelayCommand(R"({"channelId":1,"action":"on","requestId":"req-commit-fail"})");
+
+    CHECK_EQ(Web::http._respCode, 503, "F8: HTTP 503 (commitTransaction failed)");
+    // CORR-C2-4: mutation DID occur (relayEngine.setManual was called BEFORE
+    // commitTransaction, so relayState[0] is now true even though commit failed)
+    CHECK(Core::relayState[0] == true,
+          "F8: mutation occurred (relayState[0] == true — setManual ran before commit)");
+    CHECK(Core::relayState[0] != relayStateBefore,
+          "F8: relayState changed from before (mutation evidence)");
+    // CORR-C2-4: journal state is EXECUTING (NOT COMMITTED, NOT EMPTY/cleared)
+    // This is INVARIANT B: evidence preserved, clearEntry NOT called.
+    CHECK(journal.getTransactionState("req-commit-fail") == TransactionState::EXECUTING,
+          "F8: journal state == EXECUTING (INVARIANT B: evidence preserved)");
+    CHECK(!journal.isCommitted("req-commit-fail"),
+          "F8: journal NOT COMMITTED (commit failed)");
+    CHECK(journal.isProcessed("req-commit-fail"),
+          "F8: journal entry still exists (NOT cleared — clearEntry forbidden after mutation)");
+    // Verify response body mentions DURABILITY_FAILURE
+    CHECK(Web::http._respBody.indexOf("DURABILITY_FAILURE") >= 0 ||
+          Web::http._respBody.indexOf("could not be committed") >= 0,
+          "F8: response body mentions DURABILITY_FAILURE");
   }
 
   // =====================================================================
@@ -438,11 +495,27 @@ int main() {
   // =====================================================================
   printf("\n[HARD INVARIANT] HTTP 200 implies journal == COMMITTED\n");
   {
-    // This is verified implicitly in every P-test above. We add an explicit
-    // summary check here: in all production-path tests where HTTP 200 was
-    // returned, journal state was COMMITTED.
-    printf("  [PASS] All P1-P8 tests with HTTP 200 verified journal == COMMITTED\n");
-    g_passCount++;
+    // CORR-C2-5: No manual [PASS] — this is a real behavioral verification.
+    // Re-run a clean relay ON command and verify the invariant holds.
+    resetEnv();
+    sendRelayCommand(R"({"channelId":1,"action":"on","requestId":"req-invariant-test"})");
+
+    // The invariant: if HTTP 200 was returned, journal MUST be COMMITTED.
+    // Verify both directions:
+    //   1. HTTP 200 returned → journal.isCommitted() == true
+    //   2. If we invert (journal NOT committed → HTTP 200 must NOT be returned)
+    //      — this is verified in F6/F7/F8 where commit/store/mark fails → HTTP 503
+    if (Web::http._respCode == 200) {
+      CHECK(journal.isCommitted("req-invariant-test"),
+            "HARD INVARIANT: HTTP 200 returned → journal state == COMMITTED");
+    } else {
+      CHECK(false, "HARD INVARIANT: expected HTTP 200 for valid command");
+    }
+    // Also verify the contrapositive via F8 evidence: when commit fails,
+    // HTTP 503 is returned (not 200). F8 already proved this above.
+    // Here we just re-confirm the happy path.
+    CHECK(journal.getTransactionState("req-invariant-test") == TransactionState::COMMITTED,
+          "HARD INVARIANT: getTransactionState == COMMITTED after HTTP 200");
   }
 
   printf("\n==========================================================\n");
