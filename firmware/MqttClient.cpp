@@ -1382,9 +1382,44 @@ void MqttClient::_handleCommand(const String& json) {
   // ===========================================================================
   else if (strcmp(type, "system") == 0) {
     if (strcmp(action, "reboot") == 0) {
+      // P2-2 R6-C1: Reboot lifecycle — commit BEFORE restart, ACK stays queued.
+      //   1. storeIntent was already called (PENDING in journal)
+      //   2. commitTransactionFromPending → COMMITTED + ACK queued (durable)
+      //   3. Publish ACK immediately (low latency for PWA)
+      //   4. Do NOT dequeue ACK — leave it in queue for durability
+      //      If immediate publish fails, processPendingAcks would have retried,
+      //      but we're about to restart so it won't get a chance.
+      //      After reboot, boot merge sees ACK still in queue → does NOT re-add
+      //      (already present). PWA deduplicates by requestId.
+      //   5. ESP.restart()
       Services::Log.append(Core::LogType::Restart, "Reboot via MQTT", 0);
       if (requestId.length() > 0) {
-        _publishGenericAck(requestId, true, "Rebooting", commandHash);
+        // Build ACK JSON
+        StaticJsonDocument<256> doc;
+        doc["requestId"] = requestId;
+        doc["success"] = true;
+        doc["message"] = "Rebooting";
+        doc["timestamp"] = (uint64_t)Drivers::rtc.getUnixTime() * 1000ULL;
+        String ackJson;
+        serializeJson(doc, ackJson);
+
+        // Commit to journal (PENDING → COMMITTED + ACK queued)
+        bool committed = Services::journal.commitTransactionFromPending(requestId, ackJson);
+        if (!committed) {
+          // Commit failed — publish DURABILITY_FAILURE, do NOT restart
+          // (reboot without durable commit would lose transaction evidence)
+          Serial.printf("[MQTT] reboot: commitTransactionFromPending FAILED — NOT restarting\n");
+          _publishAck(requestId, false,
+            "DURABILITY_FAILURE: cannot commit reboot transaction — please retry");
+          return;
+        }
+
+        // ACK is durable — publish immediately for low latency
+        // Do NOT dequeue — ACK stays in queue as durable evidence
+        _mqtt.publish(_topicAck.c_str(), (const uint8_t*)ackJson.c_str(),
+                       ackJson.length(), false);
+        Serial.printf("[MQTT ACK] %s: Rebooting (committed, ACK published, not dequeued)\n",
+                      requestId.c_str());
       }
       delay(500);
       ESP.restart();
@@ -1552,6 +1587,15 @@ void MqttClient::_handleOta(const String& json) {
       Serial.printf("[OTA] FATAL: storeIntent failed for rid=%s — refusing to download\n", requestId.c_str());
       _publishAck(requestId, false,
         "DURABILITY_FAILURE: cannot store OTA transaction intent — please retry");
+      return;
+    }
+
+    // P2-2 R6-C2: OTA has a physical execution phase (flash write) → use EXECUTING lifecycle.
+    // markExecuting must be called BEFORE download starts (physical mutation begins).
+    if (!Services::journal.markExecuting(requestId)) {
+      Serial.printf("[OTA] markExecuting failed for rid=%s — aborting\n", requestId.c_str());
+      _publishAck(requestId, false, "Internal error: cannot mark OTA transaction as executing");
+      Services::journal.clearEntry(requestId);
       return;
     }
   }
@@ -1754,8 +1798,31 @@ void MqttClient::_handleOta(const String& json) {
                                        signatureHex, requestId, version);
 
   if (success) {
+    // P2-2 R6-C2: OTA success — state is EXECUTING, use commitTransaction (not commitFromPending).
+    // ACK is committed durably BEFORE restart. Do NOT dequeue — ACK stays as durable evidence.
     if (requestId.length() > 0) {
-      _publishGenericAck(requestId, true, "OTA success — rebooting", commandHash);
+      StaticJsonDocument<256> doc;
+      doc["requestId"] = requestId;
+      doc["success"] = true;
+      doc["message"] = "OTA success — rebooting";
+      doc["timestamp"] = (uint64_t)Drivers::rtc.getUnixTime() * 1000ULL;
+      String ackJson;
+      serializeJson(doc, ackJson);
+
+      bool committed = Services::journal.commitTransaction(requestId, ackJson);
+      if (!committed) {
+        // Commit failed — but OTA already flashed. We MUST restart (new firmware is in inactive partition).
+        // Publish DURABILITY_FAILURE ACK — PWA may see device come back with new version despite ACK failure.
+        Serial.printf("[OTA] WARNING: commitTransaction FAILED after OTA success — restarting anyway (flash already written)\n");
+        _publishAck(requestId, false,
+          "DURABILITY_FAILURE: OTA flashed but transaction not committed — device will reboot with new firmware");
+      } else {
+        // ACK is durable — publish immediately, do NOT dequeue
+        _mqtt.publish(_topicAck.c_str(), (const uint8_t*)ackJson.c_str(),
+                       ackJson.length(), false);
+        Serial.printf("[MQTT ACK] %s: OTA success (committed, ACK published, not dequeued)\n",
+                      requestId.c_str());
+      }
     }
     String doneJson = "{\"otaStatus\":\"done\",\"progress\":100,\"newVersion\":\"" + String(version) + "\"}";
     _mqtt.publish(_topicStatus.c_str(), (const uint8_t*)doneJson.c_str(), doneJson.length(), false);
