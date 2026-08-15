@@ -15,7 +15,7 @@
 //   dual-copy canonical equivalence + CRC verification.
 //
 //   ACK queue (R4-C8 doc fix — multi-key, not single 2056-byte blob):
-//     tj_ackq_hdr     — 4 bytes  (count + reserved[3] + version)
+//     tj_ackq_hdr     — 4 bytes  (byte 0: count, byte 1: reserved, byte 2: reserved, byte 3: version)
 //     tj_ackq_rec_0..7 — 1280 bytes each (ACK_RECORD_SIZE, 8 records)
 //     tj_ackq_crc     — 4 bytes  (uint32 LE, CRC32 over header ++ records)
 //
@@ -132,9 +132,13 @@ enum class AuthEvidence : uint8_t {
 // Slot durability state (runtime, derived from copy A/B validity)
 // -----------------------------------------------------------------------------
 enum class SlotDurability : uint8_t {
-  SLOT_EMPTY      = 0,  // Both copies EMPTY (gen=0)
-  SLOT_VALID      = 1,  // Both copies valid, canonical-equivalent, gen known
-  SLOT_QUARANTINED = 2, // Both copies INVALID or gen mismatch → CORRUPTED
+  SLOT_EMPTY        = 0,  // Both copies EMPTY (gen=0) — keys genuinely absent
+  SLOT_VALID        = 1,  // Both copies valid, canonical-equivalent, gen known
+  SLOT_QUARANTINED  = 2, // Both copies INVALID or gen mismatch → CORRUPTED
+  SLOT_STORAGE_ERROR = 3, // CP-R6.2: NVS storage failure (NOT empty, NOT corrupted)
+                          // Slot may contain valid data but NVS is inaccessible.
+                          // NEVER auto-reused. NEVER treated as SLOT_EMPTY.
+                          // Operator must investigate NVS health before recovery.
 };
 
 // -----------------------------------------------------------------------------
@@ -199,7 +203,7 @@ private:
 //   P2-1 CORRECTION PASS 4 (auditor CP-1): added real CRC32 integrity.
 //
 //   Storage model (each key ≤ 1280 bytes, fits ESP32 NVS single-page ~1952B):
-//     tj_ackq_hdr     — 4 bytes (count + reserved + version)
+//     tj_ackq_hdr     — 4 bytes (byte 0: count, byte 1: reserved, byte 2: reserved, byte 3: version)
 //     tj_ackq_rec_0   — 1280 bytes (ACK_RECORD_SIZE)
 //     tj_ackq_rec_1   — 1280 bytes
 //     ...             (8 records)

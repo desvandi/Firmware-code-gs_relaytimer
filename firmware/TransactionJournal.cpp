@@ -674,32 +674,30 @@ SlotDurability TransactionJournal::_observeSlot(uint8_t slotIdx, SlotDecision& o
   outDecision.needsQuarantine = false;
   outDecision.loadedRecord = JournalRecord();
 
-  // CP-4: Check if slot is completely empty (no NVS keys for either copy).
+  // CP-R6.2: Check if slot is completely empty (no NVS keys for either copy).
   // CRITICAL: prefs.begin() failure must NOT be treated as SLOT_EMPTY.
-  // NVS storage error ≠ empty slot. Fail-closed → treat as CORRUPTED.
+  // NVS storage error ≠ empty slot. Use SLOT_STORAGE_ERROR (CP-R6.2).
   //
-  // P2-1 CORRECTION R4-C3 (auditor NVS error taxonomy): the isKey()==false
-  // limitation. On the real ESP32 Preferences, isKey()==false has TWO causes:
-  //   (a) The key genuinely does not exist (fresh slot, first write pending).
-  //   (b) NVS itself is broken (begin() succeeded but the underlying nvs_get()
-  //       returned an error other than ESP_ERR_NVS_NOT_FOUND).
-  // We cannot distinguish (a) from (b) at the isKey() call site. We rely on
-  // the explicit prefs.begin() check above to catch the most common NVS-broken
-  // case. For the residual isKey()==false ambiguity, we treat "neither A nor
-  // B exists" as SLOT_EMPTY (the optimistic interpretation) — this is the
-  // expected state for the 60+ slots that have never been written. If NVS is
-  // truly broken after begin() succeeds, the subsequent _readCopy() calls
-  // (which DO check return values) will surface INVALID and force quarantine.
+  // NVS error taxonomy (CP-R6.2):
+  //   prefs.begin() fails → SLOT_STORAGE_ERROR (NVS inaccessible)
+  //   isKey()==false for both → SLOT_EMPTY (keys genuinely absent)
+  //   isKey()==false for one → proceed to _readCopy (which checks begin())
+  //
+  // NOTE: On ESP32, isKey() returns false for both "key not found" AND
+  // "NVS internal error". If begin() succeeded, the namespace is accessible,
+  // so isKey()==false most likely means "key not found" (common for empty
+  // slots). If begin() failed, we know NVS is inaccessible → STORAGE_ERROR.
+  // P2-3 hardware test should verify with esp_partition APIs.
   bool aExists = false, bExists = false;
   {
     Preferences prefs;
     if (!prefs.begin(Core::NVS_NAMESPACE, true)) {
-      // CP-4: NVS unavailable → fail-closed (quarantine, not empty)
-      Serial.printf("[Journal] _observeSlot: NVS begin FAILED for slot %u — fail-closed (CORRUPTED)\n",
+      // CP-R6.2: NVS unavailable → SLOT_STORAGE_ERROR (NOT SLOT_EMPTY, NOT QUARANTINE)
+      Serial.printf("[Journal] _observeSlot: NVS begin FAILED for slot %u — SLOT_STORAGE_ERROR\n",
                     slotIdx);
-      outDecision.durability = SlotDurability::SLOT_QUARANTINED;
-      outDecision.needsQuarantine = true;
-      return SlotDurability::SLOT_QUARANTINED;
+      outDecision.durability = SlotDurability::SLOT_STORAGE_ERROR;
+      outDecision.needsQuarantine = false;  // Storage error ≠ corruption
+      return SlotDurability::SLOT_STORAGE_ERROR;
     }
     aExists = prefs.isKey(_slotKeyA(slotIdx).c_str());
     bExists = prefs.isKey(_slotKeyB(slotIdx).c_str());
@@ -794,6 +792,16 @@ bool TransactionJournal::_applySlotDecision(const SlotDecision& dec) {
     return true;
   }
 
+  // CP-R6.2: SLOT_STORAGE_ERROR — mark slot, do NOT treat as empty or quarantine.
+  // Slot may contain valid data but NVS is inaccessible. NEVER auto-reused.
+  if (dec.durability == SlotDurability::SLOT_STORAGE_ERROR) {
+    _slots[i].durability = SlotDurability::SLOT_STORAGE_ERROR;
+    _slots[i].record = JournalRecord();
+    _slots[i].inUse = false;  // Not active until storage recovers
+    Serial.printf("[Journal] _applySlotDecision: slot %u SLOT_STORAGE_ERROR (NVS inaccessible)\n", i);
+    return true;  // Decision applied (slot marked as storage-error)
+  }
+
   if (dec.needsQuarantine) {
     // Quarantine — no NVS erase (preserves evidence)
     _quarantineSlot(i);
@@ -874,8 +882,10 @@ uint8_t TransactionJournal::_findEvictableSlot() const {
     uint8_t idx = (_journalWriteIdx + i) % JOURNAL_SIZE;
 
     // CP-2: Quarantined slots are NEVER auto-reusable, even though inUse==false.
-    if (_slots[idx].durability == SlotDurability::SLOT_QUARANTINED) {
-      continue;  // Skip quarantined — evidence preserved for operator recovery
+    // CP-R6.2: Quarantined AND storage-error slots are NEVER auto-reusable.
+    if (_slots[idx].durability == SlotDurability::SLOT_QUARANTINED ||
+        _slots[idx].durability == SlotDurability::SLOT_STORAGE_ERROR) {
+      continue;  // Skip — evidence preserved / storage inaccessible
     }
 
     // Truly empty slot (inUse==false AND not quarantined) — reusable without eviction
@@ -1536,18 +1546,23 @@ uint8_t TransactionJournal::reconcilePendingEntries() {
   // ObservationGuard out of scope — _observing is now false.
 
   // Phase 2: MUTATION — apply state transitions to NVS.
+  // CP-R6.1: Use candidate pattern with generation increment — same as reconcileEntry.
   // _assertMutationAllowed() will pass because _observing == false.
   for (uint8_t i = 0; i < actionCount; i++) {
     uint8_t slotIdx = actions[i].slotIdx;
-    _slots[slotIdx].record.recordState = actions[i].newState;
-    if (!_writeCopy(slotIdx, true, _slots[slotIdx].record)) {
-      Serial.printf("[Journal] reconcilePendingEntries: write A failed for slot %u\n", slotIdx);
-      continue;
+    JournalRecord candidate = _slots[slotIdx].record;
+    candidate.generation = _assignNextGeneration(slotIdx);  // CP-R6.1: MUST increment
+    candidate.recordState = actions[i].newState;
+    if (!_writeCopy(slotIdx, true, candidate)) {
+      Serial.printf("[Journal] reconcilePendingEntries: write A failed for slot %u — RAM unchanged\n", slotIdx);
+      continue;  // RAM stays at old state (PENDING/EXECUTING) — retry-safe
     }
-    if (!_writeCopy(slotIdx, false, _slots[slotIdx].record)) {
-      Serial.printf("[Journal] reconcilePendingEntries: write B failed for slot %u\n", slotIdx);
-      continue;
+    if (!_writeCopy(slotIdx, false, candidate)) {
+      Serial.printf("[Journal] reconcilePendingEntries: write B failed for slot %u — RAM unchanged (A durable, B not)\n", slotIdx);
+      continue;  // RAM stays at old state — retry-safe
     }
+    // Both writes succeeded — commit candidate to RAM.
+    _slots[slotIdx].record = candidate;
   }
 
   return actionCount;
@@ -1576,11 +1591,17 @@ TransactionState TransactionJournal::reconcileEntry(const String& requestId) {
   // Guard out of scope.
 
   // Phase 2: MUTATION — R5-C1 candidate pattern.
-  //   Build a candidate with recordState=UNKNOWN, write both copies, only
-  //   commit to RAM if both writes succeed. If a write fails, RAM stays at
-  //   PENDING/EXECUTING and the caller can retry. We return a TransactionState
-  //   that reflects the ACTUAL (unchanged) RAM state in that case, NOT UNKNOWN.
+  //   Build a candidate with recordState=UNKNOWN and INCREMENTED GENERATION,
+  //   write both copies, only commit to RAM if both writes succeed.
+  //
+  //   CP-R6.1 (auditor B-1 blocker): previous version did NOT increment
+  //   generation. If crash after copy A (UNKNOWN gen=N) but before B
+  //   (PENDING/EXECUTING gen=N), boot would see GEN_EQUAL + divergent →
+  //   CORRUPTED, which is wrong. With generation increment:
+  //     A = UNKNOWN gen=N+1, B = PENDING/EXECUTING gen=N
+  //     → GEN_NEWER_A → load A → UNKNOWN (correct)
   JournalRecord candidate = authoritative;
+  candidate.generation = _assignNextGeneration(slotIdx);  // CP-R6.1: MUST increment
   candidate.recordState = RecordState::UNKNOWN;
 
   if (!_writeCopy(slotIdx, true, candidate)) {
@@ -2357,9 +2378,10 @@ const char* TransactionJournal::_phaseToString(BootPhase p) {
 
 const char* TransactionJournal::_durabilityToString(SlotDurability d) {
   switch (d) {
-    case SlotDurability::SLOT_EMPTY:       return "EMPTY";
-    case SlotDurability::SLOT_VALID:       return "VALID";
-    case SlotDurability::SLOT_QUARANTINED: return "QUARANTINED";
+    case SlotDurability::SLOT_EMPTY:        return "EMPTY";
+    case SlotDurability::SLOT_VALID:        return "VALID";
+    case SlotDurability::SLOT_QUARANTINED:  return "QUARANTINED";
+    case SlotDurability::SLOT_STORAGE_ERROR: return "STORAGE_ERROR";
   }
   return "?";
 }
