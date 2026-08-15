@@ -119,7 +119,8 @@ private:
   //     - If immediate publish succeeds: dequeueAck() to prevent duplicate (fixes F-006).
   //     - If immediate publish fails: leave in queue (processPendingAcks retries).
   void _finalizeAndPublishAck(const String& requestId, bool success,
-                               const String& preBuiltJson, const String& commandHash);
+                               const String& preBuiltJson, const String& commandHash,
+                               bool fromPending = false);
 
   void _buildTopics();
   // audit-fixes: removed _isDuplicate() and _addProcessed() declarations.

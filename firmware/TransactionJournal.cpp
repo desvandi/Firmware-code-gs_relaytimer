@@ -1225,6 +1225,71 @@ bool TransactionJournal::commitTransaction(const String& requestId, const String
 }
 
 // =============================================================================
+// MUTATION API — commitTransactionFromPending (P2-2 F-P0-1)
+//
+//   PENDING → COMMITTED directly, for atomic configuration mutations that
+//   have no physical execution phase (schedule, PIR, channel, time, config,
+//   system reset).
+//
+//   Uses same candidate pattern as commitTransaction():
+//     1. Build candidate (PENDING → COMMITTED + ackJson + gen+1)
+//     2. Write copy A (candidate). If fails → return false (RAM unchanged)
+//     3. Write copy B (candidate). If fails → return false (RAM unchanged)
+//     4. Both copies durable → commit candidate to RAM
+//     5. queueAck(requestId, ackJson). If fails → return false (partial-success)
+//
+//   INVARIANT: May only be called when recordState == PENDING.
+//   INVARIANT: The associated mutation must have completed atomically before this call.
+// =============================================================================
+bool TransactionJournal::commitTransactionFromPending(const String& requestId, const String& ackJson) {
+  _assertExecutorContext();
+  _assertMutationAllowed();
+
+  uint8_t slotIdx = _findSlot(requestId);
+  if (slotIdx == JOURNAL_SIZE) {
+    Serial.printf("[Journal] commitTransactionFromPending: requestId %s not found\n", requestId.c_str());
+    return false;
+  }
+
+  JournalRecord& authoritative = _slots[slotIdx].record;
+  if (authoritative.recordState != RecordState::PENDING) {
+    Serial.printf("[Journal] commitTransactionFromPending: slot %u state %u (expected PENDING)\n",
+                  slotIdx, (uint8_t)authoritative.recordState);
+    return false;
+  }
+
+  // R4-C1 candidate pattern: build candidate, do NOT touch authoritative RAM yet.
+  JournalRecord candidate = authoritative;
+  candidate.generation = _assignNextGeneration(slotIdx);  // distance 1
+  candidate.recordState = RecordState::COMMITTED;
+  candidate.ackJson = ackJson;
+
+  // Write to both copies (durable journal commit — primary contract)
+  if (!_writeCopy(slotIdx, true, candidate)) {
+    Serial.printf("[Journal] commitTransactionFromPending: write A failed for slot %u — RAM unchanged\n", slotIdx);
+    return false;  // case (a): not durable, RAM still PENDING
+  }
+  if (!_writeCopy(slotIdx, false, candidate)) {
+    Serial.printf("[Journal] commitTransactionFromPending: write B failed for slot %u — RAM unchanged (A durable, B not)\n", slotIdx);
+    return false;  // case (a): not durable, RAM still PENDING
+  }
+
+  // Both copies durable — commit candidate to RAM.
+  authoritative = candidate;
+
+  // Queue ACK for delivery (Rev26 I3 — independent of journal entry)
+  if (!queueAck(requestId, ackJson)) {
+    Serial.printf("[Journal] commitTransactionFromPending: queueAck FAILED for rid=%s — PARTIAL SUCCESS (journal COMMITTED, ACK queue not durable; boot merge will recover)\n",
+                  requestId.c_str());
+    return false;  // case (b): partial success
+  }
+
+  Serial.printf("[Journal] commitTransactionFromPending: rid=%s slot %u COMMITTED gen=%u\n",
+                requestId.c_str(), slotIdx, (unsigned)authoritative.generation);
+  return true;
+}
+
+// =============================================================================
 // MUTATION API — commitTransactionFailed (Rev26 — failure terminal state)
 //
 //   P2-1 CORRECTION (auditor P1-7): same fix as commitTransaction —

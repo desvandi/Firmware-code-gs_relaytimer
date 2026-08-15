@@ -505,7 +505,8 @@ void MqttClient::publishLog(Core::LogType type, const String& message, int8_t ch
 //   4. Publish FAILURE ACK with DURABILITY_FAILURE message if commit fails.
 // ============================================================================
 void MqttClient::_finalizeAndPublishAck(const String& requestId, bool success,
-                                         const String& preBuiltJson, const String& commandHash) {
+                                         const String& preBuiltJson, const String& commandHash,
+                                         bool fromPending) {
   if (!_mqtt.connected()) {
     Serial.printf("[MQTT ACK] %s: MQTT not connected — ACK queued for retry\n", requestId.c_str());
     // For success ACKs, the journal's queueAck() (called by commitTransaction)
@@ -523,8 +524,15 @@ void MqttClient::_finalizeAndPublishAck(const String& requestId, bool success,
   }
 
   // SUCCESS ACK with commandHash: must commit to journal first.
+  // P2-2 F-P0-1: Use commitTransactionFromPending for atomic config commands,
+  //   commitTransaction for relay/OTA (requires EXECUTING state).
   // CYCLE-7 fix for F-002: CHECK return value. If commit fails, do NOT claim success.
-  bool committed = Services::journal.commitTransaction(requestId, preBuiltJson);
+  bool committed;
+  if (fromPending) {
+    committed = Services::journal.commitTransactionFromPending(requestId, preBuiltJson);
+  } else {
+    committed = Services::journal.commitTransaction(requestId, preBuiltJson);
+  }
   if (!committed) {
     // Commit failed — NVS write error, journal full, or other durability failure.
     // Do NOT publish the success ACK (would falsely claim durable success).
@@ -588,7 +596,7 @@ void MqttClient::_publishAck(const String& requestId, bool success, const char* 
   serializeJson(doc, json);
 
   // CYCLE-7: delegate to _finalizeAndPublishAck for commit + publish + dequeue.
-  _finalizeAndPublishAck(requestId, success, json, commandHash);
+  _finalizeAndPublishAck(requestId, success, json, commandHash, true);
 }
 
 // Relay ACK: includes actual relay state.
@@ -646,7 +654,7 @@ void MqttClient::_publishScheduleAck(const String& requestId, bool success, cons
   serializeJson(doc, json);
 
   // CYCLE-7: delegate to _finalizeAndPublishAck for commit + publish + dequeue.
-  _finalizeAndPublishAck(requestId, success, json, commandHash);
+  _finalizeAndPublishAck(requestId, success, json, commandHash, true);
   Serial.printf("[MQTT ACK] %s: %s (schedule CH%d id=%d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", channelId, scheduleId,
                 commandHash.length() > 0 ? " (committed)" : "");
@@ -678,7 +686,7 @@ void MqttClient::_publishPirAck(const String& requestId, bool success, const cha
   serializeJson(doc, json);
 
   // CYCLE-7: delegate to _finalizeAndPublishAck for commit + publish + dequeue.
-  _finalizeAndPublishAck(requestId, success, json, commandHash);
+  _finalizeAndPublishAck(requestId, success, json, commandHash, true);
   Serial.printf("[MQTT ACK] %s: %s (pir %d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", pirId,
                 commandHash.length() > 0 ? " (committed)" : "");
@@ -706,7 +714,7 @@ void MqttClient::_publishChannelAck(const String& requestId, bool success, const
   serializeJson(doc, json);
 
   // CYCLE-7: delegate to _finalizeAndPublishAck for commit + publish + dequeue.
-  _finalizeAndPublishAck(requestId, success, json, commandHash);
+  _finalizeAndPublishAck(requestId, success, json, commandHash, true);
   Serial.printf("[MQTT ACK] %s: %s (channel CH%d)%s\n", requestId.c_str(),
                 success ? "OK" : "FAIL", channelId,
                 commandHash.length() > 0 ? " (committed)" : "");
@@ -1035,17 +1043,22 @@ void MqttClient::_handleCommand(const String& json) {
   }
 
   // CYCLE-8A: Store durable INTENT record with expanded metadata.
-  // Now that validation is complete, store the intent.
-  if (!Services::journal.storeIntent(requestId, commandHash,
-                                      intentChannelId, intentDesiredState,
-                                      intentPreviousKnown)) {
-    Serial.printf("[MQTT] FATAL: storeIntent failed for rid=%s — refusing to execute\n",
-                  requestId.c_str());
-    Services::Log.append(Core::LogType::Error,
-      "storeIntent FAILED — command rejected: " + requestId, 0);
-    _publishAck(requestId, false,
-      "DURABILITY_FAILURE: cannot store transaction intent — please retry");
-    return;
+  // P2-2 F-P0-1: Skip journal for read-only commands (system/getStatus).
+  //   Read-only commands have no mutation → no durability needed → no dedup needed.
+  bool isReadOnly = (strcmp(type, "system") == 0 && strcmp(action, "getStatus") == 0);
+
+  if (!isReadOnly) {
+    if (!Services::journal.storeIntent(requestId, commandHash,
+                                        intentChannelId, intentDesiredState,
+                                        intentPreviousKnown)) {
+      Serial.printf("[MQTT] FATAL: storeIntent failed for rid=%s — refusing to execute\n",
+                    requestId.c_str());
+      Services::Log.append(Core::LogType::Error,
+        "storeIntent FAILED — command rejected: " + requestId, 0);
+      _publishAck(requestId, false,
+        "DURABILITY_FAILURE: cannot store transaction intent — please retry");
+      return;
+    }
   }
 
 
@@ -1149,6 +1162,7 @@ void MqttClient::_handleCommand(const String& json) {
         if (requestId.length() > 0) {
           _publishAck(requestId, false, "Invalid onTime/offTime (format HH:MM, must differ)");
         }
+            Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
         return;  // no _addProcessed
       }
 
@@ -1185,6 +1199,7 @@ void MqttClient::_handleCommand(const String& json) {
         if (requestId.length() > 0) {
           _publishAck(requestId, false, "Schedule limit reached (max 4 per channel)");
         }
+            Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
         return;  // no _addProcessed
       }
 
@@ -1205,6 +1220,7 @@ void MqttClient::_handleCommand(const String& json) {
         if (requestId.length() > 0) {
           _publishAck(requestId, false, "Invalid schedule id for this channel");
         }
+            Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
         return;  // no _addProcessed
       }
 
@@ -1226,6 +1242,7 @@ void MqttClient::_handleCommand(const String& json) {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, "Invalid schedule action (use upsert/delete)");
       }
+          Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
       return;  // no _addProcessed
     }
   }
@@ -1262,12 +1279,14 @@ void MqttClient::_handleCommand(const String& json) {
         if (requestId.length() > 0) {
           _publishAck(requestId, false, "PIR still warming up (60s after boot)");
         }
+            Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
         return;  // no _addProcessed
       }
     } else {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, "Invalid PIR action (use config/test)");
       }
+          Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
       return;  // no _addProcessed
     }
 
@@ -1284,12 +1303,14 @@ void MqttClient::_handleCommand(const String& json) {
       const char* name = doc["name"] | "";
       if (channelId < 1 || channelId > Core::NUM_CHANNELS || strlen(name) == 0) {
         if (requestId.length() > 0) _publishAck(requestId, false, "Invalid channelId or name");
+            Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
         return;  // no _addProcessed
       }
       if (strlen(name) > Core::MAX_NAME_LEN) {
         if (requestId.length() > 0) {
           _publishAck(requestId, false, "Name too long (max 20 chars)");
         }
+            Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
         return;  // no _addProcessed
       }
       uint8_t idx = channelId - 1;
@@ -1305,6 +1326,7 @@ void MqttClient::_handleCommand(const String& json) {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, "Invalid channel action (use rename)");
       }
+          Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
       return;  // no _addProcessed
     }
   }
@@ -1320,12 +1342,14 @@ void MqttClient::_handleCommand(const String& json) {
         if (requestId.length() > 0) {
           _publishAck(requestId, false, "Invalid datetime format (use YYYY-MM-DDTHH:MM:SS)");
         }
+            Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
         return;  // no _addProcessed
       }
       if (!Utils::isValidDate(y, m, d) || h < 0 || h > 23 || mi < 0 || mi > 59) {
         if (requestId.length() > 0) {
           _publishAck(requestId, false, "Invalid date/time values");
         }
+            Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
         return;  // no _addProcessed
       }
       Drivers::rtc.adjust(y, m, d, h, mi, s);
@@ -1336,6 +1360,7 @@ void MqttClient::_handleCommand(const String& json) {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, "Invalid time action (use set)");
       }
+          Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
       return;  // no _addProcessed
     }
   }
@@ -1378,6 +1403,7 @@ void MqttClient::_handleCommand(const String& json) {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, "Invalid system action (use reboot/getStatus/resetEnergyStats/resetDailyStats)");
       }
+          Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
       return;  // no _addProcessed
     }
   }
@@ -1408,6 +1434,7 @@ void MqttClient::_handleCommand(const String& json) {
         if (requestId.length() > 0) {
           _publishAck(requestId, false, "No valid config fields to update");
         }
+            Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
         return;  // no _addProcessed
       }
       Storage::config.saveDeviceConfig();
@@ -1418,6 +1445,7 @@ void MqttClient::_handleCommand(const String& json) {
       if (requestId.length() > 0) {
         _publishAck(requestId, false, "Invalid config action (use setDevice)");
       }
+          Services::journal.clearEntry(requestId);  // P2-2 F-P0-1: clear PENDING (no mutation occurred)
       return;  // no _addProcessed
     }
   }

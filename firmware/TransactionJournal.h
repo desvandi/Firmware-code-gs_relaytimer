@@ -321,6 +321,20 @@ public:
 
   bool commitTransaction(const String& requestId, const String& ackJson);
 
+  // P2-2 F-P0-1: commitTransactionFromPending() — PENDING → COMMITTED directly.
+  // For atomic configuration mutations (schedule, PIR, channel, time, config, system reset)
+  // that have no physical execution phase. Uses same candidate pattern as commitTransaction:
+  //   1. Build candidate (PENDING → COMMITTED + ackJson + gen+1)
+  //   2. Write copy A (candidate). If fails → return false (RAM unchanged, retry safe)
+  //   3. Write copy B (candidate). If fails → return false (RAM unchanged, retry safe)
+  //   4. Both copies durable → commit candidate to RAM
+  //   5. queueAck(requestId, ackJson). If fails → return false (partial-success case b)
+  //
+  // INVARIANT: May only be called when recordState == PENDING.
+  // INVARIANT: The associated mutation must have completed atomically before this call.
+  // INVARIANT: No external/physical execution phase exists (use commitTransaction for relay/OTA).
+  bool commitTransactionFromPending(const String& requestId, const String& ackJson);
+
   bool commitTransactionFailed(const String& requestId, const String& ackJson,
                                 TransactionState failureState);
 
