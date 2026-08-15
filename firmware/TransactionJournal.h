@@ -14,8 +14,10 @@
 //   encoded in recordState byte of canonical payload. Durability comes from
 //   dual-copy canonical equivalence + CRC verification.
 //
-//   ACK queue: tj_ackq — single 2056-byte blob containing:
-//     [count:1] [reserved:3] [AckRecord × 8 = 2048] [queueCRC:4]
+//   ACK queue (R4-C8 doc fix — multi-key, not single 2056-byte blob):
+//     tj_ackq_hdr     — 4 bytes  (count + reserved[3] + version)
+//     tj_ackq_rec_0..7 — 1280 bytes each (ACK_RECORD_SIZE, 8 records)
+//     tj_ackq_crc     — 4 bytes  (uint32 LE, CRC32 over header ++ records)
 //
 // INVARIANTS (Rev26 normative):
 //
@@ -365,7 +367,11 @@ public:
   bool queueAck(const String& requestId, const String& ackJson);
   uint8_t processPendingAcks();
   uint8_t getPendingAckCount() const { return _ackQueueCount; }
-  void dequeueAck(const String& requestId);
+  // P2-1 CORRECTION R4-C2: dequeueAck now returns bool.
+  //   true  — entry dequeued (or already absent) and NVS persistence succeeded.
+  //   false — NVS persistence failed; RAM state has been rolled back to the
+  //           pre-dequeue snapshot so callers can retry.
+  bool dequeueAck(const String& requestId);
 
   // Update ACK delivery state (called by MQTT client on PUBACK / PWA ack_confirm)
   bool updateAckDeliveryState(const String& requestId, AckDeliveryState newState);

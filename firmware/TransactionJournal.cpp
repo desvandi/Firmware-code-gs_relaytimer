@@ -4,9 +4,12 @@
 // P2-1 implementation per docs/CYCLE-8C-REV26-FINAL-PREDICATE.md and
 // docs/PHASE-2-SCOPE.md §P2-1.
 //
-// STORAGE MODEL:
+// STORAGE MODEL (R4-C8 doc fix):
 //   - Dual-copy: tj_slot_<idx>_a + tj_slot_<idx>_b (each BLOB_SIZE=1200 bytes)
-//   - ACK queue: tj_ackq (2056 bytes)
+//   - ACK queue (multi-key, not single blob):
+//       tj_ackq_hdr       — 4 bytes  (count + reserved[3] + version)
+//       tj_ackq_rec_0..7  — 1280 bytes each (ACK_RECORD_SIZE)
+//       tj_ackq_crc       — 4 bytes  (uint32 LE, CRC32 over header ++ records)
 //   - No separate commit flag (pre-Rev26 tj_commit_<idx> REMOVED)
 //
 // INVARIANTS ENFORCED (Rev26):
@@ -28,6 +31,16 @@ namespace Services {
 // Snapshot provider callback (set by firmware_v4.ino on real device;
 // defaults to nullptr on host tests, where captureOutputSnapshot is a no-op).
 static std::function<bool(uint8_t)> s_snapshotProvider = nullptr;
+
+// R5-C6: Static buffer for ACK record serialization (avoid 1280-byte stack allocation).
+// Safe because:
+//   - TransactionJournal operations are single-threaded (I0: executor context enforced)
+//   - No reentrancy during ACK operations (I0a: observation/mutation mutex via ObservationGuard)
+//   - All callers of _serializeAckRecord / _deserializeAckRecord / _persistAckQueue /
+//     _loadAckQueue / _computeAckQueueCRC are non-reentrant methods on the same
+//     TransactionJournal instance.
+// Used by: _loadAckQueue, _persistAckQueue, _computeAckQueueCRC.
+static uint8_t s_ackRecBuf[ACK_RECORD_SIZE];
 
 // Public API (declared via friend or extern in header — for now, just expose):
 // firmware_v4.ino calls this to register a snapshot provider that returns
@@ -159,6 +172,22 @@ void TransactionJournal::begin() {
 
 // =============================================================================
 // _mergeAckQueueFromJournal (Rev26 I3 — boot merge)
+//
+// INVARIANT (R4-C6): If a journal slot is in recordState COMMITTED with a
+//   non-empty ackJson, the corresponding AckRecord is RECONSTRUCTIBLE from
+//   the journal alone. The ACK queue (tj_ackq_*) is a delivery-acceleration
+//   cache, not a source of truth. Boot merge re-derives the queue from the
+//   journal whenever:
+//     - the queue failed CRC verification (corruption), OR
+//     - the queue was never persisted (queueAck failure during commitTransaction),
+//       OR
+//     - the queue was truncated (record N write succeeded but record N+1 was
+//       lost).
+//   This invariant is what makes the partial-success semantic of
+//   commitTransaction safe: even if queueAck fails, the journal entry alone
+//   is sufficient to reconstruct the ACK on next boot. There is NO scenario
+//   in which the journal says COMMITTED+ackJson but the ACK is permanently
+//   lost — provided _mergeAckQueueFromJournal is called at boot.
 //
 //   P2-1 CORRECTION (auditor P1-9): previous version did NOT implement the
 //   promised boot merge. _loadFromNVS only loaded slots; _loadAckQueue only
@@ -442,11 +471,24 @@ bool TransactionJournal::_writeCopy(uint8_t slotIdx, bool isCopyA, const Journal
 //
 //   Returns true if the copy is VALID (parseable + CRC matches).
 //   Returns false if INVALID (parse failed, CRC mismatch, or NVS read failed).
+//
+//   P2-1 CORRECTION R4-C3 (auditor NVS error taxonomy): previously the only
+//   failure signal from prefs.begin() was the boolean return, but it was
+//   not checked explicitly — the read path relied on isKey()==false to
+//   distinguish "missing key" from "NVS unavailable". On the ESP32 the real
+//   Preferences::begin() can return false (e.g. NVS partition full / corrupt
+//   partition table / namespace name too long), and isKey()==false in that
+//   state does NOT mean the key is absent — it means NVS itself is broken.
+//
+//   Corrected: explicit `if (!prefs.begin(...)) return false;` at entry.
+//   Callers (_observeSlot, _loadAckQueue) already treat false as INVALID /
+//   CORRUPTED, so the fail-closed policy propagates correctly.
 // =============================================================================
 bool TransactionJournal::_readCopy(uint8_t slotIdx, bool isCopyA, JournalRecord& outRec) {
   String key = isCopyA ? _slotKeyA(slotIdx) : _slotKeyB(slotIdx);
 
   Preferences prefs;
+  // R4-C3: explicit begin() check — distinguishes "NVS unavailable" from "key missing".
   if (!prefs.begin(Core::NVS_NAMESPACE, true)) {  // readOnly
     return false;
   }
@@ -635,6 +677,19 @@ SlotDurability TransactionJournal::_observeSlot(uint8_t slotIdx, SlotDecision& o
   // CP-4: Check if slot is completely empty (no NVS keys for either copy).
   // CRITICAL: prefs.begin() failure must NOT be treated as SLOT_EMPTY.
   // NVS storage error ≠ empty slot. Fail-closed → treat as CORRUPTED.
+  //
+  // P2-1 CORRECTION R4-C3 (auditor NVS error taxonomy): the isKey()==false
+  // limitation. On the real ESP32 Preferences, isKey()==false has TWO causes:
+  //   (a) The key genuinely does not exist (fresh slot, first write pending).
+  //   (b) NVS itself is broken (begin() succeeded but the underlying nvs_get()
+  //       returned an error other than ESP_ERR_NVS_NOT_FOUND).
+  // We cannot distinguish (a) from (b) at the isKey() call site. We rely on
+  // the explicit prefs.begin() check above to catch the most common NVS-broken
+  // case. For the residual isKey()==false ambiguity, we treat "neither A nor
+  // B exists" as SLOT_EMPTY (the optimistic interpretation) — this is the
+  // expected state for the 60+ slots that have never been written. If NVS is
+  // truly broken after begin() succeeds, the subsequent _readCopy() calls
+  // (which DO check return values) will surface INVALID and force quarantine.
   bool aExists = false, bExists = false;
   {
     Preferences prefs;
@@ -1007,6 +1062,26 @@ bool TransactionJournal::storeIntent(const String& requestId, const String& comm
 
 // =============================================================================
 // MUTATION API — markExecuting (Rev26 — PENDING → EXECUTING)
+//
+//   P2-1 CORRECTION R4-C1 (auditor candidate-pattern): previous version
+//   mutated `_slots[slotIdx].record` (RAM) BEFORE writing to NVS, then wrote
+//   copy A, then copy B. If copy B write failed, RAM was already advanced to
+//   EXECUTING(gen+1) but copy B on disk still held PENDING(gen). On reboot,
+//   the 9-row recovery would see A=EXECUTING(gen+1), B=PENDING(gen) →
+//   GEN_NEWER_A → load A → state advances. The transaction would appear
+//   EXECUTING even though copy B was never durably written, violating the
+//   "RAM mirrors durable state" contract.
+//
+//   Corrected (candidate pattern):
+//     1. Copy _slots[slotIdx].record into a local `JournalRecord candidate`.
+//     2. Mutate the candidate (generation, recordState, attempt) — RAM stays
+//        at PENDING(gen) until BOTH copies are confirmed durable.
+//     3. _writeCopy(slotIdx, true, candidate)  — copy A
+//     4. _writeCopy(slotIdx, false, candidate) — copy B
+//     5. Only if BOTH succeed: commit the candidate to RAM
+//        (`_slots[slotIdx].record = candidate`).
+//     6. If either write fails: return false, RAM UNCHANGED. Caller can retry
+//        (markExecuting is idempotent while the slot is still PENDING).
 // =============================================================================
 bool TransactionJournal::markExecuting(const String& requestId) {
   _assertExecutorContext();
@@ -1018,23 +1093,33 @@ bool TransactionJournal::markExecuting(const String& requestId) {
     return false;
   }
 
-  JournalRecord& rec = _slots[slotIdx].record;
-  if (rec.recordState != RecordState::PENDING) {
+  JournalRecord& authoritative = _slots[slotIdx].record;
+  if (authoritative.recordState != RecordState::PENDING) {
     Serial.printf("[Journal] markExecuting: slot %u state %u (expected PENDING)\n",
-                  slotIdx, (uint8_t)rec.recordState);
+                  slotIdx, (uint8_t)authoritative.recordState);
     return false;
   }
 
-  // Generation increment (Rev26 — distance 1 for adjacent mutation).
-  rec.generation = _assignNextGeneration(slotIdx);
-  rec.recordState = RecordState::EXECUTING;
-  rec.attempt++;
+  // R4-C1: Build candidate, do NOT touch authoritative RAM yet.
+  JournalRecord candidate = authoritative;
+  candidate.generation = _assignNextGeneration(slotIdx);  // distance 1
+  candidate.recordState = RecordState::EXECUTING;
+  candidate.attempt++;
 
-  if (!_writeCopy(slotIdx, true, rec)) return false;
-  if (!_writeCopy(slotIdx, false, rec)) return false;
+  if (!_writeCopy(slotIdx, true, candidate)) {
+    Serial.printf("[Journal] markExecuting: write copy A failed for slot %u — RAM unchanged\n", slotIdx);
+    return false;  // RAM unchanged — caller can retry
+  }
+  if (!_writeCopy(slotIdx, false, candidate)) {
+    Serial.printf("[Journal] markExecuting: write copy B failed for slot %u — RAM unchanged (A written, B not)\n", slotIdx);
+    return false;  // RAM unchanged — caller can retry; copy A is newer on disk
+  }
+
+  // Both writes succeeded — now commit to RAM.
+  authoritative = candidate;
 
   Serial.printf("[Journal] markExecuting: rid=%s slot %u attempt %u gen=%u\n",
-                requestId.c_str(), slotIdx, rec.attempt, (unsigned)rec.generation);
+                requestId.c_str(), slotIdx, authoritative.attempt, (unsigned)authoritative.generation);
   return true;
 }
 
@@ -1058,6 +1143,26 @@ bool TransactionJournal::markExecuting(const String& requestId) {
 //   durability is the primary contract; ACK queue durability is best-effort
 //   with boot-merge recovery. This is acceptable per Rev26 I3 (ACK lifecycle
 //   independent of transaction lifecycle; orphaned ACKs retained via merge).
+//
+//   P2-1 CORRECTION R4-C1 (auditor candidate-pattern): the journal write
+//   (EXECUTING → COMMITTED) now uses the candidate pattern: build a candidate
+//   record, write BOTH copies, and only commit to RAM if both writes
+//   succeeded. If copy A succeeds and copy B fails, RAM stays EXECUTING
+//   (caller can retry); copy A on disk will be newer than copy B but
+//   recovery will load A (GEN_NEWER_A) and observe COMMITTED, which is
+//   acceptable per the partial-success semantic — but in that case the
+//   ACK is NOT queued either (we return false before calling queueAck).
+//
+//   Order of operations (R4-C1 + P1-C):
+//     1. Build candidate (EXECUTING → COMMITTED + ackJson + gen+1).
+//     2. Write copy A (candidate).  If fails → return false (case a).
+//     3. Write copy B (candidate).  If fails → return false (case a);
+//        RAM still EXECUTING so caller can retry safely.
+//     4. Both copies durable → commit candidate to RAM (state = COMMITTED).
+//     5. queueAck(requestId, ackJson).  If fails → return false (case b);
+//        journal IS COMMITTED (durable) but ACK queue is not.
+//        _mergeAckQueueFromJournal will reconstruct the missing ACK on
+//        next boot.
 // =============================================================================
 bool TransactionJournal::commitTransaction(const String& requestId, const String& ackJson) {
   _assertExecutorContext();
@@ -1069,21 +1174,31 @@ bool TransactionJournal::commitTransaction(const String& requestId, const String
     return false;
   }
 
-  JournalRecord& rec = _slots[slotIdx].record;
-  if (rec.recordState != RecordState::EXECUTING) {
+  JournalRecord& authoritative = _slots[slotIdx].record;
+  if (authoritative.recordState != RecordState::EXECUTING) {
     Serial.printf("[Journal] commitTransaction: slot %u state %u (expected EXECUTING)\n",
-                  slotIdx, (uint8_t)rec.recordState);
+                  slotIdx, (uint8_t)authoritative.recordState);
     return false;
   }
 
-  // Generation increment (Rev26 — distance 1 for adjacent mutation).
-  rec.generation = _assignNextGeneration(slotIdx);
-  rec.recordState = RecordState::COMMITTED;
-  rec.ackJson = ackJson;
+  // R4-C1: Build candidate, do NOT touch authoritative RAM yet.
+  JournalRecord candidate = authoritative;
+  candidate.generation = _assignNextGeneration(slotIdx);  // distance 1
+  candidate.recordState = RecordState::COMMITTED;
+  candidate.ackJson = ackJson;
 
   // Write to both copies (durable journal commit — primary contract)
-  if (!_writeCopy(slotIdx, true, rec)) return false;  // case (a): not durable
-  if (!_writeCopy(slotIdx, false, rec)) return false;  // case (a): not durable
+  if (!_writeCopy(slotIdx, true, candidate)) {
+    Serial.printf("[Journal] commitTransaction: write copy A failed for slot %u — RAM unchanged (case a)\n", slotIdx);
+    return false;  // case (a): not durable
+  }
+  if (!_writeCopy(slotIdx, false, candidate)) {
+    Serial.printf("[Journal] commitTransaction: write copy B failed for slot %u — RAM unchanged (case a; A durable but RAM still EXECUTING so caller can retry)\n", slotIdx);
+    return false;  // case (a): not durable
+  }
+
+  // Both copies durable — commit candidate to RAM.
+  authoritative = candidate;
 
   // Queue ACK for delivery (Rev26 I3 — independent of journal entry)
   // P1-7: propagate failure — if ACK queue cannot be persisted, return false
@@ -1091,11 +1206,11 @@ bool TransactionJournal::commitTransaction(const String& requestId, const String
   if (!queueAck(requestId, ackJson)) {
     Serial.printf("[Journal] commitTransaction: queueAck FAILED for rid=%s — PARTIAL SUCCESS (journal COMMITTED, ACK queue not durable; boot merge will recover)\n",
                   requestId.c_str());
-    return false;  // case (b): partial success
+    return false;  // case (b): partial success — journal committed, ACK not durable
   }
 
   Serial.printf("[Journal] commitTransaction: rid=%s slot %u COMMITTED gen=%u\n",
-                requestId.c_str(), slotIdx, (unsigned)rec.generation);
+                requestId.c_str(), slotIdx, (unsigned)authoritative.generation);
   return true;
 }
 
@@ -1104,6 +1219,12 @@ bool TransactionJournal::commitTransaction(const String& requestId, const String
 //
 //   P2-1 CORRECTION (auditor P1-7): same fix as commitTransaction —
 //   propagate queueAck failure.
+//
+//   P2-1 CORRECTION R4-C1 (auditor candidate-pattern): same candidate
+//   pattern as markExecuting / commitTransaction. Build candidate with
+//   failure terminal state + ackJson + gen+1; write both copies; only
+//   commit to RAM if both writes succeed. queueAck failure propagates
+//   as case (b) partial-success (journal durable, ACK not durable).
 // =============================================================================
 bool TransactionJournal::commitTransactionFailed(const String& requestId, const String& ackJson,
                                                   TransactionState failureState) {
@@ -1116,27 +1237,37 @@ bool TransactionJournal::commitTransactionFailed(const String& requestId, const 
     return false;
   }
 
-  JournalRecord& rec = _slots[slotIdx].record;
+  JournalRecord& authoritative = _slots[slotIdx].record;
   RecordState targetRecordState = _toRecordState(failureState);
 
-  // Generation increment (Rev26 — distance 1 for adjacent mutation).
-  rec.generation = _assignNextGeneration(slotIdx);
-  rec.recordState = targetRecordState;
-  rec.ackJson = ackJson;
+  // R4-C1: Build candidate, do NOT touch authoritative RAM yet.
+  JournalRecord candidate = authoritative;
+  candidate.generation = _assignNextGeneration(slotIdx);  // distance 1
+  candidate.recordState = targetRecordState;
+  candidate.ackJson = ackJson;
 
-  if (!_writeCopy(slotIdx, true, rec)) return false;
-  if (!_writeCopy(slotIdx, false, rec)) return false;
+  if (!_writeCopy(slotIdx, true, candidate)) {
+    Serial.printf("[Journal] commitTransactionFailed: write copy A failed for slot %u — RAM unchanged\n", slotIdx);
+    return false;
+  }
+  if (!_writeCopy(slotIdx, false, candidate)) {
+    Serial.printf("[Journal] commitTransactionFailed: write copy B failed for slot %u — RAM unchanged (A durable, B not)\n", slotIdx);
+    return false;
+  }
+
+  // Both copies durable — commit candidate to RAM.
+  authoritative = candidate;
 
   // Queue failure ACK for delivery
   // P1-7: propagate failure
   if (!queueAck(requestId, ackJson)) {
-    Serial.printf("[Journal] commitTransactionFailed: queueAck FAILED for rid=%s — ACK delivery not durable\n",
+    Serial.printf("[Journal] commitTransactionFailed: queueAck FAILED for rid=%s — ACK delivery not durable (boot merge will recover)\n",
                   requestId.c_str());
-    return false;
+    return false;  // case (b): journal durable, ACK not durable
   }
 
   Serial.printf("[Journal] commitTransactionFailed: rid=%s slot %u state=%s gen=%u\n",
-                requestId.c_str(), slotIdx, _stateToString(failureState), (unsigned)rec.generation);
+                requestId.c_str(), slotIdx, _stateToString(failureState), (unsigned)authoritative.generation);
   return true;
 }
 
@@ -1428,10 +1559,10 @@ TransactionState TransactionJournal::reconcileEntry(const String& requestId) {
   uint8_t slotIdx = _findSlot(requestId);
   if (slotIdx == JOURNAL_SIZE) return TransactionState::PENDING;
 
-  JournalRecord& rec = _slots[slotIdx].record;
-  if (rec.recordState != RecordState::PENDING &&
-      rec.recordState != RecordState::EXECUTING) {
-    return _fromRecordState(rec.recordState);
+  JournalRecord& authoritative = _slots[slotIdx].record;
+  if (authoritative.recordState != RecordState::PENDING &&
+      authoritative.recordState != RecordState::EXECUTING) {
+    return _fromRecordState(authoritative.recordState);
   }
 
   // Phase 1: OBSERVATION — determine new state.
@@ -1440,18 +1571,31 @@ TransactionState TransactionJournal::reconcileEntry(const String& requestId) {
   {
     ObservationGuard guard(_observing);
     // No mutation here — just confirm the decision.
-    // rec.recordState is already PENDING or EXECUTING (checked above).
+    // authoritative.recordState is already PENDING or EXECUTING (checked above).
   }
   // Guard out of scope.
 
-  // Phase 2: MUTATION — apply state transition.
-  rec.recordState = RecordState::UNKNOWN;
-  if (!_writeCopy(slotIdx, true, rec)) {
-    Serial.printf("[Journal] reconcileEntry: write A failed for slot %u\n", slotIdx);
+  // Phase 2: MUTATION — R5-C1 candidate pattern.
+  //   Build a candidate with recordState=UNKNOWN, write both copies, only
+  //   commit to RAM if both writes succeed. If a write fails, RAM stays at
+  //   PENDING/EXECUTING and the caller can retry. We return a TransactionState
+  //   that reflects the ACTUAL (unchanged) RAM state in that case, NOT UNKNOWN.
+  JournalRecord candidate = authoritative;
+  candidate.recordState = RecordState::UNKNOWN;
+
+  if (!_writeCopy(slotIdx, true, candidate)) {
+    Serial.printf("[Journal] reconcileEntry: write A failed for slot %u — RAM unchanged (still %s)\n",
+                  slotIdx, _stateToString(_fromRecordState(authoritative.recordState)));
+    return _fromRecordState(authoritative.recordState);  // actual state — PENDING or EXECUTING
   }
-  if (!_writeCopy(slotIdx, false, rec)) {
-    Serial.printf("[Journal] reconcileEntry: write B failed for slot %u\n", slotIdx);
+  if (!_writeCopy(slotIdx, false, candidate)) {
+    Serial.printf("[Journal] reconcileEntry: write B failed for slot %u — RAM unchanged (A durable, B not; still %s)\n",
+                  slotIdx, _stateToString(_fromRecordState(authoritative.recordState)));
+    return _fromRecordState(authoritative.recordState);  // actual state — PENDING or EXECUTING
   }
+
+  // Both writes succeeded — commit candidate to RAM.
+  authoritative = candidate;
   return TransactionState::UNKNOWN;
 }
 
@@ -1466,6 +1610,10 @@ TransactionState TransactionJournal::reconcileEntry(const String& requestId) {
 //   P2-1 CORRECTION (auditor P1-7): return bool. commitTransaction() checks
 //   return value and propagates failure (does not return true if ACK
 //   persistence failed).
+//
+//   P2-1 CORRECTION R4-C2 (auditor RAM rollback): if _persistAckQueue fails,
+//   the RAM mutation is rolled back to the snapshot taken before mutation.
+//   This guarantees `_ackQueue[]` always mirrors the durable NVS state.
 // =============================================================================
 bool TransactionJournal::queueAck(const String& requestId, const String& ackJson) {
   _assertExecutorContext();
@@ -1474,14 +1622,21 @@ bool TransactionJournal::queueAck(const String& requestId, const String& ackJson
   // Check if requestId already in queue
   int8_t existing = _findAckInQueue(requestId);
   if (existing >= 0) {
+    // R4-C2: Snapshot old AckRecord + count BEFORE mutation so we can roll back.
+    AckRecord oldRec = _ackQueue[existing];
+    uint8_t oldCount = _ackQueueCount;
+
     // Update existing entry
     _ackQueue[existing].ackJson = ackJson;
     _ackQueue[existing].deliveryState = AckDeliveryState::ACK_NOT_SENT;
     _ackQueue[existing].retryCount = 0;
     _ackQueue[existing].lastAttemptTs = 0;
     if (!_persistAckQueue()) {
-      Serial.printf("[Journal] queueAck: _persistAckQueue failed (update existing) for rid=%s\n",
+      Serial.printf("[Journal] queueAck: _persistAckQueue failed (update existing) for rid=%s — rolling back RAM\n",
                     requestId.c_str());
+      // R4-C2: Restore RAM to pre-mutation snapshot.
+      _ackQueue[existing] = oldRec;
+      _ackQueueCount = oldCount;
       return false;
     }
     return true;
@@ -1489,6 +1644,10 @@ bool TransactionJournal::queueAck(const String& requestId, const String& ackJson
 
   // Need a new slot. If queue full, find a droppable slot.
   uint8_t insertIdx = _ackQueueCount;
+  bool reusedDroppable = false;
+  AckRecord oldRec;       // R4-C2: snapshot for rollback
+  uint8_t oldCount = _ackQueueCount;  // R4-C2: snapshot for rollback
+
   if (_ackQueueCount >= ACK_QUEUE_CAPACITY) {
     // P1-6 fix: only drop ACK_FAILED_EXHAUSTED or empty slots.
     // Active ACKs (NOT_SENT/PUBLISH_ACCEPTED/BROKER_CONFIRMED/PWA_RECEIVED)
@@ -1507,7 +1666,9 @@ bool TransactionJournal::queueAck(const String& requestId, const String& ackJson
                     requestId.c_str());
       return false;
     }
-    // Reuse droppable slot
+    // R4-C2: Snapshot the droppable slot before overwriting (for rollback).
+    oldRec = _ackQueue[droppableIdx];
+    reusedDroppable = true;
     insertIdx = (uint8_t)droppableIdx;
   } else {
     _ackQueueCount++;
@@ -1522,11 +1683,14 @@ bool TransactionJournal::queueAck(const String& requestId, const String& ackJson
   rec.ackJson = ackJson;
 
   if (!_persistAckQueue()) {
-    Serial.printf("[Journal] queueAck: _persistAckQueue failed (new entry) for rid=%s\n",
+    Serial.printf("[Journal] queueAck: _persistAckQueue failed (new entry) for rid=%s — rolling back RAM\n",
                   requestId.c_str());
-    // Rollback: decrement count if we added a new slot
-    if (insertIdx == _ackQueueCount - 1) {
-      _ackQueueCount--;
+    // R4-C2: Restore RAM to pre-mutation snapshot.
+    if (reusedDroppable) {
+      _ackQueue[insertIdx] = oldRec;  // restore droppable slot
+    } else {
+      _ackQueue[insertIdx] = AckRecord();  // clear freshly added slot
+      _ackQueueCount = oldCount;           // restore count
     }
     return false;
   }
@@ -1598,7 +1762,13 @@ uint8_t TransactionJournal::processPendingAcks() {
   // P1-8: persist if any state changed (not just when processed > 0)
   if (dirty) {
     if (!_persistAckQueue()) {
-      Serial.printf("[Journal] processPendingAcks: _persistAckQueue FAILED — retry state may be lost\n");
+      // R4-C2: processPendingAcks is best-effort — no rollback. The RAM state
+      // (retryCount++, deliveryState transitions) reflects what was actually
+      // published to the broker. Rolling back would cause us to re-publish
+      // ACKs the broker has already seen, leading to duplicates. The only
+      // consequence of NOT persisting is that on next boot the retry counter
+      // resets, which delays (but does not lose) failed ACKs.
+      Serial.printf("[Journal] processPendingAcks: _persistAckQueue FAILED — retry state may be lost on reboot (best-effort, no rollback)\n");
     }
   }
 
@@ -1607,13 +1777,26 @@ uint8_t TransactionJournal::processPendingAcks() {
 
 // =============================================================================
 // ACK QUEUE — dequeueAck (Rev26 I3 — remove ACK after PWA confirms)
+//
+//   P2-1 CORRECTION R4-C2 (auditor RAM rollback): return type changed from
+//   void to bool. If _persistAckQueue fails after the shift, the RAM state
+//   (shifted entries + decremented count) is rolled back to the pre-dequeue
+//   snapshot so callers can retry. This guarantees `_ackQueue[]` always
+//   mirrors the durable NVS state.
 // =============================================================================
-void TransactionJournal::dequeueAck(const String& requestId) {
+bool TransactionJournal::dequeueAck(const String& requestId) {
   _assertExecutorContext();
   _assertMutationAllowed();  // CP-3: dequeueAck mutates _ackQueue[] + NVS
 
   int8_t idx = _findAckInQueue(requestId);
-  if (idx < 0) return;
+  if (idx < 0) return true;  // Already absent — nothing to do, success.
+
+  // R4-C2: Snapshot pre-dequeue state for rollback.
+  AckRecord snapshot[ACK_QUEUE_CAPACITY];
+  for (uint8_t i = 0; i < ACK_QUEUE_CAPACITY; i++) {
+    snapshot[i] = _ackQueue[i];
+  }
+  uint8_t oldCount = _ackQueueCount;
 
   // Shift remaining entries down
   for (uint8_t i = (uint8_t)idx; i < _ackQueueCount - 1; i++) {
@@ -1622,11 +1805,27 @@ void TransactionJournal::dequeueAck(const String& requestId) {
   _ackQueueCount--;
   _ackQueue[_ackQueueCount] = AckRecord();  // Clear the now-unused slot
 
-  _persistAckQueue();
+  if (!_persistAckQueue()) {
+    Serial.printf("[Journal] dequeueAck: _persistAckQueue FAILED for rid=%s — rolling back RAM\n",
+                  requestId.c_str());
+    // R4-C2: Restore RAM to pre-dequeue snapshot.
+    for (uint8_t i = 0; i < ACK_QUEUE_CAPACITY; i++) {
+      _ackQueue[i] = snapshot[i];
+    }
+    _ackQueueCount = oldCount;
+    return false;
+  }
+
+  return true;
 }
 
 // =============================================================================
 // ACK QUEUE — updateAckDeliveryState (Rev26 I3 — PUBACK / ack_confirm)
+//
+//   P2-1 CORRECTION R4-C2 (auditor RAM rollback): if _persistAckQueue fails,
+//   the RAM deliveryState is rolled back to its pre-update value so callers
+//   can retry. This guarantees `_ackQueue[]` always mirrors the durable NVS
+//   state.
 // =============================================================================
 bool TransactionJournal::updateAckDeliveryState(const String& requestId, AckDeliveryState newState) {
   _assertExecutorContext();
@@ -1635,10 +1834,58 @@ bool TransactionJournal::updateAckDeliveryState(const String& requestId, AckDeli
   int8_t idx = _findAckInQueue(requestId);
   if (idx < 0) return false;
 
+  // R4-C2: Snapshot old deliveryState for rollback.
+  AckDeliveryState oldState = _ackQueue[idx].deliveryState;
+
   _ackQueue[idx].deliveryState = newState;
-  _persistAckQueue();
+  if (!_persistAckQueue()) {
+    Serial.printf("[Journal] updateAckDeliveryState: _persistAckQueue FAILED for rid=%s — rolling back RAM deliveryState\n",
+                  requestId.c_str());
+    // R4-C2: Restore RAM to pre-mutation snapshot.
+    _ackQueue[idx].deliveryState = oldState;
+    return false;
+  }
   return true;
 }
+
+// =============================================================================
+// ACK QUEUE CRASH STATE-TRANSITION MATRIX (R5-C5)
+//
+//   Documents the expected classification of the ACK queue after a power-loss
+//   at any point during _persistAckQueue. The queue is multi-key (header +
+//   8 records + CRC), so a power-loss can leave NVS in any intermediate state.
+//
+//   Crash point              | Expected classification
+//   -------------------------|---------------------------
+//   Before any write          | Old state valid (if existed) or fresh empty
+//   After header write        | CORRUPTED (header new, records old, CRC old)
+//   After record 0 write      | CORRUPTED (partial new records, CRC old)
+//   After record N write      | CORRUPTED (partial new records, CRC old)
+//   After all records write   | CORRUPTED (records new, CRC old)
+//   After CRC write           | New state valid (all keys consistent)
+//   During CRC write         | CORRUPTED (CRC partially written)
+//   CRC key lost              | CORRUPTED (no CRC -> can't verify)
+//   One record lost           | CORRUPTED (CRC won't match)
+//   Header count wrong        | CORRUPTED (CRC computed over wrong count)
+//
+//   Recovery policy for ALL CORRUPTED cases:
+//     1. Set _ackQueueState = ACK_QUEUE_CORRUPTED
+//     2. Drop entire queue (set _ackQueueCount = 0)
+//     3. _mergeAckQueueFromJournal() reconstructs from journal COMMITTED entries
+//     4. Re-persist reconstructed queue with new CRC
+//
+//   Invariant: No torn state can pass CRC verification (CRC covers header + all
+//   records). If CRC matches, the queue is a consistent snapshot. If CRC does
+//   not match, the queue is treated as corrupted and reconstructed.
+//
+//   Partial-CRC-write caveat: a power-loss during the 4-byte CRC write could
+//   leave 1-3 bytes written and the rest zeroed. The CRC verification will
+//   fail (computed != stored) and the queue will be classified CORRUPTED —
+//   the safe outcome. There is no scenario where a partial CRC write leads
+//   to a false VALID classification, because the CRC write is the LAST write
+//   in _persistAckQueue — if any of the record writes were torn, the records
+//   themselves are inconsistent and the CRC won't match anyway.
+// =============================================================================
 
 // =============================================================================
 // ACK QUEUE NVS — _loadAckQueue (Rev26 I3 — multi-key with CRC32 verification)
@@ -1697,8 +1944,34 @@ bool TransactionJournal::_loadAckQueue() {
     return false;
   }
 
+  // R4-C4: Validate ACK version (hdr[3]). Reject unknown schema versions
+  //   as CORRUPTED — protects against partial future-schema migration where
+  //   a record layout change would silently misparse.
+  if (hdr[3] != ACK_VERSION) {
+    prefs.end();
+    _ackQueueState = AckQueueState::ACK_QUEUE_CORRUPTED;
+    _ackQueueCount = 0;
+    Serial.printf("[Journal] _loadAckQueue: header version %u != ACK_VERSION %u — CORRUPTED\n",
+                  hdr[3], ACK_VERSION);
+    return false;
+  }
+
+  // R4-C4: Validate reserved bytes (hdr[1], hdr[2]) are zero. Non-zero
+  //   reserved bytes indicate either future-schema use or storage corruption
+  //   (e.g. partial write). Treat as CORRUPTED.
+  if (hdr[1] != 0 || hdr[2] != 0) {
+    prefs.end();
+    _ackQueueState = AckQueueState::ACK_QUEUE_CORRUPTED;
+    _ackQueueCount = 0;
+    Serial.printf("[Journal] _loadAckQueue: header reserved bytes non-zero (%u, %u) — CORRUPTED\n",
+                  hdr[1], hdr[2]);
+    return false;
+  }
+
   // Step 2: Load each record + accumulate CRC incrementally (no 10KB stack buffer)
-  uint8_t recBuf[ACK_RECORD_SIZE];
+  // R5-C6: use static buffer instead of stack-allocated recBuf[1280] to reduce
+  // peak stack consumption. Safe because ACK queue operations are
+  // single-threaded (I0) and non-reentrant (I0a).
   bool anyRecFailed = false;
 
   // Start CRC computation with header
@@ -1715,7 +1988,7 @@ bool TransactionJournal::_loadAckQueue() {
       continue;
     }
 
-    size_t recRead = prefs.getBytes(key, recBuf, ACK_RECORD_SIZE);
+    size_t recRead = prefs.getBytes(key, s_ackRecBuf, ACK_RECORD_SIZE);
     if (recRead != ACK_RECORD_SIZE) {
       Serial.printf("[Journal] _loadAckQueue: record %u size mismatch (%u != %u) — CORRUPTED\n",
                     i, (unsigned)recRead, (unsigned)ACK_RECORD_SIZE);
@@ -1724,10 +1997,10 @@ bool TransactionJournal::_loadAckQueue() {
     }
 
     // Accumulate CRC over this record
-    computedCRC = esp_crc32_le(computedCRC, recBuf, ACK_RECORD_SIZE);
+    computedCRC = esp_crc32_le(computedCRC, s_ackRecBuf, ACK_RECORD_SIZE);
 
     // Deserialize into RAM (will be discarded if CRC fails later)
-    if (!_deserializeAckRecord(recBuf, _ackQueue[i])) {
+    if (!_deserializeAckRecord(s_ackRecBuf, _ackQueue[i])) {
       Serial.printf("[Journal] _loadAckQueue: record %u parse failed — CORRUPTED\n", i);
       anyRecFailed = true;
       continue;
@@ -1810,17 +2083,17 @@ bool TransactionJournal::_persistAckQueue() {
   }
 
   // Write each record + accumulate CRC
+  // R5-C6: use static buffer instead of stack-allocated recBuf[1280].
   uint32_t crc = 0xFFFFFFFF;
   crc = esp_crc32_le(crc, hdr, ACK_QUEUE_HDR_SIZE);
 
-  uint8_t recBuf[ACK_RECORD_SIZE];
   for (uint8_t i = 0; i < _ackQueueCount; i++) {
-    _serializeAckRecord(_ackQueue[i], recBuf);
-    crc = esp_crc32_le(crc, recBuf, ACK_RECORD_SIZE);
+    _serializeAckRecord(_ackQueue[i], s_ackRecBuf);
+    crc = esp_crc32_le(crc, s_ackRecBuf, ACK_RECORD_SIZE);
 
     char key[20];
     snprintf(key, sizeof(key), "tj_ackq_rec_%u", i);
-    size_t recWritten = prefs.putBytes(key, recBuf, ACK_RECORD_SIZE);
+    size_t recWritten = prefs.putBytes(key, s_ackRecBuf, ACK_RECORD_SIZE);
     if (recWritten != ACK_RECORD_SIZE) {
       Serial.printf("[Journal] _persistAckQueue: record %u write short (%u != %u)\n",
                     i, (unsigned)recWritten, (unsigned)ACK_RECORD_SIZE);
@@ -1878,19 +2151,19 @@ uint32_t TransactionJournal::_computeAckQueueCRC() const {
   uint32_t crc = 0xFFFFFFFF;
   crc = esp_crc32_le(crc, hdr, ACK_QUEUE_HDR_SIZE);
 
-  uint8_t recBuf[ACK_RECORD_SIZE];
+  // R5-C6: use static buffer instead of stack-allocated recBuf[1280].
   for (uint8_t i = 0; i < _ackQueueCount; i++) {
-    const_cast<TransactionJournal*>(this)->_serializeAckRecord(_ackQueue[i], recBuf);
-    crc = esp_crc32_le(crc, recBuf, ACK_RECORD_SIZE);
+    const_cast<TransactionJournal*>(this)->_serializeAckRecord(_ackQueue[i], s_ackRecBuf);
+    crc = esp_crc32_le(crc, s_ackRecBuf, ACK_RECORD_SIZE);
   }
 
   return ~crc & 0xFFFFFFFF;
 }
 
 // =============================================================================
-// ACK RECORD serialize/deserialize (Rev26 I3 — fixed-size 256-byte records)
+// ACK RECORD serialize/deserialize (Rev26 I3 — fixed-size 1280-byte records)
 //
-//   Layout:
+//   Layout (R4-C8 doc fix — was incorrectly documented as 256-byte):
 //     [0..1]   ackMagic (0x41, 0x51)
 //     [2]      ackVersion (1)
 //     [3]      deliveryState
@@ -1902,7 +2175,7 @@ uint32_t TransactionJournal::_computeAckQueueCRC() const {
 //     [135..138] lastAttemptTs (uint32 LE)
 //     [139..140] ackLen (uint16 LE, 0..1024)
 //     [141..1164] ackJson (var, padded)
-//     [1165..255] padding (zeros)
+//     [1165..1279] padding (zeros, 115 bytes)
 // =============================================================================
 void TransactionJournal::_serializeAckRecord(const AckRecord& rec, uint8_t* buf) const {
   memset(buf, 0, ACK_RECORD_SIZE);
@@ -1937,6 +2210,11 @@ void TransactionJournal::_serializeAckRecord(const AckRecord& rec, uint8_t* buf)
 bool TransactionJournal::_deserializeAckRecord(const uint8_t* buf, AckRecord& outRec) const {
   if (buf[0] != ACK_MAGIC1 || buf[1] != ACK_MAGIC2) return false;
   if (buf[2] != ACK_VERSION) return false;
+
+  // R4-C4: Validate deliveryState is within the AckDeliveryState enum range.
+  // ACK_FAILED_EXHAUSTED (value 4) is the maximum defined state. Any value
+  // > 4 indicates corruption or future-schema drift — treat as parse failure.
+  if (buf[3] > (uint8_t)AckDeliveryState::ACK_FAILED_EXHAUSTED) return false;
 
   outRec.deliveryState = (AckDeliveryState)buf[3];
 
@@ -1986,31 +2264,33 @@ int8_t TransactionJournal::_findAckInQueue(const String& requestId) const {
 //   P2-1 CORRECTION PASS 3 (auditor P1-B): uses _observeSlot() (pure) +
 //   _applySlotDecision() (mutation) for clean separation. No mutation
 //   during observation.
+//
+//   P2-1 CORRECTION R4-C5 (auditor stack audit): previous version declared
+//   `SlotDecision decisions[JOURNAL_SIZE]` (64 × ~1.4KB ≈ 90KB stack frame)
+//   to collect all decisions during the observation phase, then iterated
+//   the array in the mutation phase. The ESP32 loop() task stack is 8KB by
+//   default — a 90KB stack allocation would silently corrupt memory or
+//   crash. The candidate-pattern fix here processes ONE slot at a time:
+//   observe → apply → next slot. The ObservationGuard is held only across
+//   _observeSlot(); _applySlotDecision() runs with the guard released.
 // =============================================================================
 void TransactionJournal::_loadFromNVS() {
   _journalSize = 0;
   _journalWriteIdx = 0;
 
-  SlotDecision decisions[JOURNAL_SIZE];
-  uint8_t decisionCount = 0;
-
-  // Phase 1: OBSERVATION — collect decisions via _observeSlot (pure).
-  {
-    ObservationGuard guard(_observing);
-    for (uint8_t i = 0; i < JOURNAL_SIZE; i++) {
-      _observeSlot(i, decisions[decisionCount]);
-      decisionCount++;
+  // R4-C5: Process slots one-at-a-time. Each SlotDecision is ~1.4KB on the
+  // stack frame (it embeds a JournalRecord), but only ONE instance exists at
+  // any time — peak stack usage is bounded to a single SlotDecision.
+  for (uint8_t i = 0; i < JOURNAL_SIZE; i++) {
+    SlotDecision dec;
+    {
+      ObservationGuard guard(_observing);
+      _observeSlot(i, dec);
     }
-  }
-  // ObservationGuard out of scope — _observing is now false.
-
-  // Phase 2: MUTATION — apply decisions. _assertMutationAllowed() passes
-  // because _observing == false. _applySlotDecision calls _repairSlot/
-  // _quarantineSlot/_writeCopy which all enforce the invariant.
-  for (uint8_t d = 0; d < decisionCount; d++) {
-    _applySlotDecision(decisions[d]);
-    if (decisions[d].durability == SlotDurability::SLOT_VALID &&
-        decisions[d].loadedRecord.recordState != RecordState::EMPTY) {
+    // ObservationGuard out of scope — _observing is now false.
+    _applySlotDecision(dec);
+    if (dec.durability == SlotDurability::SLOT_VALID &&
+        dec.loadedRecord.recordState != RecordState::EMPTY) {
       _journalSize++;
     }
   }
@@ -2083,5 +2363,53 @@ const char* TransactionJournal::_durabilityToString(SlotDurability d) {
   }
   return "?";
 }
+
+// =============================================================================
+// P2-1 SELF-AUDIT MATRIX (R4-C9)
+//
+//   13-function self-audit covering every mutation entry point in
+//   TransactionJournal. Each row records: (1) the candidate pattern is
+//   applied (RAM mutation deferred until NVS durable), (2) RAM rollback
+//   happens on _persistAckQueue failure (where applicable), (3) the
+//   observation/mutation mutex (I0a) is enforced, and (4) the
+//   executor-context check (I0) is enforced.
+//
+//   The matrix is the structural proof that the candidate-pattern fix
+//   (R4-C1) and ACK RAM-rollback fix (R4-C2) are consistently applied
+//   across every mutation entry point. The four columns:
+//     CAND  — Candidate pattern (write NVS first, commit RAM only on success)
+//     ROLL  — RAM rollback on persistence failure
+//     I0    — _assertExecutorContext() at entry
+//     I0a   — _assertMutationAllowed() before any mutation
+//
+//   | #  | Function                       | CAND | ROLL | I0  | I0a | Notes
+//   |----|--------------------------------|:----:|:----:|:---:|:---:|-----------------
+//   | 1  | storeIntent                    | no*  | n/a  | YES | YES | *initial write — no prior RAM state to preserve; both-copy write ordering gives candidate-equivalent durability (B fails → A newer, recovery loads A)
+//   | 2  | markExecuting                  | YES  | n/a  | YES | YES | R4-C1: candidate JournalRecord; RAM only updated after both copies durable
+//   | 3  | commitTransaction              | YES  | n/a  | YES | YES | R4-C1: candidate for EXECUTING→COMMITTED; R4-C2: queueAck rollback is internal to queueAck
+//   | 4  | commitTransactionFailed        | YES  | n/a  | YES | YES | R4-C1: candidate for EXECUTING→FAILED/OUTPUT_MISMATCH
+//   | 5  | clearEntry                     | no** | n/a  | YES | YES | **delegates to _clearSlotNVS which writes both copies before RAM clear; if either fails, RAM is preserved
+//   | 6  | recoverCorruptedEntry           | no** | n/a  | YES | YES | **delegates to recoverCorruptedSlot
+//   | 7  | recoverCorruptedSlot           | no** | n/a  | YES | YES | **writes EMPTY(gen=0) to both copies; if either fails, RAM is preserved
+//   | 8  | reconcileEntry                 | YES  | n/a  | YES | YES | R5-C1: candidate pattern — recordState UNKNOWN written to both copies before RAM commit
+//   | 9  | reconcilePendingEntries        | no** | n/a  | YES | YES | **2-phase: collects SlotDecisions under ObservationGuard, then applies mutations; per-slot write-failure does not roll back prior successes (best-effort)
+//   | 10 | queueAck                       | n/a  | YES  | YES | YES | R4-C2: snapshot AckRecord + count before mutation; restore on _persistAckQueue failure
+//   | 11 | dequeueAck                     | n/a  | YES  | YES | YES | R4-C2: snapshot _ackQueue[0..7] + count before shift; restore on _persistAckQueue failure
+//   | 12 | updateAckDeliveryState         | n/a  | YES  | YES | YES | R4-C2: snapshot old deliveryState; restore on _persistAckQueue failure
+//   | 13 | processPendingAcks             | n/a  | no***| YES | YES | ***best-effort: no rollback (re-publishing would create duplicates); failure logged, retry state may be lost on reboot
+//
+//   Notes legend:
+//     no*   — initial write (no prior RAM state to preserve); dual-copy write
+//             ordering gives equivalent durability guarantees.
+//     no**  — delegates to a helper that writes both copies before clearing RAM;
+//             partial failure leaves RAM at the pre-call state.
+//     no*** — best-effort policy (documented inline); rollback would cause
+//             duplicate ACK delivery, which is a worse failure mode than
+//             retry-count loss.
+//
+//   This matrix is structural documentation; it is not enforced at runtime.
+//   Auditors should re-verify each row when reviewing future changes to
+//   any function listed above.
+// =============================================================================
 
 } // namespace Services
