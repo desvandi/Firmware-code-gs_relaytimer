@@ -4,6 +4,12 @@
 // P0 #10 (audit round 9): CORS origin now configurable via Config::ALLOWED_CORS_ORIGINS.
 // Default: "*" (any origin — development only).
 // Production: set to PWA's Vercel URL, e.g., "https://remote-relay.vercel.app".
+//
+// PD-001 (Phase 6): Added REST transaction helpers (beginTransaction /
+//   commitTransaction / replayDuplicate / rejectConflict) so REST handlers
+//   share the SAME canonicalization + dedup path as MQTT. This closes the
+//   REST/MQTT asymmetry where REST previously had no transaction identity,
+//   no command hash, and no journal integration.
 // =============================================================================
 #pragma once
 #ifndef TIMER12_WEB_HANDLERS_COMMON_H
@@ -11,9 +17,13 @@
 
 #include <Arduino.h>
 #include <WebServer.h>
+#include <ArduinoJson.h>
 #include "AuthManager.h"
 #include "HttpServer.h"
 #include "Config.h"
+#include "CommandCanonicalizer.h"
+#include "TransactionJournal.h"
+#include "LogService.h"
 
 namespace Web {
 
@@ -105,6 +115,105 @@ inline bool requireBody(size_t maxSize) {
     }
   }
   return true;
+}
+
+// ===========================================================================
+// PD-001 (Phase 6): REST transaction helpers.
+//
+// These helpers wire REST ingress into the SAME canonical command model used
+// by MQTT. Each REST mutation handler should:
+//
+//   1. Parse JSON body into a JsonDocument.
+//   2. Mutate the doc to add the canonical (type, action) pair corresponding
+//      to the REST endpoint (REST endpoints do NOT carry "type"/"action" in
+//      their JSON body — they're implied by the URL + method).
+//   3. Call beginTransaction(doc) — this validates transactionId, computes
+//      the canonical hash, and checks the journal.
+//   4. If decision == CONFLICT  → call rejectConflict() and return.
+//   5. If decision == DUPLICATE → call replayDuplicate() and return.
+//   6. If decision == NEW       → execute the mutation, then call
+//      commitTransaction() with the success ACK JSON.
+//
+// Per directive §16 / AC-009 / AC-010 / AC-011:
+//   - DUPLICATE: replay original ACK, NO re-execution, NO journal overwrite.
+//   - CONFLICT:  REJECT, NO mutation, NO journal overwrite.
+//   - NEW:       execute, then store {requestId, commandHash, ackJson} in
+//                journal (durable layer owned by TransactionJournal/PD-002).
+// ===========================================================================
+
+struct RestTransaction {
+  bool ok;                                  // false if validation/canonicalization failed
+  String transactionId;                     // validated transactionId
+  String commandHash;                       // canonical SHA-256 hex
+  Services::TransactionDecision decision;   // NEW / DUPLICATE / CONFLICT
+  String previousAckJson;                   // populated if DUPLICATE
+  String errorMessage;                      // populated if !ok
+};
+
+// Begin a REST transaction: validate + canonicalize + hash + journal lookup.
+// This does NOT execute any mutation and does NOT modify the journal.
+//
+// doc IN/OUT: the parsed JSON body. The caller should set doc["type"] and
+//   doc["action"] BEFORE calling this helper (REST endpoints imply a fixed
+//   type/action pair that is not present in the wire JSON).
+inline RestTransaction beginTransaction(JsonDocument& doc) {
+  RestTransaction r;
+  r.ok = false;
+  r.decision = Services::TransactionDecision::NEW;
+
+  Services::CanonicalResult canon = Services::CommandCanonicalizer::canonicalizeAndHash(doc);
+  if (!canon.ok) {
+    r.errorMessage = canon.errorMessage;
+    return r;
+  }
+  r.transactionId = canon.transactionId;
+  r.commandHash = canon.commandHash;
+
+  Services::DecisionResult d =
+      Services::CommandCanonicalizer::decideTransaction(r.transactionId, r.commandHash);
+  r.decision = d.decision;
+  r.previousAckJson = d.previousAckJson;
+  r.ok = true;
+  return r;
+}
+
+// Commit a REST transaction AFTER successful mutation.
+// Stores {requestId, commandHash, ackJson} in the journal.
+//
+// ackJson: the success ACK JSON that would be sent to the client. This is
+//   stored so that a future DUPLICATE request can replay the EXACT same ACK.
+//
+// Returns true if stored successfully. If storage fails (NVS write error),
+// the mutation has already happened — caller should still send the success
+// response. The journal will miss this entry, so a retry may re-execute
+// (safe for idempotent commands per existing durability documentation).
+inline bool commitTransaction(const String& transactionId,
+                              const String& commandHash,
+                              const String& ackJson) {
+  return Services::journal.storeTransaction(transactionId, commandHash, ackJson);
+}
+
+// Send a 409 Conflict response for a CONFLICT decision.
+// Per directive §16 / AC-010 / AC-011: NO mutation, NO journal overwrite.
+inline void rejectConflict(const RestTransaction& tx) {
+  Services::Log.append(Core::LogType::AuthFail,
+    "SECURITY: requestId reuse with different command (REST): " + tx.transactionId, 0);
+  sendError(409, "requestId reuse with different command — rejected");
+}
+
+// Replay the original ACK for a DUPLICATE decision.
+// Per directive §16 / AC-009: NO re-execution, NO journal overwrite.
+inline void replayDuplicate(const RestTransaction& tx) {
+  Serial.printf("[REST] Duplicate command detected: %s — replaying original ACK\n",
+                tx.transactionId.c_str());
+  if (tx.previousAckJson.length() > 0) {
+    // Replay the EXACT original ACK bytes (including its own success/data fields).
+    sendSecurityHeaders();
+    Web::http.send(200, "application/json; charset=utf-8", tx.previousAckJson);
+  } else {
+    // Journal entry exists but ACK JSON is empty — shouldn't happen.
+    sendSuccess("Duplicate command (already executed)");
+  }
 }
 
 } // namespace Web

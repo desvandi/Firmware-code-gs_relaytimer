@@ -1,6 +1,10 @@
 // =============================================================================
 // Web/Handlers/TimeHandlers.h — /api/time
 // =============================================================================
+// PD-001 (Phase 6): REST ingress now uses the SHARED CommandCanonicalizer +
+//   TransactionJournal path. Canonical mapping:
+//     POST /api/time  →  type="time", action="set"
+// =============================================================================
 #pragma once
 #ifndef TIMER12_WEB_HANDLERS_TIME_H
 #define TIMER12_WEB_HANDLERS_TIME_H
@@ -15,7 +19,7 @@
 
 namespace Web { namespace Handlers {
 
-// POST /api/time { datetime: "YYYY-MM-DDTHH:MM:SS" }
+// POST /api/time { datetime: "YYYY-MM-DDTHH:MM:SS", requestId }
 inline void handleSetTime() {
   if (!requireAuth()) return;
   if (!requireCsrf()) return;
@@ -40,8 +44,43 @@ inline void handleSetTime() {
     sendError(400, "Invalid date/time components");
     return;
   }
+
+  // --- PD-001: Canonical command model integration ---
+  doc["type"] = "time";
+  doc["action"] = "set";
+
+  RestTransaction tx = beginTransaction(doc);
+  if (!tx.ok) {
+    sendError(400, tx.errorMessage);
+    return;
+  }
+  if (tx.decision == Services::TransactionDecision::CONFLICT) {
+    rejectConflict(tx);
+    return;
+  }
+  if (tx.decision == Services::TransactionDecision::DUPLICATE) {
+    replayDuplicate(tx);
+    return;
+  }
+
+  // --- NEW: Execute ---
   Drivers::rtc.adjust(y, m, d, h, mi, s);
-  sendSuccess("RTC time synced", "{\"synced\":true}");
+
+  // --- Build success ACK JSON ---
+  String data = "{\"synced\":true,\"requestId\":\"";
+  data += tx.transactionId;
+  data += "\",\"commandHash\":\"";
+  data += tx.commandHash;
+  data += "\"}";
+
+  String ackJson = "{\"success\":true,\"message\":\"RTC time synced\",\"data\":";
+  ackJson += data;
+  ackJson += "}";
+
+  commitTransaction(tx.transactionId, tx.commandHash, ackJson);
+
+  sendSecurityHeaders();
+  Web::http.send(200, "application/json; charset=utf-8", ackJson);
 }
 
 }} // namespace Web::Handlers

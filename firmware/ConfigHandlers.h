@@ -88,7 +88,10 @@ inline void handleSetConfig() {
   sendSuccess("Config saved. Please log in again with the new credentials.");
 }
 
-// POST /api/config/device { deviceName?, timezone? }
+// POST /api/config/device { deviceName?, timezone?, requestId }
+// PD-001 (Phase 6): REST ingress now uses the SHARED CommandCanonicalizer +
+//   TransactionJournal path. Canonical mapping:
+//     POST /api/config/device  →  type="config", action="setDevice"
 inline void handleSetDeviceConfig() {
   if (!requireAuth()) return;
   if (!requireCsrf()) return;
@@ -106,11 +109,44 @@ inline void handleSetDeviceConfig() {
   if (doc.containsKey("deviceName")) {
     const char* dn = doc["deviceName"];
     if (dn && strlen(dn) > 0 && strlen(dn) <= 32) {
-      strncpy(Core::deviceName, dn, 32);
-      Core::deviceName[32] = '\0';
+      // valid — will be applied below
     } else {
       sendError(400, "Device name must be 1-32 chars");
       return;
+    }
+  }
+  if (doc.containsKey("timezone")) {
+    const char* tz = doc["timezone"];
+    if (tz && strlen(tz) >= 40) {
+      sendError(400, "Timezone too long (max 39 chars)");
+      return;
+    }
+  }
+
+  // --- PD-001: Canonical command model integration ---
+  doc["type"] = "config";
+  doc["action"] = "setDevice";
+
+  RestTransaction tx = beginTransaction(doc);
+  if (!tx.ok) {
+    sendError(400, tx.errorMessage);
+    return;
+  }
+  if (tx.decision == Services::TransactionDecision::CONFLICT) {
+    rejectConflict(tx);
+    return;
+  }
+  if (tx.decision == Services::TransactionDecision::DUPLICATE) {
+    replayDuplicate(tx);
+    return;
+  }
+
+  // --- NEW: Execute ---
+  if (doc.containsKey("deviceName")) {
+    const char* dn = doc["deviceName"];
+    if (dn && strlen(dn) > 0 && strlen(dn) <= 32) {
+      strncpy(Core::deviceName, dn, 32);
+      Core::deviceName[32] = '\0';
     }
   }
   if (doc.containsKey("timezone")) {
@@ -121,12 +157,26 @@ inline void handleSetDeviceConfig() {
     }
   }
   Storage::config.saveDeviceConfig();
+
+  // --- Build success ACK JSON ---
   String data = "{\"updated\":true,\"deviceName\":\"";
   data += Core::deviceName;
   data += "\",\"timezone\":\"";
   data += Core::timezone;
+  data += "\",\"requestId\":\"";
+  data += tx.transactionId;
+  data += "\",\"commandHash\":\"";
+  data += tx.commandHash;
   data += "\"}";
-  sendSuccess("Device config updated", data);
+
+  String ackJson = "{\"success\":true,\"message\":\"Device config updated\",\"data\":";
+  ackJson += data;
+  ackJson += "}";
+
+  commitTransaction(tx.transactionId, tx.commandHash, ackJson);
+
+  sendSecurityHeaders();
+  Web::http.send(200, "application/json; charset=utf-8", ackJson);
 }
 
 // POST /api/config/password { current, next }

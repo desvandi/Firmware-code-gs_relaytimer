@@ -7,6 +7,13 @@
 //   never registered /api/channel → PWA LAN REST mode got 404. MQTT mode
 //   worked because MqttClient.cpp handles type="channel" action="rename".
 //   This file adds the missing REST endpoint so both modes are consistent.
+//
+// PD-001 (Phase 6): REST ingress now uses the SHARED CommandCanonicalizer +
+//   TransactionJournal path. Canonical mapping:
+//     POST /api/channel  →  type="channel", action="rename"
+//   Cross-transport hash equivalence: a channel rename via REST produces the
+//   SAME commandHash as the equivalent MQTT command (AC-001/AC-018).
+// =============================================================================
 #pragma once
 #ifndef TIMER12_WEB_HANDLERS_CHANNEL_H
 #define TIMER12_WEB_HANDLERS_CHANNEL_H
@@ -21,7 +28,7 @@
 
 namespace Web { namespace Handlers {
 
-// POST /api/channel { channelId, name }
+// POST /api/channel { channelId, name, requestId }
 //   Renames a relay channel (1-12). Name max 20 chars (MAX_NAME_LEN).
 //   Persists to schedule.json via ConfigStore.
 inline void handleChannelRename() {
@@ -51,6 +58,25 @@ inline void handleChannelRename() {
     return;
   }
 
+  // --- PD-001: Canonical command model integration ---
+  doc["type"] = "channel";
+  doc["action"] = "rename";
+
+  RestTransaction tx = beginTransaction(doc);
+  if (!tx.ok) {
+    sendError(400, tx.errorMessage);
+    return;
+  }
+  if (tx.decision == Services::TransactionDecision::CONFLICT) {
+    rejectConflict(tx);
+    return;
+  }
+  if (tx.decision == Services::TransactionDecision::DUPLICATE) {
+    replayDuplicate(tx);
+    return;
+  }
+
+  // --- NEW: Execute ---
   uint8_t idx = channelId - 1;
   strncpy(Core::channels[idx].name, newName.c_str(), Core::MAX_NAME_LEN);
   Core::channels[idx].name[Core::MAX_NAME_LEN] = '\0';
@@ -59,12 +85,25 @@ inline void handleChannelRename() {
   Services::Log.append(Core::LogType::ConfigChange,
     "CH" + String(channelId) + " renamed via REST: " + newName, channelId);
 
+  // --- Build success ACK JSON ---
   String data = "{\"channel\":{\"id\":";
   data += String(channelId);
   data += ",\"name\":\"";
   data += Core::channels[idx].name;
-  data += "\"}}";
-  sendSuccess("Channel renamed", data);
+  data += "\"},\"requestId\":\"";
+  data += tx.transactionId;
+  data += "\",\"commandHash\":\"";
+  data += tx.commandHash;
+  data += "\"}";
+
+  String ackJson = "{\"success\":true,\"message\":\"Channel renamed\",\"data\":";
+  ackJson += data;
+  ackJson += "}";
+
+  commitTransaction(tx.transactionId, tx.commandHash, ackJson);
+
+  sendSecurityHeaders();
+  Web::http.send(200, "application/json; charset=utf-8", ackJson);
 }
 
 }} // namespace Web::Handlers

@@ -1,6 +1,18 @@
 // =============================================================================
 // Web/Handlers/ScheduleHandlers.h — /api/schedule POST/DELETE
 // =============================================================================
+// PD-001 (Phase 6): REST ingress now uses the SHARED CommandCanonicalizer +
+//   TransactionJournal path. Canonical mappings:
+//     POST   /api/schedule       →  type="schedule", action="upsert"
+//     DELETE /api/schedule?id=..  →  type="schedule", action="delete"
+//   Cross-transport hash equivalence: same logical schedule mutation via REST
+//   or MQTT produces the SAME commandHash (AC-001/AC-018).
+//
+//   For DELETE, the canonical payload is {channelId, id} where id is the
+//   1-based schedule index within the channel (matches MQTT semantics).
+//   Composite/legacy ID formats are resolved to (channelId, id-within-channel)
+//   BEFORE hashing so the hash is transport-independent.
+// =============================================================================
 #pragma once
 #ifndef TIMER12_WEB_HANDLERS_SCHEDULE_H
 #define TIMER12_WEB_HANDLERS_SCHEDULE_H
@@ -17,7 +29,7 @@
 
 namespace Web { namespace Handlers {
 
-// POST /api/schedule { channelId, onTime, offTime, dayMask, enabled, id? }
+// POST /api/schedule { channelId, onTime, offTime, dayMask, enabled, id?, requestId }
 inline void handleScheduleUpsert() {
   if (!requireAuth()) return;
   if (!requireCsrf()) return;
@@ -57,7 +69,28 @@ inline void handleScheduleUpsert() {
   bool enabled = doc["enabled"] | true;
   int schedId = doc["id"] | 0;
 
-  if (schedId > 0 && schedId <= Core::channels[idx].schedCount) {
+  // --- PD-001: Canonical command model integration ---
+  // REST endpoint implies (type="schedule", action="upsert").
+  doc["type"] = "schedule";
+  doc["action"] = "upsert";
+
+  RestTransaction tx = beginTransaction(doc);
+  if (!tx.ok) {
+    sendError(400, tx.errorMessage);
+    return;
+  }
+  if (tx.decision == Services::TransactionDecision::CONFLICT) {
+    rejectConflict(tx);
+    return;
+  }
+  if (tx.decision == Services::TransactionDecision::DUPLICATE) {
+    replayDuplicate(tx);
+    return;
+  }
+
+  // --- NEW: Execute ---
+  int savedId = 0;
+  if (schedId > 0 && schedId <= (int)Core::channels[idx].schedCount) {
     // Update existing
     uint8_t sIdx = schedId - 1;
     strncpy(Core::channels[idx].sched[sIdx].onTime, onTime, 5);
@@ -68,6 +101,7 @@ inline void handleScheduleUpsert() {
     Core::channels[idx].sched[sIdx].offMin = offMin;
     Core::channels[idx].sched[sIdx].dayMask = dayMask;
     Core::channels[idx].sched[sIdx].enabled = enabled;
+    savedId = schedId;
   } else {
     // Add new
     if (Core::channels[idx].schedCount >= Core::MAX_SCHEDULES) {
@@ -84,16 +118,27 @@ inline void handleScheduleUpsert() {
     Core::channels[idx].sched[sIdx].dayMask = dayMask;
     Core::channels[idx].sched[sIdx].enabled = enabled;
     Core::channels[idx].schedCount++;
+    savedId = sIdx + 1;
   }
   Storage::config.markDirty();
   Services::relayEngine.forceRefresh();
 
-  char data[256];
+  // --- Build success ACK JSON ---
+  char data[384];
   snprintf(data, sizeof(data),
-           "{\"schedule\":{\"id\":%d,\"channelId\":%d,\"onTime\":\"%s\",\"offTime\":\"%s\",\"dayMask\":%d,\"enabled\":%s}}",
-           schedId > 0 ? schedId : (int)Core::channels[idx].schedCount,
-           channelId, onTime, offTime, dayMask, enabled ? "true" : "false");
-  sendSuccess("Schedule saved", data);
+           "{\"schedule\":{\"id\":%d,\"channelId\":%d,\"onTime\":\"%s\",\"offTime\":\"%s\",\"dayMask\":%d,\"enabled\":%s},"
+           "\"requestId\":\"%s\",\"commandHash\":\"%s\"}",
+           savedId, channelId, onTime, offTime, dayMask, enabled ? "true" : "false",
+           tx.transactionId.c_str(), tx.commandHash.c_str());
+
+  String ackJson = "{\"success\":true,\"message\":\"Schedule saved\",\"data\":";
+  ackJson += data;
+  ackJson += "}";
+
+  commitTransaction(tx.transactionId, tx.commandHash, ackJson);
+
+  sendSecurityHeaders();
+  Web::http.send(200, "application/json; charset=utf-8", ackJson);
 }
 
 // DELETE /api/schedule?id=N&channelId=C  OR  DELETE /api/schedule?id=N
@@ -112,6 +157,11 @@ inline void handleScheduleUpsert() {
 //   Preferred usage: pass channelId explicitly.
 //     DELETE /api/schedule?channelId=3&id=2   (deletes channel 3 schedule index 2)
 //     DELETE /api/schedule?id=32               (composite: channel 3 schedule 2)
+//
+// PD-001 (Phase 6): For canonical hash determinism, the resolved
+//   (channelId, id-within-channel) is what gets hashed — NOT the raw query
+//   string. This ensures a DELETE via REST with `?channelId=3&id=2` produces
+//   the SAME commandHash as an MQTT `type=schedule action=delete channelId=3 id=2`.
 inline void handleScheduleDelete() {
   if (!requireAuth()) return;
   if (!requireCsrf()) return;
@@ -176,6 +226,34 @@ inline void handleScheduleDelete() {
     return;
   }
 
+  // --- PD-001: Build canonical command doc ---
+  // The canonical payload is {channelId, id} where id is 1-based index within
+  // channel (matches MQTT semantics). requestId comes from query string.
+  DynamicJsonDocument doc(256);
+  doc["type"] = "schedule";
+  doc["action"] = "delete";
+  doc["channelId"] = (int)(targetChannel + 1);
+  doc["id"] = (int)(targetSchedIdx + 1);
+  String rid = Web::http.arg("requestId");
+  if (rid.length() > 0) {
+    doc["requestId"] = rid;
+  }
+
+  RestTransaction tx = beginTransaction(doc);
+  if (!tx.ok) {
+    sendError(400, tx.errorMessage);
+    return;
+  }
+  if (tx.decision == Services::TransactionDecision::CONFLICT) {
+    rejectConflict(tx);
+    return;
+  }
+  if (tx.decision == Services::TransactionDecision::DUPLICATE) {
+    replayDuplicate(tx);
+    return;
+  }
+
+  // --- NEW: Execute ---
   // Shift down
   for (uint8_t j = targetSchedIdx; j < Core::channels[targetChannel].schedCount - 1; j++) {
     Core::channels[targetChannel].sched[j] = Core::channels[targetChannel].sched[j + 1];
@@ -190,11 +268,22 @@ inline void handleScheduleDelete() {
     "Schedule deleted via REST: CH" + String(channelId) + " idx=" + String(scheduleId),
     channelId);
 
-  char data[128];
+  // --- Build success ACK JSON ---
+  char data[256];
   snprintf(data, sizeof(data),
-           "{\"deleted\":true,\"channelId\":%d,\"scheduleId\":%d}",
-           channelId, scheduleId);
-  sendSuccess("Schedule deleted", data);
+           "{\"deleted\":true,\"channelId\":%d,\"scheduleId\":%d,"
+           "\"requestId\":\"%s\",\"commandHash\":\"%s\"}",
+           channelId, scheduleId,
+           tx.transactionId.c_str(), tx.commandHash.c_str());
+
+  String ackJson = "{\"success\":true,\"message\":\"Schedule deleted\",\"data\":";
+  ackJson += data;
+  ackJson += "}";
+
+  commitTransaction(tx.transactionId, tx.commandHash, ackJson);
+
+  sendSecurityHeaders();
+  Web::http.send(200, "application/json; charset=utf-8", ackJson);
 }
 
 }} // namespace Web::Handlers
