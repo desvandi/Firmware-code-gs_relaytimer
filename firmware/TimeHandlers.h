@@ -46,10 +46,14 @@ inline void handleSetTime() {
   }
 
   // --- PD-001: Canonical command model integration ---
+  // transactionId is OPTIONAL for /api/time (PWA does not yet send requestId
+  // for this endpoint as of P2-2 reconciliation). When absent, the command
+  // proceeds without journal integration (pre-PD-001 behavior). When present
+  // (future PWA update / PD-007), full journal integration applies.
   doc["type"] = "time";
   doc["action"] = "set";
 
-  RestTransaction tx = beginTransaction(doc);
+  RestTransaction tx = beginTransaction(doc, /*transactionIdRequired=*/false);
   if (!tx.ok) {
     sendError(400, tx.errorMessage);
     return;
@@ -67,11 +71,17 @@ inline void handleSetTime() {
   Drivers::rtc.adjust(y, m, d, h, mi, s);
 
   // --- Build success ACK JSON ---
-  String data = "{\"synced\":true,\"requestId\":\"";
-  data += tx.transactionId;
-  data += "\",\"commandHash\":\"";
-  data += tx.commandHash;
-  data += "\"}";
+  // Include requestId/commandHash only when present (backward compat with
+  // PWA builds that do not send requestId for /api/time).
+  String data = "{\"synced\":true";
+  if (tx.transactionId.length() > 0) {
+    data += ",\"requestId\":\"";
+    data += tx.transactionId;
+    data += "\",\"commandHash\":\"";
+    data += tx.commandHash;
+    data += "\"";
+  }
+  data += "}";
 
   String ackJson = "{\"success\":true,\"message\":\"RTC time synced\",\"data\":";
   ackJson += data;

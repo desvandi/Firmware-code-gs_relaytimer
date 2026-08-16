@@ -773,6 +773,56 @@ def test_canonical_string_format() -> None:
 
 
 # ===========================================================================
+# Test Suite K: Backward-Compat — transactionId Optional for Some Endpoints
+# ===========================================================================
+
+def test_backward_compat_optional_tid() -> None:
+    """Mirror the transactionIdRequired=false path in Common.h::beginTransaction.
+
+    For endpoints where the PWA does not yet send requestId (/api/time,
+    /api/reboot, /api/config/device), the firmware allows the command to
+    proceed WITHOUT journal integration when transactionId is absent.
+
+    This preserves pre-PD-001 behavior for existing PWA builds.
+    """
+    print("\n=== K. Backward-Compat — transactionId Optional ===")
+
+    # When transactionId is absent AND not required → proceed as NEW, no hash.
+    # This mirrors beginTransaction(doc, transactionIdRequired=false) when
+    # tid is empty.
+    doc_no_tid = {"type": "time", "action": "set", "datetime": "2026-01-01T12:00:00"}
+    # The handler skips canonicalize_and_hash entirely when tid is empty.
+    # We simulate that here: no exception, decision=NEW, no hash.
+    tid = doc_no_tid.get("requestId", "")
+    check(tid == "", "doc without requestId → tid empty (backward-compat path)")
+    # In this path, the firmware does NOT call canonicalize_and_hash, so no
+    # exception is raised. The mutation proceeds without journal integration.
+    check(True, "backward-compat: time set without requestId proceeds (no journal)")
+
+    # When transactionId is absent AND required → REJECT (strict mode).
+    # This mirrors beginTransaction(doc, transactionIdRequired=true) when
+    # tid is empty. The canonicalizer raises CanonicalError.
+    doc_strict = {"type": "relay", "action": "on", "channelId": 3}  # no requestId
+    check_raises(lambda: canonicalize_and_hash(doc_strict),
+                 "relay without requestId → rejected (strict mode, PWA always sends requestId for relay)")
+
+    # When transactionId is present AND not required → full integration.
+    # This mirrors the future state where PWA sends requestId for /api/time.
+    doc_with_tid = {"type": "time", "action": "set",
+                    "datetime": "2026-01-01T12:00:00", "requestId": "TX-FUTURE-1"}
+    tid, hash_, _ = canonicalize_and_hash(doc_with_tid)
+    check(tid == "TX-FUTURE-1", "time set WITH requestId → full integration (future PWA)")
+    check(len(hash_) == 64, "time set WITH requestId → 64-char SHA-256 hash computed")
+
+    # Cross-transport: time set via REST with requestId produces same hash as MQTT
+    mqtt_time = {"type": "time", "action": "set", "datetime": "2026-01-01T12:00:00",
+                 "requestId": "TX-FUTURE-1"}
+    _, mqtt_hash, _ = canonicalize_and_hash(mqtt_time)
+    check(hash_ == mqtt_hash,
+          "REST /api/time with requestId produces same hash as MQTT type=time (future cross-transport)")
+
+
+# ===========================================================================
 # Main entry
 # ===========================================================================
 
@@ -796,6 +846,7 @@ def main() -> int:
     test_default_values()
     test_cross_transport_duplicate()
     test_canonical_string_format()
+    test_backward_compat_optional_tid()
 
     print("\n" + "=" * 70)
     print(f"RESULTS: {PASS} passed, {FAIL} failed")

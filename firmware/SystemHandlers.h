@@ -42,10 +42,14 @@ inline void handleReboot() {
   }
 
   // --- PD-001: Canonical command model integration ---
+  // transactionId is OPTIONAL for /api/reboot (PWA does not yet send requestId
+  // for this endpoint as of P2-2 reconciliation). When absent, the command
+  // proceeds without journal integration (pre-PD-001 behavior). When present
+  // (future PWA update / PD-007), full journal integration applies.
   doc["type"] = "system";
   doc["action"] = "reboot";
 
-  RestTransaction tx = beginTransaction(doc);
+  RestTransaction tx = beginTransaction(doc, /*transactionIdRequired=*/false);
   if (!tx.ok) {
     sendError(400, tx.errorMessage);
     return;
@@ -60,11 +64,16 @@ inline void handleReboot() {
   }
 
   // --- Build success ACK JSON (sent BEFORE reboot) ---
-  String data = "{\"rebooting\":true,\"requestId\":\"";
-  data += tx.transactionId;
-  data += "\",\"commandHash\":\"";
-  data += tx.commandHash;
-  data += "\"}";
+  // Include requestId/commandHash only when present.
+  String data = "{\"rebooting\":true";
+  if (tx.transactionId.length() > 0) {
+    data += ",\"requestId\":\"";
+    data += tx.transactionId;
+    data += "\",\"commandHash\":\"";
+    data += tx.commandHash;
+    data += "\"";
+  }
+  data += "}";
 
   String ackJson = "{\"success\":true,\"message\":\"System rebooting\",\"data\":";
   ackJson += data;
@@ -73,7 +82,7 @@ inline void handleReboot() {
   // --- Commit to journal BEFORE sending response / rebooting ---
   // This ensures the transaction is durable even if reboot interrupts
   // the HTTP response. A duplicate reboot request after restart will be
-  // detected as DUPLICATE and replayed.
+  // detected as DUPLICATE and replayed. (No-op if transactionId is empty.)
   commitTransaction(tx.transactionId, tx.commandHash, ackJson);
 
   // --- Send response ---

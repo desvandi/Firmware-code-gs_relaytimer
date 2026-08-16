@@ -124,10 +124,13 @@ inline void handleSetDeviceConfig() {
   }
 
   // --- PD-001: Canonical command model integration ---
+  // transactionId is OPTIONAL for /api/config/device (PWA does not yet send
+  // requestId for this endpoint as of P2-2 reconciliation). When absent, the
+  // command proceeds without journal integration (pre-PD-001 behavior).
   doc["type"] = "config";
   doc["action"] = "setDevice";
 
-  RestTransaction tx = beginTransaction(doc);
+  RestTransaction tx = beginTransaction(doc, /*transactionIdRequired=*/false);
   if (!tx.ok) {
     sendError(400, tx.errorMessage);
     return;
@@ -159,15 +162,20 @@ inline void handleSetDeviceConfig() {
   Storage::config.saveDeviceConfig();
 
   // --- Build success ACK JSON ---
+  // Include requestId/commandHash only when present.
   String data = "{\"updated\":true,\"deviceName\":\"";
   data += Core::deviceName;
   data += "\",\"timezone\":\"";
   data += Core::timezone;
-  data += "\",\"requestId\":\"";
-  data += tx.transactionId;
-  data += "\",\"commandHash\":\"";
-  data += tx.commandHash;
-  data += "\"}";
+  data += "\"";
+  if (tx.transactionId.length() > 0) {
+    data += ",\"requestId\":\"";
+    data += tx.transactionId;
+    data += "\",\"commandHash\":\"";
+    data += tx.commandHash;
+    data += "\"";
+  }
+  data += "}";
 
   String ackJson = "{\"success\":true,\"message\":\"Device config updated\",\"data\":";
   ackJson += data;

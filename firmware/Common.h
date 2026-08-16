@@ -156,10 +156,48 @@ struct RestTransaction {
 // doc IN/OUT: the parsed JSON body. The caller should set doc["type"] and
 //   doc["action"] BEFORE calling this helper (REST endpoints imply a fixed
 //   type/action pair that is not present in the wire JSON).
-inline RestTransaction beginTransaction(JsonDocument& doc) {
+//
+// TRANSACTION_ID_REQUIRED:
+//   If true (default), transactionId MUST be present and valid — missing/
+//   invalid → ok=false with errorMessage. This is the strict mode for
+//   endpoints where the PWA already sends requestId (relay, channel,
+//   schedule, pir).
+//
+//   If false, transactionId is OPTIONAL — if absent, the transaction is
+//   allowed to proceed WITHOUT journal integration (decision=NEW, but
+//   no hash computed, no journal lookup, no commit). This preserves
+//   backward compatibility for endpoints where the PWA does not yet send
+//   requestId (time, reboot, config/device). When the PWA is updated to
+//   send requestId for these endpoints (PD-007), they will automatically
+//   gain journal integration without further firmware changes.
+inline RestTransaction beginTransaction(JsonDocument& doc,
+                                        bool transactionIdRequired = true) {
   RestTransaction r;
   r.ok = false;
   r.decision = Services::TransactionDecision::NEW;
+
+  // Extract transactionId (requestId compatibility).
+  String tid = doc["requestId"] | "";
+  String tidAlt = doc["transactionId"] | "";
+  if (tid.length() == 0 && tidAlt.length() > 0) {
+    tid = tidAlt;
+  } else if (tid.length() > 0 && tidAlt.length() > 0 && tid != tidAlt) {
+    r.errorMessage = "requestId and transactionId both present but differ";
+    return r;
+  }
+
+  // Backward-compat path: transactionId not required and not provided.
+  // Skip canonicalization + journal integration entirely. The command
+  // proceeds as a non-journaled mutation (pre-PD-001 behavior).
+  if (!transactionIdRequired && tid.length() == 0) {
+    r.ok = true;
+    r.transactionId = "";
+    r.commandHash = "";
+    r.decision = Services::TransactionDecision::NEW;
+    r.previousAckJson = "";
+    r.errorMessage = "";
+    return r;
+  }
 
   Services::CanonicalResult canon = Services::CommandCanonicalizer::canonicalizeAndHash(doc);
   if (!canon.ok) {
@@ -187,9 +225,18 @@ inline RestTransaction beginTransaction(JsonDocument& doc) {
 // the mutation has already happened — caller should still send the success
 // response. The journal will miss this entry, so a retry may re-execute
 // (safe for idempotent commands per existing durability documentation).
+//
+// If transactionId or commandHash is empty (backward-compat path where
+// client did not send requestId), this is a NO-OP — the mutation proceeds
+// without journal integration. This preserves pre-PD-001 behavior for
+// endpoints where the PWA does not yet send requestId.
 inline bool commitTransaction(const String& transactionId,
                               const String& commandHash,
                               const String& ackJson) {
+  if (transactionId.length() == 0 || commandHash.length() == 0) {
+    // Backward-compat: no transactionId → no journal integration.
+    return false;
+  }
   return Services::journal.storeTransaction(transactionId, commandHash, ackJson);
 }
 
