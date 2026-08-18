@@ -17,13 +17,14 @@
 #include "OtaManager.h"
 #include "Config.h"
 #include "Globals.h"
+#include "BatteryStatusSerializer.h"  // v4.1 — extends /api/status with battery/powerFlow/environment
 
 namespace Web { namespace Handlers {
 
 // GET /api/status → SystemStatus (PWA contract)
 inline void handleStatus() {
   if (!requireAuth()) return;
-  DynamicJsonDocument doc(8192);
+  DynamicJsonDocument doc(10240);  // v4.1: increased from 8192 to fit battery/powerFlow/environment blocks
   JsonObject data = doc.createNestedObject("data");
 
   // Device info
@@ -102,6 +103,13 @@ inline void handleStatus() {
   for (uint8_t i = 0; i < Core::NUM_PIR; i++) pirToday += Core::pirState[i].triggerCountToday;
   stats["pirTriggersToday"] = pirToday;
   stats["errorsToday"] = Core::metrics.errorsToday;
+
+  // v4.1 — DC Energy & Battery Monitoring telemetry (brief §31-§33)
+  // Adds battery / powerFlow / environment / energy nested objects.
+  // Existing fields above remain untouched (backward compat — brief §55).
+  if (Battery::ENABLED) {
+    Services::serializeBatteryTelemetry(data);
+  }
 
   // Serialize
   String body;

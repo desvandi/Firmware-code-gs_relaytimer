@@ -16,6 +16,8 @@
 #include "WifiManager.h"
 #include "Crypto.h"
 #include "Json.h"
+#include "BatteryStatusSerializer.h"  // v4.1 — same battery/powerFlow/environment blocks as REST
+#include "BatteryConfig.h"
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
 #include <WiFiClient.h>
@@ -266,7 +268,8 @@ bool MqttClient::isConnected() {
 void MqttClient::publishStatus() {
   if (!_mqtt.connected()) return;
 
-  DynamicJsonDocument doc(6144);  // Increased for PZEM + schedules + alarms
+  // v4.1: increased from 6144 to 12288 to fit battery/powerFlow/environment blocks
+  DynamicJsonDocument doc(12288);
   JsonObject data = doc.to<JsonObject>();
 
   data["firmwareVersion"] = Core::FIRMWARE_VERSION;
@@ -376,6 +379,12 @@ void MqttClient::publishStatus() {
   for (uint8_t i = 0; i < Core::NUM_PIR; i++) pirToday += Core::pirState[i].triggerCountToday;
   stats["pirTriggersToday"] = pirToday;
   stats["errorsToday"] = Core::metrics.errorsToday;
+
+  // v4.1 — DC Energy & Battery Monitoring telemetry (brief §31-§33).
+  // Same canonical blocks as REST /api/status. Existing fields untouched.
+  if (Battery::ENABLED) {
+    Services::serializeBatteryTelemetry(data);
+  }
 
   String json;
   serializeJson(doc, json);

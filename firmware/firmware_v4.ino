@@ -70,6 +70,15 @@
 #include "RtcDriver.h"
 #include "PzemDriver.h"
 
+// v4.1 — DC Energy & Battery Monitoring drivers (brief §3, §10-20)
+// GPIO audit documented in BatteryConfig.h (PACK_VOLTAGE_SOURCE = ADS1115_AIN3_BPLUS
+// by default; ESP32 ADC1 is fully occupied by I2C + PIR on standard WROOM-32).
+#include "BatteryConfig.h"
+#include "Ina219Driver.h"
+#include "Ads1115Driver.h"
+#include "Sht31Driver.h"
+#include "BatteryVoltageDriver.h"
+
 // Network
 #include "WifiManager.h"
 
@@ -81,6 +90,9 @@
 #include "OtaManager.h"
 #include "MqttClient.h"
 #include "TransactionJournal.h"  // R10G-1: NVS transaction journal
+#include "BatteryMonitor.h"        // v4.1 DC energy & battery monitoring
+#include "BatteryDiagnostics.h"
+#include "ResistanceEstimator.h"
 
 // Web
 #include "HttpServer.h"
@@ -172,6 +184,34 @@ void setup() {
   // ---------- PZEM-004T v3.0 POWER METER (optional, via UART) ----------
   Drivers::pzem.begin();
 
+  // ---------- v4.1 — DC ENERGY & BATTERY MONITORING ----------
+  // All these drivers share the I²C bus initialized by RtcDriver::begin()
+  // (SDA=GPIO32, SCL=GPIO33). They are non-fatal: if any sensor is absent
+  // the relay/scheduler/PZEM/MQTT/REST subsystem continues working.
+  // (Brief §46: monitoring failure must NOT disable relay control.)
+  if (Battery::ENABLED) {
+    Drivers::ina219Battery.begin();
+    esp_task_wdt_reset();
+    Drivers::ina219Inverter.begin();
+    esp_task_wdt_reset();
+    Drivers::adsCell1.begin();
+    esp_task_wdt_reset();
+    Drivers::adsCell2.begin();
+    esp_task_wdt_reset();
+    Drivers::sht31.begin();
+    esp_task_wdt_reset();
+    Drivers::packVoltage.begin();
+    esp_task_wdt_reset();
+
+    // Calculation + diagnostics layers (brief §53 Phase 2/3)
+    Services::battery.begin();
+    esp_task_wdt_reset();
+    Services::batteryDiagnostics.begin();
+    esp_task_wdt_reset();
+    Services::resistance.begin();
+    esp_task_wdt_reset();
+  }
+
   // ---------- INITIAL RELAY COMPUTATION ----------
   Services::relayEngine.forceRefresh();
 
@@ -226,6 +266,20 @@ void loop() {
 
   // 2b. PZEM power meter read (every 1s)
   Drivers::pzem.tick();
+
+  // 2c. v4.1 DC energy & battery monitoring sensors — non-blocking, all
+  // internally rate-limited. (Brief §44.)
+  if (Battery::ENABLED) {
+    Drivers::ina219Battery.tick();
+    Drivers::ina219Inverter.tick();
+    Drivers::adsCell1.tick();
+    Drivers::adsCell2.tick();
+    Drivers::sht31.tick();
+    Drivers::packVoltage.tick();
+    Services::battery.tick();
+    Services::batteryDiagnostics.tick();
+    Services::resistance.tick();
+  }
 
   // 3. Recompute relay states every 1s (catch up if loop was slow)
   static unsigned long lastTick = 0;
