@@ -30,8 +30,30 @@
 #include "Ads1115Driver.h"
 #include "BatteryVoltageDriver.h"
 #include "BatteryTypes.h"
+#include "HealthSupervisor.h"  // v4.2 — health + telemetry sequence serialization
+#include "AlarmRegistry.h"      // v4.2 — alarms array serialization
 
 namespace Services {
+
+// ---------- HELPERS shared with firmware serializer ----------
+inline const char* rtcStatusStr_FW(Services::RtcStatus s) {
+  switch (s) {
+    case Services::RtcStatus::Valid:    return "VALID";
+    case Services::RtcStatus::Invalid:  return "INVALID";
+    case Services::RtcStatus::Unsynced: return "UNSYNCED";
+  }
+  return "UNSYNCED";
+}
+
+inline const char* sensorStatusStr_FW(Services::SensorStatus s) {
+  switch (s) {
+    case Services::SensorStatus::Valid:       return "VALID";
+    case Services::SensorStatus::Stale:       return "STALE";
+    case Services::SensorStatus::Error:       return "ERROR";
+    case Services::SensorStatus::Unavailable: return "UNAVAILABLE";
+  }
+  return "UNAVAILABLE";
+}
 
 // Serialize float that may be NaN → emit null (ArduinoJson: setNaN/null)
 // To preserve backward-compat with PWA's optional fields, we omit NaN keys.
@@ -209,6 +231,60 @@ inline void serializeBatteryTelemetry(JsonObject& data) {
   setOptionalFloat(energy, "chargedAh",      t.energy.chargedAh);
   setOptionalFloat(energy, "dischargedAh",   t.energy.dischargedAh);
   energy["valid"] = t.energy.valid;
+
+  // v4.2 — HEALTH + ALARMS + TELEMETRY SEQUENCE (brief §22, §44, §60)
+  HealthSnapshot hs = health.getSnapshot();
+  JsonObject healthObj = data.createNestedObject("health");
+  healthObj["uptimeSeconds"]     = hs.uptimeSeconds;
+  healthObj["bootCount"]          = hs.bootCount;
+  healthObj["lastResetReason"]    = hs.lastResetReason;
+  healthObj["lastResetReasonStr"] = HealthSupervisor::resetReasonStr(hs.lastResetReason);
+  healthObj["watchdogResets"]     = hs.watchdogResets;
+  healthObj["brownoutResets"]     = hs.brownoutResets;
+  healthObj["freeHeap"]           = (uint32_t)hs.freeHeap;
+  healthObj["minFreeHeap"]       = (uint32_t)hs.minFreeHeap;
+  healthObj["largestFreeBlock"]  = (uint32_t)hs.largestFreeBlock;
+  healthObj["wifiReconnectCount"] = hs.wifiReconnectCount;
+  healthObj["mqttReconnectCount"] = hs.mqttReconnectCount;
+  healthObj["rtcStatus"]          = rtcStatusStr_FW(hs.rtcStatus);
+  healthObj["pzemStatus"]         = sensorStatusStr_FW(hs.pzemStatus);
+  healthObj["pirStatus"]          = sensorStatusStr_FW(hs.pirStatus);
+  healthObj["sht31Status"]        = sensorStatusStr_FW(hs.sht31Status);
+  healthObj["ina219Status"]       = sensorStatusStr_FW(hs.ina219Status);
+  healthObj["ads1115Status"]      = sensorStatusStr_FW(hs.ads1115Status);
+  healthObj["filesystemOk"]       = hs.filesystemOk;
+  healthObj["nvsOk"]               = hs.nvsOk;
+  healthObj["mqttConnected"]       = hs.mqttConnected;
+  healthObj["highestAlarmSeverity"] = alarmSeverityStr(hs.highestAlarm);
+
+  // Task heartbeat ages (brief §45)
+  JsonObject hb = healthObj.createNestedObject("taskHeartbeats");
+  static const char* TASK_NAMES[] = {
+    "relayEngine", "mqtt", "telemetry", "scheduler",
+    "pir", "pzem", "ota", "healthMonitor", "batteryMonitor"
+  };
+  for (uint8_t i = 0; i < TASK_COUNT; i++) {
+    hb[TASK_NAMES[i]] = (uint32_t)hs.taskHeartbeatAgeMs[i];
+  }
+
+  // Alarms array (brief §60)
+  JsonArray alarmsArr = data.createNestedArray("alarms");
+  for (uint8_t i = 0; i < alarms.countAll(); i++) {
+    const Alarm* a = alarms.getAlarm(i);
+    if (!a) break;
+    JsonObject ao = alarmsArr.createNestedObject();
+    ao["code"] = a->code;
+    ao["severity"] = alarmSeverityStr(a->severity);
+    ao["active"] = a->active;
+    ao["acknowledged"] = a->acknowledged;
+    ao["raisedAt"] = a->raisedAt;
+    ao["clearedAt"] = a->clearedAt;
+    ao["message"] = a->message;
+  }
+
+  // Telemetry sequence (brief §22) — monotonic, allows PWA/GAS to detect
+  // packet loss / reordering
+  data["telemetrySequence"] = hs.telemetrySequence;
 }
 
 } // namespace Services

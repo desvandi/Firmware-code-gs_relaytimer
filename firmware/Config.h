@@ -11,17 +11,20 @@
 
 // ---------- FIRMWARE VERSION ----------
 namespace Core {
-  // v4.1.0 (brief §71): minor bump — added DC Energy & Battery Monitoring
-  // subsystem (8S LiFePO4 cell monitoring, INA219 bidirectional current,
-  // ADS1115 cell-node ADC, SHT31 ambient, power-flow analysis, battery
-  // diagnostics, internal-resistance estimate). Backward-compatible with
-  // 4.0.x PWA — all existing SystemStatus fields remain; new fields are
-  // added under nested "battery" / "powerFlow" / "environment" / "energy"
-  // objects. OTA signing workflow unchanged.
-  constexpr char FIRMWARE_VERSION[] = "4.1.0";
+  // v4.2.0 (audit brief #2 — 115-section industrial-grade directive):
+  //   Added per-channel maxOnTime/minOnTime/minOffTime/anti-chatter (§13-16)
+  //   + boot policy per channel (§13) + RTC state machine (§18) +
+  //   sensor data quality states VALID/STALE/ERROR/UNAVAILABLE (§20) +
+  //   monotonic telemetry sequence (§22) + Health Supervisor (§44) +
+  //   Task heartbeat monitoring (§45) + Crash forensics (§47) +
+  //   Central AlarmRegistry (§60) + ErrorCodes registry (§59).
+  // Local-first (§5, §78) — all safety enforcement works without
+  // Internet/MQTT/PWA/GAS. Backward-compatible — existing SystemStatus
+  // fields remain; new health/alarms/telemetrySequence blocks are added.
+  constexpr char FIRMWARE_VERSION[] = "4.2.0";
   constexpr char BUILD_DATE[] = __DATE__ " " __TIME__;
   constexpr uint8_t CONFIG_VERSION = 2;  // bump when schedule.json schema changes
-  constexpr char DEVICE_MODEL[] = "ESP32-WROOM-32 Timer12 v4.1";
+  constexpr char DEVICE_MODEL[] = "ESP32-WROOM-32 Timer12 v4.2 (industrial-grade)";
 
   // ---------- CHANNELS ----------
   constexpr uint8_t NUM_CHANNELS = 12;

@@ -1,15 +1,203 @@
-# Timer Digital Relay v4.0 — Firmware + Google Apps Script
+# Timer Digital Relay v4.2 — Firmware + Google Apps Script (Industrial-Grade)
 
-> ESP32-WROOM-32 firmware for 12-channel relay control + 4 PIR sensors + DS3231 RTC + PZEM-004T v3.0 power meter, with NVS-persisted transaction journal, Ed25519-signed OTA, and Google Apps Script AI insights pipeline.
+> ESP32-WROOM-32 firmware for 12-channel industrial relay control with per-channel safety limits (maxOnTime, minOnTime, anti-chatter), RTC state machine, Health Supervisor, central AlarmRegistry, monotonic telemetry sequence, NVS-persisted transaction journal, Ed25519-signed OTA, 8S LiFePO4 battery monitoring (INA219/ADS1115/SHT31), and Google Apps Script AI insights pipeline. **Local-first** — all safety logic runs on-device without Internet/MQTT/PWA/GAS.
 
-[![Firmware Version](https://img.shields.io/badge/firmware-v4.0.0-blue)](#)
+[![Firmware Version](https://img.shields.io/badge/firmware-v4.2.0-blue)](#)
+[![Industrial Grade](https://img.shields.io/badge/grade-industrial-orange)](#industrial-grade-hardening-v42)
+[![Local-First](https://img.shields.io/badge/local--first-✓-green)](#local-first-control-principle)
 [![Security Audit](https://img.shields.io/badge/audit-round%2010K-brightgreen)](#security-audit-history)
 [![ESP32 Core](https://img.shields.io/badge/ESP32%20core-3.3.7-green)](#)
 [![License](https://img.shields.io/badge/license-proprietary-lightgrey)](#)
 
-This repo holds the **device-side code** for the Timer Digital Relay v4.0 system. The companion PWA dashboard lives in a separate repo: **[desvandi/Remote-Relay](https://github.com/desvandi/Remote-Relay)**.
+This repo holds the **device-side code** for the Timer Digital Relay v4.2 system. The companion PWA dashboard lives in a separate repo: **[desvandi/Remote-Relay](https://github.com/desvandi/Remote-Relay)**.
 
 ---
+
+## ⚡ What's New in v4.2 (Industrial-Grade Hardening)
+
+v4.2 implements a comprehensive 115-section industrial-grade hardening directive. Key additions:
+
+### Safety-Critical (P0)
+
+- **Per-channel safety limits** (audit brief §13-16):
+  - `maxOnTimeSec` — automatic FORCE OFF after configured duration (e.g. 7200s = 2h)
+  - `minOnTimeSec` / `minOffTimeSec` — inhibit premature ON/OFF transitions (protect motors, contactors)
+  - `minSwitchIntervalSec` — anti-chatter filter (block rapid ON/OFF cycles from noisy PIR or unstable sensors)
+  - `bootPolicy` — `BOOT_OFF` / `BOOT_ON` / `RESTORE_LAST` / `SAFE_STATE` per channel
+- **RTC state machine** (§18-19): explicit `VALID` / `INVALID` / `UNSYNCED` states.
+  Scheduler is **inhibited** when RTC is not VALID — prevents time-based
+  commands from executing against a wrong clock.
+- **Sensor data quality states** (§20-21): `VALID` / `STALE` / `ERROR` /
+  `UNAVAILABLE` — invalid sensor readings are NEVER silently reported as 0.
+- **Local-first safety** (§5, §78): all safety logic runs on-device without
+  Internet, MQTT, PWA, or GAS. If all connectivity is lost for 24 hours,
+  local automation + safety limits continue to function.
+
+### Reliability (P1)
+
+- **Monotonic telemetry sequence** (§22): every status publication carries
+  an incrementing `telemetrySequence` — PWA/GAS can detect packet loss or
+  reordering.
+- **Health Supervisor** (§44): tracks uptime, boot count, last reset reason
+  (POWERON/EXT/WDT/BROWNOUT/...), watchdog reset count, brownout count,
+  free heap, minimum free heap observed, WiFi reconnect count, MQTT
+  reconnect count, per-task heartbeat ages.
+- **RTOS task heartbeat monitoring** (§45): every critical task (RelayEngine,
+  MQTT, Telemetry, Scheduler, PIR, PZEM, OTA, HealthMonitor, BatteryMonitor)
+  records a heartbeat. If any task stalls for >10 s, a `TASK_STALL_*` alarm
+  is raised.
+- **Crash forensics** (§47): `bootCount`, `lastResetReason`,
+  `lastResetReasonStr`, `watchdogResets`, `brownoutResets` are persisted
+  across reboots in NVS namespace `health`.
+
+### Observability (P1)
+
+- **Central AlarmRegistry** (§60): all alarms have `code`, `severity`
+  (INFO/WARNING/CRITICAL), `active`, `acknowledged`, `raisedAt`,
+  `clearedAt`, `message`. Minimum alarm set per brief:
+  device offline, MQTT failure, RTC invalid, PZEM failure, PIR failure,
+  over/undervoltage, overcurrent, overpower, storage failure, OTA failure,
+  auth failure, repeated reboot, watchdog, brownout, state drift,
+  interlock violation.
+- **Error code registry** (§59): deterministic `ERR_<DOMAIN>_<NNN>` strings
+  (e.g. `ERR_RELAY_002` for maxOnTime, `ERR_RTC_001` for invalid RTC).
+  PWA can match on these to render localized messages.
+
+### How to configure per-channel safety limits
+
+All limits default to `0` (= unlimited/inactive). Configure per-channel
+in `Channel` struct (Types.h) or via NVS-backed config (future PWA
+Settings page):
+
+```cpp
+// Example: CH1 = heater, force OFF after 2 hours, min 60s ON, min 60s OFF
+channels[0].maxOnTimeSec = 7200;
+channels[0].minOnTimeSec = 60;
+channels[0].minOffTimeSec = 60;
+channels[0].minSwitchIntervalSec = 5;
+channels[0].bootPolicy = (uint8_t)BootPolicy::BootOff;  // safe default
+```
+
+---
+
+## 🏭 Industrial-Grade Hardening (v4.2)
+
+### Local-First Control Principle
+
+The ESP32 is the **authoritative edge controller** (audit brief §4, §5).
+PWA / GAS / MQTT are enhancement layers, NOT sources of truth for physical
+relay state. If all cloud connectivity is lost:
+
+| Subsystem | Continues to work? |
+|---|---|
+| Relay control | ✅ Yes |
+| Scheduler (RTC-based) | ✅ Yes (if RTC VALID) |
+| PIR override | ✅ Yes |
+| maxOnTime FORCE OFF | ✅ Yes |
+| minOnTime / anti-chatter | ✅ Yes |
+| Boot policy | ✅ Yes |
+| Audit log (LittleFS) | ✅ Yes |
+| Transaction journal (NVS) | ✅ Yes |
+| OTA rollback detection | ✅ Yes |
+| MQTT telemetry publish | ❌ Queued / dropped |
+| PWA control | ❌ Disabled until reconnect |
+| GAS AI insights | ❌ Disabled |
+
+### Architecture
+
+```
+                    ┌─────────────────────┐
+                    │       USER          │
+                    └──────────┬──────────┘
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │       PWA           │
+                    │ UI / RBAC / State   │
+                    └──────────┬──────────┘
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │ APPLICATION / GAS   │
+                    │ Auth / Data / API   │
+                    └──────────┬──────────┘
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │       MQTT          │
+                    │ Transport Layer     │
+                    └──────────┬──────────┘
+                               │
+                               ▼
+             ┌────────────────────────────────┐
+             │ ESP32 AUTHORITATIVE EDGE       │
+             │ CONTROLLER                     │
+             │                                │
+             │ Auth / Command Validation      │
+             │ Arbitration / Interlock        │
+             │ Scheduler / PIR / Relay Engine │
+             │ SafetySupervisor               │
+             │ HealthSupervisor               │
+             │ AlarmRegistry                  │
+             │ OTA                            │
+             └───────────────┬────────────────┘
+                             │
+                             ▼
+                    PHYSICAL HARDWARE
+```
+
+### Key v4.2 Modules
+
+| Module | File | Brief § | Purpose |
+|---|---|---|---|
+| `ErrorCodes.h` | 59 | Centralized `ERR_<DOMAIN>_<NNN>` registry |
+| `AlarmRegistry.{h,cpp}` | 60 | Central alarm engine with severity levels |
+| `SafetySupervisor.{h,cpp}` | 13-16 | Per-channel maxOnTime/minOnTime/anti-chatter |
+| `HealthSupervisor.{h,cpp}` | 44, 45, 47 | Health metrics + task heartbeats + crash forensics |
+| `BatteryMonitor.{h,cpp}` | 21-28 (v4.1) | 8S LiFePO4 cell + power + energy + SOC |
+| `BatteryDiagnostics.{h,cpp}` | 30 (v4.1) | Battery fault detection |
+| `ResistanceEstimator.{h,cpp}` | 25-29 (v4.1) | ΔV/ΔI dynamic resistance estimate |
+| `BatteryStatusSerializer.h` | 31-33 | Shared REST+MQTT telemetry serializer |
+
+### Command Priority (audit brief §8)
+
+```
+SAFETY (1000) > EMERGENCY/INTERLOCK (900) > MANUAL AUTHORIZED (800) >
+MAINTENANCE (700) > REMOTE AUTOMATION (600) > SCHEDULE (500) >
+PIR (400) > DEFAULT (100)
+```
+
+In v4.2 the existing `Manual > PIR > Schedule > Off` priority is preserved
+(backward compat). The full numeric priority will be activated in v4.3 when
+the command arbitration engine (§7) is implemented.
+
+---
+
+## 📚 Documentation Index
+
+In addition to this README, see:
+
+| Doc | Purpose |
+|---|---|
+| [SECURITY.md](./SECURITY.md) | Security model, attack surface, hardening checklist |
+| [PROTOCOL.md](./PROTOCOL.md) | MQTT/REST message protocol, packet format, QoS |
+| [DEPLOYMENT.md](./DEPLOYMENT.md) | Production deployment guide |
+| [TEST_PLAN.md](./TEST_PLAN.md) | Required test matrix (unit / integration / fault injection / power-loss) |
+| [DISASTER_RECOVERY.md](./DISASTER_RECOVERY.md) | Device replacement, credential recovery, OTA recovery |
+| [HARDWARE_SAFETY_CONTRACT.md](./HARDWARE_SAFETY_CONTRACT.md) | GPIO, relay polarity, PSU, grounding, isolation |
+| [SAFETY_CASE.md](./SAFETY_CASE.md) | Hazard/cause/risk/prevention/detection/safe-state |
+| [COMPATIBILITY_MATRIX.md](./COMPATIBILITY_MATRIX.md) | PWA/Firmware/Protocol version compatibility |
+
+---
+
+## 🔧 Existing v4.0/v4.1 Documentation
+
+The sections below are preserved from v4.0/v4.1. They remain accurate for
+all existing features. The v4.2 additions are layered on top — no existing
+behavior has been removed.
+
+---
+
 
 ## Table of Contents
 

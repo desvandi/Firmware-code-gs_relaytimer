@@ -93,6 +93,11 @@
 #include "BatteryMonitor.h"        // v4.1 DC energy & battery monitoring
 #include "BatteryDiagnostics.h"
 #include "ResistanceEstimator.h"
+// v4.2 industrial-grade hardening (audit brief §13-16, §18-19, §44, §59-60)
+#include "ErrorCodes.h"
+#include "AlarmRegistry.h"
+#include "SafetySupervisor.h"
+#include "HealthSupervisor.h"
 
 // Web
 #include "HttpServer.h"
@@ -177,8 +182,21 @@ void setup() {
   Storage::config.loadSchedule();
   esp_task_wdt_reset();
 
+  // ---------- v4.2 INDUSTRIAL-GRADE SERVICES (brief §13-16, §18-19, §44, §60) ----------
+  // AlarmRegistry + HealthSupervisor + SafetySupervisor initialize BEFORE
+  // any driver begins so they can capture boot-time events (reset reason,
+  // brownout, watchdog, low heap, RTC invalid) as alarms.
+  Services::alarms.begin();
+  esp_task_wdt_reset();
+  Services::health.begin();          // loads bootCount + watchdog/brownout counters from NVS
+  esp_task_wdt_reset();
+  Services::health.recordBoot();    // classifies reset reason, raises alarms
+  esp_task_wdt_reset();
+  Services::safety.reset();         // clear runtime tracking
+  esp_task_wdt_reset();
+
   // ---------- DRIVERS: RTC + Relays ----------
-  Drivers::rtc.begin();
+  Drivers::rtc.begin();              // updates RTC state machine in HealthSupervisor
   Drivers::relay.begin();
 
   // ---------- PZEM-004T v3.0 POWER METER (optional, via UART) ----------
@@ -279,7 +297,14 @@ void loop() {
     Services::battery.tick();
     Services::batteryDiagnostics.tick();
     Services::resistance.tick();
+    // v4.2: battery monitor + resistance estimator report heartbeats via their
+    // own tick() calls internally — they call Services::health.recordHeartbeat()
+    // to indicate liveness for task-stall detection (brief §45).
+    Services::health.recordHeartbeat(Services::TaskId::BatteryMonitor);
   }
+
+  // 2d. v4.2 health supervisor tick — monitors heap, reset reasons, task stalls
+  Services::health.tick();
 
   // 3. Recompute relay states every 1s (catch up if loop was slow)
   static unsigned long lastTick = 0;

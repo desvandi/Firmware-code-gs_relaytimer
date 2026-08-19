@@ -1,19 +1,38 @@
 // =============================================================================
 // Drivers/RtcDriver.cpp
 // =============================================================================
+// v4.2 audit (brief §18-19): RTC now exposes explicit state machine
+// (VALID/INVALID/UNSYNCED) via HealthSupervisor. Scheduler is inhibited
+// when RTC is not VALID.
+// =============================================================================
 #include "RtcDriver.h"
 #include "Globals.h"
 #include "LogService.h"
+#include "HealthSupervisor.h"
+#include "AlarmRegistry.h"
+#include "ErrorCodes.h"
 
 namespace Drivers {
 
 RtcDriver rtc;
+
+static void _updateRtcHealthStatus(bool initialized, bool timeValid) {
+  using namespace Services;
+  if (!initialized) {
+    health.setRtcStatus(RtcStatus::Unsynced);
+  } else if (!timeValid) {
+    health.setRtcStatus(RtcStatus::Invalid);
+  } else {
+    health.setRtcStatus(RtcStatus::Valid);
+  }
+}
 
 bool RtcDriver::begin() {
   Wire.begin(Core::I2C_SDA, Core::I2C_SCL, Core::I2C_CLOCK);
   if (!_rtc.begin()) {
     Services::Log.append(Core::LogType::Error, "RTC not detected", 0);
     _initialized = false;
+    _updateRtcHealthStatus(false, false);
     return false;
   }
   if (_rtc.lostPower()) {
@@ -29,18 +48,21 @@ bool RtcDriver::begin() {
     }
   }
   _initialized = true;
+  _updateRtcHealthStatus(_initialized, Core::timeValid);
   return true;
 }
 
 bool RtcDriver::isValid() {
-  if (!_initialized) return false;
-  if (!Core::timeValid) return false;
-  DateTime now = _rtc.now();
-  if (now.year() < 2020 || now.year() > 2099) {
-    Core::timeValid = false;
-    return false;
+  bool valid = _initialized && Core::timeValid;
+  if (valid) {
+    DateTime now = _rtc.now();
+    if (now.year() < 2020 || now.year() > 2099) {
+      Core::timeValid = false;
+      valid = false;
+    }
   }
-  return true;
+  _updateRtcHealthStatus(_initialized, valid);
+  return valid;
 }
 
 uint32_t RtcDriver::getUnixTime() {

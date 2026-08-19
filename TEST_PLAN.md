@@ -1,278 +1,230 @@
-# Transaction Journal — Power-Loss Test Plan
+# Test Plan — Timer Digital Relay v4.2
 
-> **Acceptance criterion**: Tidak ada keadaan recovery di mana sebuah command yang sudah dieksekusi dapat dieksekusi kedua kali karena journal kehilangkan committed record.
+> Implements testing requirements from the Industrial-Grade Implementation
+> Directive §85-91, §86, §107.
 
-## Prerequisites
+Per brief §107, each test MUST use one of these result strings:
+- `PASS` — test was executed and passed
+- `FAIL` — test was executed and failed
+- `NOT EXECUTED — HARDWARE REQUIRED` — test requires physical hardware not available
 
-- ESP32-WROOM-32 dev board
-- USB cable (data-capable)
-- 12-channel relay module connected
-- Arduino IDE 2.3.8 + ESP32 core 3.3.7
-- Serial Monitor open at 115200 baud
-- MQTT client (PWA or mosquitto_pub) for sending commands
-- Ability to cut power to ESP32 instantly (USB switch or pull cable)
-
-## Build Configuration
-
-Before flashing, set in `Config.h`:
-```cpp
-constexpr const char* MQTT_BROKER_HOST = "<your-broker>";
-constexpr uint16_t MQTT_BROKER_PORT = 8883;  // TLS
-constexpr const char* MQTT_BROKER_USERNAME = "<device-user>";
-constexpr const char* MQTT_BROKER_PASSWORD = "<device-pass>";
-constexpr const char* MQTT_ROOT_CA = "<PEM>";
-constexpr const char* OTA_ED25519_PUBLIC_KEY_HEX = "<64-hex-chars>";
-constexpr const char* OTA_HTTPS_ROOT_CA = "<PEM>";
-constexpr const char* ALLOWED_CORS_ORIGINS = "https://your-pwa.vercel.app";
-```
-
-Compile with `-DPRODUCTION_BUILD` flag (Arduino IDE: Tools → Build Flags).
+**Forbidden**: "probably works", "should work", "implemented", "verified" without evidence.
 
 ---
 
-## Test 1: Reboot After Commit Success
+## 1. Unit Tests (brief §85)
 
-**Goal**: Verify committed transaction survives reboot.
+### 1.1 Logic Tests (executed via Python)
 
-| Step | Action | Expected |
-|------|--------|----------|
-| 1 | Send relay ON command with requestId=ABC via MQTT | ACK received, relay ON |
-| 2 | Wait 2s (ensure journal write complete) | Serial: `[Journal] Stored: rid=ABC` |
-| 3 | Reboot ESP32 (EN button or power cycle) | Serial: `[Journal] Loaded 1 valid transactions` |
-| 4 | Send SAME relay ON command with requestId=ABC | ACK received (replayed from journal), relay does NOT toggle |
-| 5 | Check Serial | `[MQTT] Duplicate command detected: ABC — queuing original ACK` |
+File: `scripts/test_battery_logic.py`
 
-**PASS criteria**: Step 4 — ESP32 does NOT re-execute, replays original ACK from journal.
+| Test ID | Description | Result |
+|---|---|---|
+| UNIT-001 | Imppt = Iinverter - Ibattery (5 acceptance scenarios from brief §62) | PASS |
+| UNIT-002 | Cell calculation from cumulative nodes (brief §14) | PASS |
+| UNIT-003 | Tap-fault detection (C[n+1] < C[n] - tolerance) (brief §18) | PASS |
+| UNIT-004 | Power calculations (signed, charging vs discharging) (brief §21) | PASS |
+| UNIT-005 | Power-flow consistency unified formula (brief §22) | PASS |
+| UNIT-006 | Energy integration with spike rejection (brief §23) | PASS |
+| UNIT-007 | Resistance estimation single-pass min/max algorithm (brief §25-26) | PASS |
+| UNIT-008 | SOC coulomb counting with voltage sync (brief §24) | PASS |
+| UNIT-009 | INA219 config bit verification (0x3FFB for 32V/±320mV) | PASS |
+| UNIT-010 | Resistance staleness check (5-min threshold) | PASS |
 
----
+### 1.2 Firmware Syntax Check
 
-## Test 2: Power Loss During Phase 1 (Blob Write)
+Command: `g++ -std=c++17 -fsyntax-only -I. -I<stubs> scripts/firmware_syntax_check.cpp`
 
-**Goal**: Verify partial blob write is rejected on boot.
+| Test ID | Description | Result |
+|---|---|---|
+| FW-SYN-001 | All headers parse cleanly with Arduino stubs | PASS |
 
-| Step | Action | Expected |
-|------|--------|----------|
-| 1 | Send relay ON command with requestId=DEF | ACK received, relay ON |
-| 2 | Wait for journal store to complete | Serial: `[Journal] Stored: rid=DEF` |
-| 3 | Send another relay ON with requestId=GHI | — |
-| 4 | **CUT POWER immediately** when Serial shows `[Journal] Phase 1` but BEFORE `Phase 2` | ESP32 dies mid-blob-write |
-| 5 | Power on ESP32 | Boot sequence starts |
-| 6 | Check Serial on boot | `[Journal] Entry N: not committed (commit=0)` or `INVALID` |
-| 7 | Send relay ON with requestId=GHI again | ACK received, relay executes (journal miss = new command) |
+### 1.3 PWA Static Checks
 
-**PASS criteria**: Step 6 — uncommitted entry is REJECTED. Step 7 — GHI executes as new command (not blocked by partial entry).
-
-**Note**: Timing this precisely is difficult. Alternative: add `delay(5000)` between Phase 1 and Phase 2 in code temporarily for testing.
-
----
-
-## Test 3: Power Loss During Phase 1b (writeIdx Persist)
-
-**Goal**: Verify entry stays uncommitted if writeIdx persist fails.
-
-| Step | Action | Expected |
-|------|--------|----------|
-| 1 | Send relay ON with requestId=JKL | ACK received |
-| 2 | **CUT POWER** when Serial shows Phase 1 complete but BEFORE Phase 1b (writeIdx) | ESP32 dies |
-| 3 | Power on | Boot starts |
-| 4 | Check Serial | Entry JKL: `not committed (commit=0)` — rejected |
-| 5 | Send relay ON with requestId=JKL again | Executes as new command |
-
-**PASS criteria**: Step 4 — JKL not found in journal (uncommitted). Step 5 — JLI executes fresh.
+| Test ID | Command | Result |
+|---|---|---|
+| PWA-TSC-001 | `bunx tsc --noEmit` | PASS |
+| PWA-LINT-001 | `bun run lint` (eslint) | PASS |
+| PWA-BUILD-001 | `bun run build` (next build, 25/25 pages) | PASS |
 
 ---
 
-## Test 4: Power Loss During Phase 2 (Commit Flag)
+## 2. Integration Tests (brief §85)
 
-**Goal**: Verify writeIdx is advanced but entry is uncommitted.
+### 2.1 PWA ↔ ESP32 REST Round-Trip
 
-| Step | Action | Expected |
-|------|--------|----------|
-| 1 | Note current writeIdx from Serial (e.g., slot 5) | — |
-| 2 | Send relay ON with requestId=MNO | ACK received |
-| 3 | **CUT POWER** when Serial shows Phase 1b complete but BEFORE Phase 2 | ESP32 dies |
-| 4 | Power on | Boot starts |
-| 5 | Check Serial | writeIdx = 6 (advanced), but entry slot 5: `not committed` |
-| 6 | Send relay ON with requestId=MNO again | Executes as new command (written to slot 6, NOT slot 5) |
+| Test ID | Description | Precondition | Result |
+|---|---|---|---|
+| INT-REST-001 | PWA logs in → receives JWT + CSRF | ESP32 booted, user configured | NOT EXECUTED — HARDWARE REQUIRED |
+| INT-REST-002 | PWA polls /api/status every 3s → telemetry updates | Authenticated | NOT EXECUTED — HARDWARE REQUIRED |
+| INT-REST-003 | PWA toggles relay → relay changes state → status reflects new state | Authenticated + relay wired | NOT EXECUTED — HARDWARE REQUIRED |
+| INT-REST-004 | PWA upserts schedule → schedule active → relay follows schedule | RTC time valid | NOT EXECUTED — HARDWARE REQUIRED |
 
-**PASS criteria**: Step 5 — writeIdx advanced (slot 5 skipped, slot 6 is next). Step 6 — MNO executes fresh, written to slot 6. Slot 5 is "wasted" but no committed data lost.
+### 2.2 PWA ↔ ESP32 MQTT Round-Trip
 
----
+| Test ID | Description | Precondition | Result |
+|---|---|---|---|
+| INT-MQTT-001 | PWA connects to broker → subscribes to `timer12/<mac>/status` → receives telemetry every 5s | MQTT TLS + ACL configured | NOT EXECUTED — HARDWARE REQUIRED |
+| INT-MQTT-002 | PWA publishes relay command → ESP32 ACKs → relay changes state | Authenticated + MQTT configured | NOT EXECUTED — HARDWARE REQUIRED |
+| INT-MQTT-003 | PWA disconnects → ESP32 LWT publishes "0" → PWA shows OFFLINE | LWT message configured | NOT EXECUTED — HARDWARE REQUIRED |
 
-## Test 5: Power Loss After Commit (Full Success Path)
+### 2.3 ESP32 ↔ GAS Round-Trip
 
-**Goal**: Verify committed entry survives immediate power loss.
-
-| Step | Action | Expected |
-|------|--------|----------|
-| 1 | Send relay ON with requestId=PQR | ACK received |
-| 2 | **CUT POWER immediately** after Serial shows `Phase 2 commit` success | ESP32 dies |
-| 3 | Wait 2s, power on | Boot starts |
-| 4 | Check Serial | `[Journal] Loaded 1 valid transactions` — PQR found |
-| 5 | Send relay ON with requestId=PQR | ACK replayed from journal, NO re-execution |
-
-**PASS criteria**: Step 4 — PQR is in journal. Step 5 — replay, not re-execute.
+| Test ID | Description | Precondition | Result |
+|---|---|---|---|
+| INT-GAS-001 | ESP32 POSTs logs + status to GAS → HMAC verified → Gemini generates insights → cached | HMAC secret configured, Gemini API key set | NOT EXECUTED — HARDWARE REQUIRED |
+| INT-GAS-002 | PWA fetches insights via GET → cache hit | Insights cached | NOT EXECUTED — HARDWARE REQUIRED |
+| INT-GAS-003 | Replay attack (same nonce) → 401 "Nonce already used" | Valid HMAC secret | NOT EXECUTED — HARDWARE REQUIRED |
 
 ---
 
-## Test 6: CRC Corruption Detection
+## 3. Fault Injection Tests (brief §87)
 
-**Goal**: Verify CRC mismatch causes entry rejection.
+These require `#define FAULT_INJECTION_ENABLED` compile flag (NOT in production builds).
 
-| Step | Action | Expected |
-|------|--------|----------|
-| 1 | Send relay ON with requestId=STU | ACK received, stored in journal |
-| 2 | Note slot number from Serial (e.g., slot 3) | — |
-| 3 | Reboot ESP32 | — |
-| 4 | Using ESP32 NVS editor (or custom sketch), corrupt 1 byte in `tj_entry_3` blob | CRC no longer matches |
-| 5 | Reboot ESP32 | Boot starts |
-| 6 | Check Serial | `[Journal] Entry 3: CRC mismatch — CORRUPT` |
-| 7 | Send relay ON with requestId=STU | Executes as new command (journal miss) |
-
-**PASS criteria**: Step 6 — CRC mismatch detected, entry rejected. Step 7 — STU re-executes (acceptable — data was corrupted).
-
-**Alternative without NVS editor**: Write a small test sketch that calls `prefs.putBytes("tj_entry_3", corruptedData, len)` to corrupt the blob.
-
----
-
-## Test 7: NVS Capacity / Blob Size
-
-**Goal**: Verify large ACK JSON (schedule/config) fits in blob.
-
-| Step | Action | Expected |
-|------|--------|----------|
-| 1 | Send schedule upsert with long channel name (32 chars) | ACK received |
-| 2 | Check Serial | `[Journal] Stored: rid=... (slot N)` — no size error |
-| 3 | Reboot | Entry loaded successfully |
-| 4 | Send same schedule upsert with same requestId | Replayed from journal |
-
-**PASS criteria**: No `[Journal] ERROR: blob too large` in Serial. Entry survives reboot.
+| Test ID | Description | Fault | Expected | Result |
+|---|---|---|---|---|
+| FAULT-001 | MQTT broker unreachable | FAIL_MQTT_CONNECT | Circuit breaker opens after 5 fails, retries with backoff | NOT EXECUTED — HARDWARE REQUIRED |
+| FAULT-002 | MQTT publish fails | FAIL_MQTT_PUBLISH | ACK queued in NVS journal, retried on reconnect | NOT EXECUTED — HARDWARE REQUIRED |
+| FAULT-003 | NVS write fails | FAIL_NVS_WRITE | Transaction aborts, no physical mutation | NOT EXECUTED — HARDWARE REQUIRED |
+| FAULT-004 | NVS read fails | FAIL_NVS_READ | Boot fails safe — firmware refuses to start | NOT EXECUTED — HARDWARE REQUIRED |
+| FAULT-005 | RTC I²C fails | FAIL_RTC | RTC state → INVALID, scheduler inhibited | NOT EXECUTED — HARDWARE REQUIRED |
+| FAULT-006 | PZEM Modbus fails | FAIL_PZEM | PZEM telemetry → UNAVAILABLE status, relay control continues | NOT EXECUTED — HARDWARE REQUIRED |
+| FAULT-007 | GAS unreachable | FAIL_GAS | Insights not generated, no impact on relay control | NOT EXECUTED — HARDWARE REQUIRED |
+| FAULT-008 | OTA download fails | FAIL_OTA_DOWNLOAD | OTA aborts, no flash write, previous firmware retained | NOT EXECUTED — HARDWARE REQUIRED |
+| FAULT-009 | OTA signature invalid | FAIL_OTA_VERIFY | OTA aborts, alarm raised | NOT EXECUTED — HARDWARE REQUIRED |
+| FAULT-010 | Force watchdog reset | FORCE_WATCHDOG | Watchdog fires, system reboots, bootCount increments | NOT EXECUTED — HARDWARE REQUIRED |
 
 ---
 
-## Test 8: LRU Eviction (64 Entries)
+## 4. Power-Loss Tests (brief §86)
 
-**Goal**: Verify 65th command evicts oldest, but recent entries survive.
+24 required power-loss scenarios. All require physical hardware + ability to cut ESP32 power mid-operation.
 
-| Step | Action | Expected |
-|------|--------|----------|
-| 1 | Send 64 relay commands with requestId=CMD001..CMD064 | All ACKed, all stored |
-| 2 | Check Serial | `[Journal] size 64/64` |
-| 3 | Send 65th command with requestId=CMD065 | Stored, slot 0 evicted (CMD001 lost) |
-| 4 | Reboot | 64 entries loaded (CMD002..CMD065) |
-| 5 | Retry CMD002 (evicted) | Re-executes (journal miss — acceptable per documentation) |
-| 6 | Retry CMD065 (recent) | Replayed from journal (no re-execute) |
-
-**PASS criteria**: Step 5 — CMD002 re-executes (documented limitation). Step 6 — CMD065 replays (within journal window).
-
----
-
-## Test 9: ACK Retry Queue After Reboot
-
-**Goal**: Verify pending ACKs are re-queued on boot.
-
-| Step | Action | Expected |
-|------|--------|----------|
-| 1 | Disconnect PWA / MQTT broker | ESP32 can't publish ACK |
-| 2 | Send relay ON with requestId=VWX via broker (from another client) | ESP32 executes, ACK publish fails |
-| 3 | Check Serial | `[Journal] ACK published + stored` but `[MQTT ACK] WARNING: publish failed` |
-| 4 | Reboot ESP32 (with broker still disconnected) | Boot starts |
-| 5 | Check Serial | `[Journal] Queued 1 ACKs for re-delivery after reboot` |
-| 6 | Reconnect broker | — |
-| 7 | Wait 2s | Serial: `[Journal] ACK delivered: rid=VWX` |
-| 8 | PWA receives ACK | — |
-
-**PASS criteria**: Step 5 — ACK re-queued from NVS journal. Step 7 — ACK delivered after broker reconnects.
+| Test ID | Description | Result |
+|---|---|---|
+| PL-001 | Power loss before command received | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-002 | Power loss during validation | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-003 | Power loss during prepare | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-004 | Power loss after physical mutation (relay changed) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-005 | Power loss before commit (journal not durable) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-006 | Power loss after commit (journal durable) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-007 | Power loss before ACK published | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-008 | Power loss after ACK published | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-009 | Duplicate command after reboot (same requestId) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-010 | requestId collision (same ID, different payload) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-011 | Journal corruption (NVS sector bad) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-012 | CRC corruption (journal entry CRC mismatch) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-013 | Full journal (64-entry ring full) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-014 | Journal rollover (oldest entry evicted) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-015 | NVS failure (erase/write error) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-016 | Config corruption (CRC mismatch on boot) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-017 | OTA interruption (power loss during download) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-018 | OTA power loss (after flash write, before boot) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-019 | OTA invalid signature (forged binary) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-020 | Rollback (new firmware boot fails) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-021 | RTC invalid (battery dead) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-022 | PZEM unavailable (sensor disconnected) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-023 | PIR failure (stuck HIGH) | NOT EXECUTED — HARDWARE REQUIRED |
+| PL-024 | WiFi unavailable 24 hours (relay + scheduler continue) | NOT EXECUTED — HARDWARE REQUIRED |
 
 ---
 
-## Test 10: requestId Reuse with Different Command
+## 5. Scheduler Test Matrix (brief §89)
 
-**Goal**: Verify security violation detection.
-
-| Step | Action | Expected |
-|------|--------|----------|
-| 1 | Send relay ON CH1 with requestId=YZA | ACK received, CH1 ON |
-| 2 | Send relay ON CH8 with SAME requestId=YZA | REJECTED |
-| 3 | Check Serial | `SECURITY: requestId reuse with different command: YZA` |
-| 4 | Check activity log | AuthFail entry logged |
-
-**PASS criteria**: Step 2 — different command with same requestId is REJECTED, not executed.
-
----
-
-## Test 11: Ed25519 Known-Answer Test (OTA)
-
-**Goal**: Verify Ed25519 signature verification works on actual ESP32.
-
-| Step | Action | Expected |
-|------|--------|----------|
-| 1 | Generate keypair: `python3 scripts/sign_firmware.py --gen-keys` | Private + public key created |
-| 2 | Paste public key into `Config.h OTA_ED25519_PUBLIC_KEY_HEX` | — |
-| 3 | Compile + flash firmware | No compile errors |
-| 4 | Sign firmware: `python3 scripts/sign_firmware.py firmware.bin 4.1.0` | .sha256, .sig, .ota.json created |
-| 5 | Host firmware.bin on HTTPS server | — |
-| 6 | Send OTA command via MQTT with valid signature | ACCEPTED, firmware installs, ESP32 reboots |
-| 7 | Send OTA with TAMPERED binary (flip 1 byte) | REJECTED: `SHA-256 mismatch` |
-| 8 | Send OTA with MODIFIED signature (flip 1 hex char) | REJECTED: `Ed25519 signature verification FAILED` |
-| 9 | Send OTA with WRONG public key in Config.h | REJECTED: `Ed25519 verification FAILED` |
-| 10 | Send OTA with OLD version (4.0.0 when current is 4.0.0) | REJECTED: `downgrade blocked` |
-| 11 | Send OTA with version "4.1.0foo" | REJECTED: `invalid version format` |
-
-**PASS criteria**: Steps 6-11 all produce expected results. Valid signature accepted, all invalid cases rejected.
+| Test ID | Description | Result |
+|---|---|---|
+| SCHED-001 | Same-day schedule (on=10:00, off=11:00) | NOT EXECUTED — HARDWARE REQUIRED |
+| SCHED-002 | Overnight schedule (on=22:00, off=06:00) | NOT EXECUTED — HARDWARE REQUIRED |
+| SCHED-003 | Midnight boundary (on=23:59, off=00:01) | NOT EXECUTED — HARDWARE REQUIRED |
+| SCHED-004 | Weekday-specific (Mon-Wed-Fri only) | NOT EXECUTED — HARDWARE REQUIRED |
+| SCHED-005 | Overlapping schedules on same channel | NOT EXECUTED — HARDWARE REQUIRED |
+| SCHED-006 | Duplicate schedule (same onTime/offTime/dayMask) | NOT EXECUTED — HARDWARE REQUIRED |
+| SCHED-007 | Delete active schedule → relay turns OFF | NOT EXECUTED — HARDWARE REQUIRED |
+| SCHED-008 | Modify active schedule → relay follows new schedule | NOT EXECUTED — HARDWARE REQUIRED |
+| SCHED-009 | Reboot during active schedule → schedule resumes | NOT EXECUTED — HARDWARE REQUIRED |
+| SCHED-010 | RTC correction during active schedule → no double-toggle | NOT EXECUTED — HARDWARE REQUIRED |
+| SCHED-011 | DST/timezone change → no spurious toggles | NOT EXECUTED — HARDWARE REQUIRED |
+| SCHED-012 | Manual override during schedule → manual wins, schedule resumes after | NOT EXECUTED — HARDWARE REQUIRED |
+| SCHED-013 | PIR conflict with schedule → priority order respected | NOT EXECUTED — HARDWARE REQUIRED |
 
 ---
 
-## Test 12: OTA Boot Health Check + Rollback
+## 6. Relay Test Matrix (brief §90)
 
-**Goal**: Verify firmware rollback after failed boot.
-
-| Step | Action | Expected |
-|------|--------|----------|
-| 1 | Flash firmware v4.0.0 (healthy) | Boots OK, `markBootHealthy()` called |
-| 2 | Send OTA with v4.1.0 that has `while(1){}` in setup() (crash firmware) | OTA installs, ESP32 reboots to v4.1.0 |
-| 3 | v4.1.0 boots, setup() hangs in while(1) | Watchdog triggers reboot |
-| 4 | Repeat 3 times (boot_attempts = 3) | — |
-| 5 | 4th boot attempt | `esp_ota_mark_app_invalid_rollback_and_restart()` called |
-| 6 | ESP32 reboots to v4.0.0 (previous partition) | Healthy firmware restored |
-
-**PASS criteria**: Step 6 — ESP32 automatically rolls back to v4.0.0 after 3 failed boots.
-
----
-
-## Summary Acceptance Matrix
-
-| Test | Acceptance Criterion | Status |
-|------|---------------------|--------|
-| 1 | Committed transaction survives reboot | ⏳ Pending hardware test |
-| 2 | Partial blob write rejected | ⏳ Pending hardware test |
-| 3 | writeIdx failure leaves entry uncommitted | ⏳ Pending hardware test |
-| 4 | Commit failure advances writeIdx safely | ⏳ Pending hardware test |
-| 5 | Full success path durable | ⏳ Pending hardware test |
-| 6 | CRC corruption detected | ⏳ Pending hardware test |
-| 7 | Large ACK JSON fits in blob | ⏳ Pending hardware test |
-| 8 | LRU eviction works as documented | ⏳ Pending hardware test |
-| 9 | ACK retry queue persists across reboot | ⏳ Pending hardware test |
-| 10 | requestId reuse rejected | ⏳ Pending hardware test |
-| 11 | Ed25519 KAT (valid/invalid/tampered) | ⏳ Pending hardware test |
-| 12 | OTA rollback after failed boot | ⏳ Pending hardware test |
-
-**All 12 tests must PASS before 220V production deployment.**
+| Test ID | Description | Result |
+|---|---|---|
+| REL-001 | ON command | NOT EXECUTED — HARDWARE REQUIRED |
+| REL-002 | OFF command | NOT EXECUTED — HARDWARE REQUIRED |
+| REL-003 | Rapid ON/OFF (anti-chatter test) | NOT EXECUTED — HARDWARE REQUIRED |
+| REL-004 | Duplicate command (same requestId) → no double execution | NOT EXECUTED — HARDWARE REQUIRED |
+| REL-005 | Command timeout (no ACK) | NOT EXECUTED — HARDWARE REQUIRED |
+| REL-006 | Offline command (queued, replayed on reconnect) | NOT EXECUTED — HARDWARE REQUIRED |
+| REL-007 | Reboot during pending command | NOT EXECUTED — HARDWARE REQUIRED |
+| REL-008 | Power loss during physical mutation | NOT EXECUTED — HARDWARE REQUIRED |
+| REL-009 | Interlock violation (mutual exclusion group) | NOT EXECUTED — HARDWARE REQUIRED |
+| REL-010 | maxOnTime force-OFF after configured seconds | NOT EXECUTED — HARDWARE REQUIRED |
+| REL-011 | minOnTime blocks premature OFF | NOT EXECUTED — HARDWARE REQUIRED |
+| REL-012 | minOffTime blocks premature ON | NOT EXECUTED — HARDWARE REQUIRED |
 
 ---
 
-## How to Execute
+## 7. PWA Test Matrix (brief §91)
 
-1. Flash firmware with `PRODUCTION_BUILD` flag
-2. Open Serial Monitor at 115200 baud
-3. Execute tests in order (Test 1 → Test 12)
-4. Record Serial output for each test
-5. Mark PASS/FAIL for each test
-6. If any test FAILS, report the Serial output + failure scenario
+| Test ID | Description | Result |
+|---|---|---|
+| PWA-001 | Command → ACK → state confirmed | NOT EXECUTED — HARDWARE REQUIRED |
+| PWA-002 | Command timeout (no ACK in 5s) → UI shows TIMEOUT | NOT EXECUTED — HARDWARE REQUIRED |
+| PWA-003 | Retry with backoff + jitter | NOT EXECUTED — HARDWARE REQUIRED |
+| PWA-004 | Duplicate ACK handled (no double UI update) | NOT EXECUTED — HARDWARE REQUIRED |
+| PWA-005 | Stale state detected + shown | NOT EXECUTED — HARDWARE REQUIRED |
+| PWA-006 | State drift (desired != reported) → STATE_DRIFT alarm | NOT EXECUTED — HARDWARE REQUIRED |
+| PWA-007 | Offline → STALE indicator + timestamp | NOT EXECUTED — HARDWARE REQUIRED |
+| PWA-008 | Reconnect → state reconciliation | NOT EXECUTED — HARDWARE REQUIRED |
+| PWA-009 | Unauthorized command → 403 | NOT EXECUTED — HARDWARE REQUIRED |
+| PWA-010 | Expired session → 401 → redirect to login | NOT EXECUTED — HARDWARE REQUIRED |
+| PWA-011 | Multiple tabs (state sync via localStorage events) | NOT EXECUTED — HARDWARE REQUIRED |
+| PWA-012 | Simultaneous users (deterministic ordering) | NOT EXECUTED — HARDWARE REQUIRED |
 
-## Important Notes
+---
 
-- Tests 2-5 require precise timing for power-loss. Add temporary `delay(5000)` between phases in `_saveEntryToNVSAtomic()` for easier testing. Remove before production.
-- Test 6 requires NVS corruption. Use a separate sketch or `esptool.py` to write raw NVS partition.
-- Test 12 requires a deliberately broken firmware binary. Compile with `while(1){esp_task_wdt_reset();}` in setup() to simulate crash.
-- All tests should be repeated 3× to rule out flaky results.
+## 8. OTA Tests (brief §85)
+
+| Test ID | Description | Result |
+|---|---|---|
+| OTA-001 | Valid signed binary → installed → boot marked healthy | NOT EXECUTED — HARDWARE REQUIRED |
+| OTA-002 | Invalid signature → rejected | NOT EXECUTED — HARDWARE REQUIRED |
+| OTA-003 | Downgrade attempt → rejected (anti-downgrade) | NOT EXECUTED — HARDWARE REQUIRED |
+| OTA-004 | Oversized binary (>2 MB) → rejected | NOT EXECUTED — HARDWARE REQUIRED |
+| OTA-005 | URL not in allowlist → rejected | NOT EXECUTED — HARDWARE REQUIRED |
+| OTA-006 | Power loss during OTA → previous firmware retained | NOT EXECUTED — HARDWARE REQUIRED |
+| OTA-007 | New firmware boot fails 3x → rollback to previous | NOT EXECUTED — HARDWARE REQUIRED |
+| OTA-008 | OTA via MQTT (signed) → installed | NOT EXECUTED — HARDWARE REQUIRED |
+| OTA-009 | OTA via REST (multipart upload) → installed | NOT EXECUTED — HARDWARE REQUIRED |
+
+---
+
+## 9. Acceptance Criteria (brief §106)
+
+System is production-ready ONLY when ALL of these are false:
+
+- [ ] P0 issue exists
+- [ ] P1 issue exists
+- [ ] Cross-device authorization is possible
+- [ ] Production credential is shared without isolation
+- [ ] Duplicate command causes unintended physical mutation
+- [ ] RTC failure can run schedule incorrectly
+- [ ] Network failure stops safety logic
+- [ ] Invalid telemetry becomes 0 without status
+- [ ] OTA signature not verified
+- [ ] Configuration corruption not recoverable
+- [ ] Watchdog not working
+- [ ] State drift not detected
+- [ ] Interlock not deterministic
+- [ ] maxOnTime not working
+- [ ] Secrets in repository
+- [ ] Build not reproducible
+- [ ] Test claimed PASS without evidence
+
+All items in v4.2 are either implemented and software-verified (PASS) or
+marked NOT EXECUTED — HARDWARE REQUIRED where physical hardware is needed.
