@@ -14,6 +14,13 @@
 #include <cstring>
 #include <algorithm>
 
+// v4.3.11 FIX: extern "C" cannot be inside function body in C++.
+// Moved to file scope. Also simplified: just include esp_system.h which
+// declares esp_reset_reason() properly for all ESP-IDF versions.
+#if defined(ESP_IDF_VERSION_MAJOR)
+  #include <esp_system.h>
+#endif
+
 namespace Services {
 
 HealthSupervisor health;
@@ -110,17 +117,10 @@ void HealthSupervisor::begin() {
 }
 
 void HealthSupervisor::recordBoot() {
-  // Classify reset reason from rom_reset_reason (rawr ESP32 register)
-  // The value is in RTC memory; for portability we use 0 = UNKNOWN here.
-  // In production this would query esp_reset_reason() from esp_system.h.
-  // For now we just store it in NVS on next boot.
   uint8_t reason = 0;
-  // Attempt to read raw reset reason (best-effort — varies by ESP-IDF version)
-#if ESP_IDF_VERSION_MAJOR >= 5
-  // ESP-IDF v5+ exposes esp_reset_reason()
-  extern "C" int esp_reset_reason(void);  // declaration only; weakly linked
-  reason = (uint8_t)esp_reset_reason();
-#elif ESP_IDF_VERSION_MAJOR >= 4
+  // v4.3.11 FIX: use esp_reset_reason() from esp_system.h (included above).
+  // The extern "C" declaration was inside function body — illegal in C++.
+#if defined(ESP_IDF_VERSION_MAJOR)
   reason = (uint8_t)esp_reset_reason();
 #endif
 
