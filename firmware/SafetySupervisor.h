@@ -114,6 +114,15 @@ private:
   bool _bootStatesApplied = false;
   // v4.3.1 D-007: per-channel safety lockout state
   SafetyLockoutState _lockoutState[Core::NUM_CHANNELS] = {};
+  // v4.3.2 BLOCKER-02: EXPLICIT fault tracking — NOT inferred from relayState.
+  // Per ChatGPT: "Pisahkan secara eksplisit: faultActive, faultReason,
+  // safetyState, relayState"
+  bool _faultActive[Core::NUM_CHANNELS] = {};       // true when fault condition exists
+  char _faultReason[Core::NUM_CHANNELS][32] = {};  // human-readable fault reason
+  // clearFaultCondition() — called internally when the fault is resolved.
+  // For maxOnTime: fault resolves when relay goes OFF (no longer timing).
+  // Returns true if fault was active and is now resolved.
+  bool _isFaultConditionResolved(uint8_t idx) const;
 };
 
 extern SafetySupervisor safety;

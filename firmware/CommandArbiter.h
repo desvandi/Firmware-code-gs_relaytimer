@@ -64,13 +64,9 @@ inline const char* sourceStr(CommandSource s) {
 }
 
 // ---------- COMMAND SEMANTICS (audit P1-007) ----------
-// Per ChatGPT audit: "logical idempotency ≠ physical side-effect idempotency"
-// Firmware must distinguish SET_STATE (idempotent — re-executing is safe)
-// from NON_IDEMPOTENT_ACTION (PULSE / TOGGLE / START_MOTOR /
-// TRIGGER_CONTACTOR / RESET — re-executing is NOT safe).
 enum class CommandSemantics : uint8_t {
-  IdempotentState       = 0,  // SET_STATE: ON, OFF, SET_MODE — replay-safe
-  NonIdempotentAction   = 1,  // PULSE / TOGGLE / etc. — NOT replay-safe
+  IdempotentState       = 0,
+  NonIdempotentAction   = 1,
 };
 
 inline const char* semanticsStr(CommandSemantics s) {
@@ -80,6 +76,34 @@ inline const char* semanticsStr(CommandSemantics s) {
   }
   return "IDEMPOTENT_STATE";
 }
+
+// v4.3.2 BLOCKER-05: Explicit whitelist of supported command types.
+// Per ChatGPT: "Unknown command: REJECT. Jangan menggunakan blacklist."
+// Fail-closed: anything NOT in this enum is rejected.
+enum class SupportedCommandType : uint8_t {
+  SetRelayState       = 0,   // SET_STATE: ON/OFF — idempotent
+  SetMode              = 1,   // SET_MODE: auto/manual — idempotent
+  AcknowledgeAlarm    = 2,   // ACK safety alarm — idempotent
+  ClearSafetyLockout  = 3,   // CLEAR safety lockout — idempotent
+  // PULSE, TOGGLE, START_MOTOR, TRIGGER_CONTACTOR, RESET → NOT supported → REJECT
+};
+constexpr uint8_t NUM_SUPPORTED_COMMANDS = 4;
+
+inline const char* supportedCommandStr(SupportedCommandType t) {
+  switch (t) {
+    case SupportedCommandType::SetRelayState:      return "SET_RELAY_STATE";
+    case SupportedCommandType::SetMode:              return "SET_MODE";
+    case SupportedCommandType::AcknowledgeAlarm:     return "ACK_ALARM";
+    case SupportedCommandType::ClearSafetyLockout:   return "CLEAR_ALARM";
+  }
+  return "UNKNOWN";
+}
+
+// v4.3.2 BLOCKER-04: Monotonic command sequence for ordering enforcement.
+// Per ChatGPT: "Jangan defer ke protocol v5. Implementasikan minimum
+// monotonic command sequence/version sekarang."
+// requestId = duplicate identity ("pernah diproses?")
+// commandSequence = ordering/relevance ("masih relevan?")
 
 // ---------- ARBITRATION RESULT ----------
 struct ArbitrationResult {
@@ -93,40 +117,42 @@ struct ArbitrationResult {
 
 // ---------- COMMAND REQUEST (formal input to Arbiter) ----------
 struct CommandRequest {
-  uint8_t           channelIdx;        // 0..NUM_CHANNELS-1
+  uint8_t           channelIdx;
   CommandSource     source;
   CommandSemantics  semantics;
+  SupportedCommandType commandType;  // v4.3.2 BLOCKER-05: whitelist type
   bool              targetState;
-  const char*       requestId;         // optional UUID (NULL for non-transactional)
-  const char*       reason;            // optional human-readable
+  const char*       requestId;
+  const char*       reason;
+  uint32_t          commandSequence;  // v4.3.2 BLOCKER-04: monotonic ordering
 };
 
 // ---------- COMMAND ARBITER ----------
 class CommandArbiter {
 public:
-  // Single entry point: given the current state of all input sources
-  // (manual mode + PIR + schedule + safety), produce the authoritative
-  // desired state for the channel.
-  //
-  // This is the SINGLE authoritative path for computing desired state.
-  // RelayEngine::tick() calls this and applies the result via RelayDriver.
-  // No other code path may compute desired state directly.
   ArbitrationResult arbitrate(uint8_t channelIdx,
                                uint16_t currentMin, int weekdayIdx);
 
-  // Process an explicit operator/remote command (REST or MQTT ingress).
-  // Returns the arbitration result. Caller (REST handler / MQTT handler)
-  // applies the result via RelayEngine.
+  // v4.3.2 BLOCKER-04, BLOCKER-05: processCommand now enforces:
+  //   1. Whitelist: commandType must be in SupportedCommandType enum (fail-closed)
+  //   2. Stale: commandSequence must be > lastAppliedSequence[channel]
+  //   3. Duplicate: requestId checked by TransactionJournal (existing)
   ArbitrationResult processCommand(const CommandRequest& req);
 
-  // Get the last arbitration result for a channel (for SystemStatus serialization)
   ArbitrationResult getLastResult(uint8_t channelIdx) const;
+
+  // v4.3.2 BLOCKER-04: query last applied sequence per channel
+  uint32_t getLastAppliedSequence(uint8_t channelIdx) const {
+    if (channelIdx >= Core::NUM_CHANNELS) return 0;
+    return _lastAppliedSeq[channelIdx];
+  }
 
 private:
   ArbitrationResult _lastResult[Core::NUM_CHANNELS] = {};
   bool              _initialized = false;
+  // v4.3.2 BLOCKER-04: per-channel monotonic command sequence
+  uint32_t          _lastAppliedSeq[Core::NUM_CHANNELS] = {};
 
-  // Internal helpers
   bool              _evaluateManual(uint8_t idx, ArbitrationResult& out);
   bool              _evaluateSchedule(uint8_t idx, uint16_t currentMin, int weekdayIdx,
                                       ArbitrationResult& out);

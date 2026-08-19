@@ -120,26 +120,50 @@ uint8_t SafetySupervisor::checkMaxOnTimeExceeded() {
   unsigned long now = millis();
   for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
     Core::Channel& ch = Core::channels[i];
-    if (ch.maxOnTimeSec == 0) continue;        // no limit configured
-    if (!Core::relayState[i]) continue;        // not currently ON
-    if (ch.maxOnTimeForced) continue;          // already forced OFF
-    if (ch.onSinceMs == 0) continue;           // never turned ON (shouldn't happen)
+    if (ch.maxOnTimeSec == 0) continue;
+    if (!Core::relayState[i]) continue;
+    if (ch.maxOnTimeForced) continue;
+    if (ch.onSinceMs == 0) continue;
     unsigned long elapsedSec = (now - ch.onSinceMs) / 1000UL;
     if (elapsedSec >= ch.maxOnTimeSec) {
-      // v4.3.1 D-007: enter TRIPPED state (not just set flag)
       ch.maxOnTimeForced = true;
       _lockoutState[i] = SafetyLockoutState::Tripped;
+      // v4.3.2 BLOCKER-02: set EXPLICIT fault tracking
+      _faultActive[i] = true;
+      strncpy(_faultReason[i], "maxOnTime exceeded", sizeof(_faultReason[i]) - 1);
+      _faultReason[i][sizeof(_faultReason[i]) - 1] = '\0';
       alarms.raise(Err::RELAY_MAX_ON_TIME, AlarmSeverity::Critical,
                    "maxOnTime exceeded — channel FORCE OFF (TRIPPED)");
       return i;
     }
   }
-  // v4.3.1 D-007: advance CLEARED → ARMED → NORMAL for channels that have
-  // been cleared by operator
+  // v4.3.2 BLOCKER-02: check if fault condition has resolved for channels
+  // in TRIPPED or ACKNOWLEDGED state. For maxOnTime: fault resolves when
+  // relay goes OFF (no longer timing).
+  for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
+    if (_faultActive[i] && _isFaultConditionResolved(i)) {
+      _faultActive[i] = false;  // fault condition resolved
+      // Do NOT auto-clear lockout — operator must still CLEAR explicitly.
+      // This just means the precondition for CLEAR is now met.
+    }
+  }
+  // Advance CLEARED → ARMED → NORMAL
   for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
     armForNormalOperation(i);
   }
   return 0xFF;
+}
+
+bool SafetySupervisor::_isFaultConditionResolved(uint8_t idx) const {
+  if (idx >= Core::NUM_CHANNELS) return false;
+  if (!_faultActive[idx]) return true;  // no fault → trivially resolved
+  // For maxOnTime fault: resolved when relay is OFF
+  // (the timer can only accumulate while relay is ON)
+  if (strncmp(_faultReason[idx], "maxOnTime", 9) == 0) {
+    return !Core::relayState[idx];  // fault resolved when relay OFF
+  }
+  // Unknown fault type — conservatively require manual resolution
+  return false;
 }
 
 void SafetySupervisor::reset() {
@@ -184,29 +208,19 @@ bool SafetySupervisor::acknowledgeSafetyAlarm(uint8_t idx) {
 
 bool SafetySupervisor::clearSafetyLockout(uint8_t idx) {
   if (idx >= Core::NUM_CHANNELS) return false;
-  // Can only CLEAR from ACKNOWLEDGED state
   if (_lockoutState[idx] != SafetyLockoutState::Acknowledged) {
     return false;  // must acknowledge first
   }
-  // v4.3.2 BLOCKER-02: CLEAR requires fault condition to be resolved.
-  // Per ChatGPT audit: "clearSafetyAlarm() harus menolak apabila:
-  //   faultStillActive == true"
-  // The "fault" here is: was the relay ON for too long (maxOnTime exceeded)?
-  // If the relay is STILL ON (shouldn't be — it was forced OFF), or if
-  // onSinceMs indicates the relay was ON recently and hasn't been OFF
-  // long enough, we reject the CLEAR.
-  //
-  // maxOnTimeForced=true means the fault is still active.
-  // We clear maxOnTimeForced HERE (transitioning to CLEARED), but only
-  // if the relay is actually OFF (forced OFF already happened).
-  if (Core::relayState[idx]) {
-    // Relay still ON — fault not resolved. Reject CLEAR.
-    char msg[80];
-    snprintf(msg, sizeof(msg), "CH%u CLEAR rejected — relay still ON (fault active)", idx + 1);
-    return false;
+  // v4.3.2 BLOCKER-02: CLEAR requires EXPLICIT fault condition to be resolved.
+  // Per ChatGPT: "CLEAR harus ditolak apabila faultStillActive == true"
+  // Uses _faultActive (explicit tracking) NOT relayState (inferred).
+  // _isFaultConditionResolved() checks the specific fault type's resolution
+  // precondition (for maxOnTime: relay must be OFF).
+  if (_faultActive[idx] && !_isFaultConditionResolved(idx)) {
+    return false;  // fault condition still active — cannot CLEAR
   }
-  // Relay is OFF — fault condition resolved. Clear lockout.
   _lockoutState[idx] = SafetyLockoutState::Cleared;
+  _faultActive[idx] = false;
   Core::channels[idx].maxOnTimeForced = false;
   alarms.clear(Err::RELAY_MAX_ON_TIME);
   return true;
