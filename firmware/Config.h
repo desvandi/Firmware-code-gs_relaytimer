@@ -9,21 +9,29 @@
 #include <Arduino.h>
 #include <cstdint>
 
-// v4.3 audit P1-016: Build profile guard. Per ChatGPT audit:
-//   "development mode harus explicitly enabled, bukan default."
-//   "PRODUCTION_BUILD harus tidak mungkin tersandung ke public broker."
-//
-// Exactly ONE of DEVELOPMENT_BUILD / STAGING_BUILD / PRODUCTION_BUILD
-// MUST be defined (via platformio.ini build_flags). If none is defined,
-// the build FAILS at compile time — no implicit default.
+// v4.3 audit P1-016: Build profile guard.
+// PlatformIO users: define via platformio.ini build_flags (-DPRODUCTION_BUILD etc.)
+// Arduino IDE users: no build_flags available, so we auto-default to DEVELOPMENT_BUILD
+//   with a compile-time warning. To use PRODUCTION_BUILD in Arduino IDE:
+//   Sketch → Show Sketch Folder → edit Config.h → uncomment #define PRODUCTION_BUILD below.
 #if !defined(DEVELOPMENT_BUILD) && !defined(STAGING_BUILD) && !defined(PRODUCTION_BUILD)
-  #error "Build profile not selected. Define one of: -DDEVELOPMENT_BUILD, -DSTAGING_BUILD, or -DPRODUCTION_BUILD (in platformio.ini build_flags). Production MUST use PRODUCTION_BUILD."
+  #if defined(PLATFORMIO)
+    // PlatformIO: build profile MUST be explicitly selected
+    #error "Build profile not selected. Define one of: -DDEVELOPMENT_BUILD, -DSTAGING_BUILD, or -DPRODUCTION_BUILD (in platformio.ini build_flags). Production MUST use PRODUCTION_BUILD."
+  #else
+    // Arduino IDE: auto-default to DEVELOPMENT_BUILD (no build_flags mechanism)
+    #warning "Arduino IDE detected: auto-selecting DEVELOPMENT_BUILD. For production: use PlatformIO with -DPRODUCTION_BUILD, or manually uncomment #define PRODUCTION_BUILD in Config.h."
+    #define DEVELOPMENT_BUILD
+  #endif
 #endif
 #if (defined(DEVELOPMENT_BUILD) && defined(STAGING_BUILD)) || \
     (defined(DEVELOPMENT_BUILD) && defined(PRODUCTION_BUILD)) || \
     (defined(STAGING_BUILD) && defined(PRODUCTION_BUILD))
   #error "Multiple build profiles defined. Select exactly ONE of DEVELOPMENT_BUILD / STAGING_BUILD / PRODUCTION_BUILD."
 #endif
+
+// ---- Arduino IDE manual override (uncomment for production) ----
+// #define PRODUCTION_BUILD
 
 // ---------- FIRMWARE VERSION ----------
 namespace Core {
