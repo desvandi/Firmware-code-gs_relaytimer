@@ -68,6 +68,17 @@ void ResistanceEstimator::_evaluatePassive() {
   if (!battery.getLatestVi(v, i, ts)) return;
   if (!isF(v) || !isF(i)) return;
 
+  // v4.1.1 audit: staleness check — if no new valid resistance computed
+  //   for > STALE_MS, mark INVALID. This ensures consumers don't trust a
+  //   stale value from a transient that happened long ago.
+  if (_packRes.valid && _packRes.timestamp > 0) {
+    if (millis() - _packRes.timestamp > STALE_MS) {
+      _packRes.valid = false;
+      _packRes.quality = ResistanceQuality::INVALID;
+      // Diagnostics will pick this up on next tick
+    }
+  }
+
   // Push to ring
   _vRing[_ringIdx] = v;
   _iRing[_ringIdx] = i;
@@ -75,44 +86,49 @@ void ResistanceEstimator::_evaluatePassive() {
   _ringIdx = (_ringIdx + 1) % RING_LEN;
   if (_ringIdx == 0) _ringFilled = true;
 
-  // Find the pair with the largest |ΔI| within the ring window
   uint8_t n = _ringFilled ? RING_LEN : _ringIdx;
   if (n < 4) return;
 
-  uint8_t bestA = 0, bestB = 0;
-  float bestAbsDI = 0;
-  for (uint8_t a = 0; a < n; a++) {
-    for (uint8_t b = a + 1; b < n; b++) {
-      if (!isF(_vRing[a]) || !isF(_vRing[b])) continue;
-      if (!isF(_iRing[a]) || !isF(_iRing[b])) continue;
-      float dI = _iRing[b] - _iRing[a];
-      float absDI = std::fabs(dI);
-      if (absDI > bestAbsDI) {
-        bestAbsDI = absDI;
-        bestA = a; bestB = b;
-      }
-    }
+  // v4.1.1 audit: replace O(n²) pair-wise scan with single-pass min/max.
+  //   Find the index of min-I and max-I in the ring buffer (single pass).
+  //   V0 = V at min-I time, V1 = V at max-I time.
+  //   ΔV = |V0 - V1|, ΔI = |Imax - Imin|.
+  //   This is more robust against noise (the pair-wise scan was picking up
+  //   spurious small-step pairs adjacent to the real transient).
+  uint8_t iMinIdx = 0, iMaxIdx = 0;
+  float iMin = _iRing[0], iMax = _iRing[0];
+  bool anyValid = false;
+  for (uint8_t k = 0; k < n; k++) {
+    if (!isF(_vRing[k]) || !isF(_iRing[k])) continue;
+    anyValid = true;
+    if (_iRing[k] < iMin) { iMin = _iRing[k]; iMinIdx = k; }
+    if (_iRing[k] > iMax) { iMax = _iRing[k]; iMaxIdx = k; }
   }
+  if (!anyValid) return;
 
-  if (bestAbsDI < Battery::RESISTANCE_MIN_DELTA_I_A) {
+  float dI = iMax - iMin;  // always >= 0
+  if (dI < Battery::RESISTANCE_MIN_DELTA_I_A) {
+    // Not enough current variation in the window — don't mark INVALID
+    // (preserve previous result if still within STALE_MS)
     _packRes.quality = ResistanceQuality::LOW_DELTA_I;
-    _packRes.valid = false;
     return;
   }
 
-  float dI = _iRing[bestB] - _iRing[bestA];
-  float dV = _vRing[bestA] - _vRing[bestB];  // V0 - V1 (post-load drop)
-  uint32_t window = (_tsRing[bestB] >= _tsRing[bestA])
-                  ? (_tsRing[bestB] - _tsRing[bestA]) : 0;
+  float vAtMinI = _vRing[iMinIdx];
+  float vAtMaxI = _vRing[iMaxIdx];
+  float dV = vAtMinI - vAtMaxI;  // V0 - V1 (post-load drop) — signed
+  uint32_t window = (_tsRing[iMaxIdx] >= _tsRing[iMinIdx])
+                  ? (_tsRing[iMaxIdx] - _tsRing[iMinIdx])
+                  : (_tsRing[iMinIdx] - _tsRing[iMaxIdx]);
 
   if (std::fabs(dV) < Battery::RESISTANCE_MIN_DELTA_V_V) {
     _packRes.quality = ResistanceQuality::LOW_DELTA_I;
-    _packRes.valid = false;
     return;
   }
 
-  // Check sample window noise (variance) — UNSTABLE if too noisy
-  // Compute mean + variance of V and I across the ring window
+  // Compute mean + variance across the ring for UNSTABLE detection.
+  // (Replaces the original variance check that was preserved after
+  // the pair-wise scan.)
   float vSum = 0, iSum = 0; uint8_t cnt = 0;
   for (uint8_t k = 0; k < n; k++) {
     if (isF(_vRing[k]) && isF(_iRing[k])) {
@@ -133,7 +149,6 @@ void ResistanceEstimator::_evaluatePassive() {
   if (vVar > 0.05f * std::fabs(vMean) + 0.01f ||
       iVar > 0.05f * std::fabs(iMean) + 0.05f) {
     _packRes.quality = ResistanceQuality::UNSTABLE;
-    _packRes.valid = false;
     return;
   }
 
@@ -141,7 +156,6 @@ void ResistanceEstimator::_evaluatePassive() {
   float R = std::fabs(dV / dI);
   if (!isF(R) || R > Battery::RESISTANCE_MAX_VALID_OHMS) {
     _packRes.quality = ResistanceQuality::INVALID;
-    _packRes.valid = false;
     return;
   }
 
@@ -151,8 +165,7 @@ void ResistanceEstimator::_evaluatePassive() {
   _packRes.sampleWindowMs = window;
   _packRes.timestamp = millis();
   _packRes.valid = true;
-  // Quality grading
-  if (bestAbsDI >= 5.0f * Battery::RESISTANCE_MIN_DELTA_I_A &&
+  if (dI >= 5.0f * Battery::RESISTANCE_MIN_DELTA_I_A &&
       std::fabs(dV) >= 5.0f * Battery::RESISTANCE_MIN_DELTA_V_V) {
     _packRes.quality = ResistanceQuality::HIGH_CONFIDENCE;
   } else {
@@ -163,16 +176,27 @@ void ResistanceEstimator::_evaluatePassive() {
   bool highR = (R > 0.050f);  // 50 mΩ threshold (pack-level)
   batteryDiagnostics.setPackResistanceAlarm(highR, R);
 
-  // Cell resistance (brief §28) — use latest cell voltages around the step.
-  // We use a single ΔVcell[n] snapshot per cell at the bestA/bestB timestamps.
-  // This is a rough estimate because cells aren't stored in the ring buffer;
-  // a more rigorous implementation would buffer cells too. For diagnostic use
-  // we capture the current snapshot vs the step ΔI.
+  // v4.1.1 audit: capture per-cell voltages into the per-cell ring buffer
+  //   at the same cadence as V/I. We do this AFTER pushing V/I to the ring
+  //   so they share the same _ringIdx position.
   const CellMeasurement* cells = battery.getCells();
+  for (uint8_t k = 0; k < Battery::NUM_CELLS; k++) {
+    _cellRing[k][_ringIdx == 0 ? RING_LEN - 1 : _ringIdx - 1] = cells[k].voltageV;
+  }
+  _cellRingInit = true;
+
+  // Compute per-cell ΔV using actual cell voltages at iMinIdx and iMaxIdx.
+  // vCellPre[k] = cell voltage at min-I time (less loaded → higher V)
+  // vCellPost[k] = cell voltage at max-I time (more loaded → lower V)
   float vCellPre[Battery::NUM_CELLS], vCellPost[Battery::NUM_CELLS];
   for (uint8_t k = 0; k < Battery::NUM_CELLS; k++) {
-    vCellPre[k] = cells[k].voltageV;
-    vCellPost[k] = cells[k].voltageV;  // best-effort: cell ring not stored
+    if (_cellRingInit) {
+      vCellPre[k] = _cellRing[k][iMinIdx];
+      vCellPost[k] = _cellRing[k][iMaxIdx];
+    } else {
+      vCellPre[k] = cells[k].voltageV;
+      vCellPost[k] = cells[k].voltageV;
+    }
   }
   _evaluateCells(vCellPre, vCellPost, dI, window);
 }

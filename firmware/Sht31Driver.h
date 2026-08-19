@@ -51,6 +51,26 @@ private:
   Sht31Reading _reading = {};
   unsigned long _lastReadMs = 0;
 
+  // v4.1.1 audit: non-blocking state machine (replaces previous delay(15)
+  // which violated brief §44 "no sensor acquisition may block relay/MQTT/
+  // REST/OTA/scheduler/watchdog/transaction processing").
+  //   State IDLE          → if interval elapsed, send measure cmd → State CONVERTING
+  //   State CONVERTING    → wait for SHT31_CONV_TIME_MS (no delay!) → State READY
+  //   State READY         → read 6 bytes + CRC, update reading → State IDLE
+  enum class State : uint8_t {
+    Idle = 0,
+    Converting,
+    Ready,
+  };
+  State    _state = State::Idle;
+  unsigned long _stateEnteredMs = 0;
+
+  // I2C failure recovery (brief §46 — no infinite retry, no spam)
+  uint8_t  _consecutiveErrors = 0;
+  unsigned long _nextRetryMs = 0;  // when unavailable, only retry after this time
+  static constexpr uint16_t MAX_CONSECUTIVE_ERRORS = 10;
+  static constexpr uint32_t RECOVERY_RETRY_MS = 60000;  // 60 s slow retry after sustained failure
+
   bool _sendCommand(uint16_t cmd);
   bool _read6(uint8_t out[6]);
   bool _crc8(const uint8_t* data, uint8_t len, uint8_t expected) const;

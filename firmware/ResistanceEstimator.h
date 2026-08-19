@@ -75,13 +75,28 @@ private:
   CellResistanceResult _cellRes[Battery::NUM_CELLS] = {};
   bool _initialized = false;
 
-  // Rolling buffer for passive step detection
+  // Rolling buffer for passive step detection (v4.1.1 audit: kept for
+  //   reference but the algorithm now uses single-pass min/max scan instead
+  //   of O(n²) pair-wise comparison — more robust against noise + faster).
   static constexpr uint8_t RING_LEN = 16;
   float _vRing[RING_LEN];
   float _iRing[RING_LEN];
   uint32_t _tsRing[RING_LEN];
   uint8_t  _ringIdx = 0;
   bool     _ringFilled = false;
+
+  // v4.1.1 audit: per-cell ring buffer for true ΔVcell[n] computation.
+  //   Brief §28 requires Rcell[n] = ΔVcell[n] / ΔI from the same load-step
+  //   event. Without per-cell history we were returning Rpack/NUM_CELLS
+  //   (a uniform value) — useless for diagnostics. The new buffer stores
+  //   cell voltages at the same cadence as V/I so we can compute the actual
+  //   per-cell ΔV at the (iMinIdx, iMaxIdx) timestamps.
+  float _cellRing[Battery::NUM_CELLS][RING_LEN];
+  bool  _cellRingInit = false;
+
+  // v4.1.1 audit: staleness check — if no new valid resistance computed for
+  //   STALE_MS, mark the result INVALID (industrial-grade telemetry hygiene).
+  static constexpr uint32_t STALE_MS = 300000;  // 5 min
 
   // Test load state
   bool     _testRunning = false;

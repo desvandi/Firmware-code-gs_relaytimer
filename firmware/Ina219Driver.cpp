@@ -61,9 +61,10 @@ bool Ina219Driver::_readRegister(uint8_t reg, uint16_t& out) {
   Wire.write(reg);
   if (Wire.endTransmission(false) != 0) return false;  // restart
   if (Wire.requestFrom((int)_address, 2) != 2) return false;
+  // v4.1.1 audit: reduce timeout from 50 ms to 10 ms — non-blocking-friendly
   uint32_t start = millis();
   while (Wire.available() < 2) {
-    if (millis() - start > 50) return false;  // 50 ms timeout (non-blocking-ish)
+    if (millis() - start > 10) return false;
   }
   uint8_t hi = Wire.read();
   uint8_t lo = Wire.read();
@@ -88,22 +89,24 @@ bool Ina219Driver::begin() {
   }
   delay(2);  // INA219 datasheet: 100 µs minimum after reset
 
-  // Configure: 32 V FSR (bit13=0), shunt PGA ±320 mV (bits11-12=00),
-  // 16-sample averaging for both shunt and bus (bits7-10=1111, bits3-6=1111),
-  // shunt + bus continuous (bits0-2=11).
-  // Binary: 0000 1111 1000 1111 1111 0011 = 0x3F8F + (10<<3) wait recheck
-  // Actual: CONFIG = 32V/320mV/12-bit/16-sample/16-sample/shunt+bus-continuous
-  //   bits15-13: 000 (32 V FSR)
-  //   bits12-11: 00 (PGA ±320 mV)
-  //   bits10-7:  1111 (shunt 16-sample avg)  → 17.6 ms conversion
-  //   bits6-3:   1111 (bus 16-sample avg)
-  //   bits2-0:   011 (shunt+bus continuous)
-  uint16_t config = 0b0000000011111111; // 0x00FF
-  config |= (0b1111 << 7);              // shunt avg
-  config |= (0b1111 << 3);              // bus avg
-  config |= 0b011;                       // continuous shunt+bus
-  // → 0x3FFF (32V, 320 mV PGA, 16-sample both, continuous)
-  if (!_writeRegister(REG_CONFIG, config)) {
+  // Configure per INA219 datasheet §8.5.1 (bit layout).
+  //
+  // INDUSTRIAL AUDIT FIX (v4.1.1): previous code computed 0x07FF which has
+  //   bit13=0 (16V FSR) and bits12-11=00 (±40mV PGA) — both WRONG for 8S
+  //   LiFePO4. At 26.4 V pack the bus voltage saturates; at 100 A × 0.75 mΩ
+  //   = 75 mV the shunt PGA saturates. Correct config is 0x3FFB:
+  //
+  //     bit 15:     0   (no reset)
+  //     bit 14:     0   (reserved, always 0)
+  //     bit 13:     1   (BRNG=1 → 32 V FSR, required for 8S LiFePO4 ≤29.2 V)
+  //     bits 12-11: 11  (PG=11  → ±320 mV PGA, required for 100 A × 0.75 mΩ)
+  //     bits 10-7:  1111 (SADC=1111 → 16-sample shunt averaging)
+  //     bits 6-3:   1111 (BADC=1111 → 16-sample bus averaging)
+  //     bits 2-0:   011 (MODE=011  → shunt+bus continuous)
+  //
+  //   → 0x3FFB (binary: 0011 1111 1111 1011)
+  constexpr uint16_t CONFIG_NORMAL = 0x3FFB;
+  if (!_writeRegister(REG_CONFIG, CONFIG_NORMAL)) {
     _reading.status = Ina219Status::I2cError;
     Serial.printf("[INA219 0x%02X] config write failed\n", _address);
     return false;
@@ -132,14 +135,30 @@ bool Ina219Driver::begin() {
 void Ina219Driver::tick() {
   if (!_available) return;
   unsigned long now = millis();
+
+  // v4.1.1 audit: I2C failure recovery cooldown — skip read attempts during
+  // recovery window to free I2C bus bandwidth.
+  if (_nextRetryMs > 0 && now < _nextRetryMs) return;
+  if (_nextRetryMs > 0 && now >= _nextRetryMs) {
+    _nextRetryMs = 0;
+    _consecutiveErrors = 0;
+    Serial.printf("[INA219 0x%02X] retrying after recovery cooldown\n", _address);
+  }
+
   if (now - _lastReadMs < Battery::INA219_INTERVAL_MS) return;
   _lastReadMs = now;
 
   uint16_t shuntRaw, busRaw;
   if (!_readRegister(REG_SHUNT, shuntRaw) || !_readRegister(REG_BUS, busRaw)) {
     _reading.status = Ina219Status::I2cError;
+    if (++_consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+      _nextRetryMs = now + RECOVERY_RETRY_MS;
+      Serial.printf("[INA219 0x%02X] %u consecutive errors — cooldown %lu s\n",
+                    _address, _consecutiveErrors, RECOVERY_RETRY_MS / 1000);
+    }
     return;
   }
+  _consecutiveErrors = 0;  // reset on success
 
   // Shunt voltage: 16-bit signed, LSB = 10 µV (brief datasheet)
   int16_t shuntSigned = _signExtend16(shuntRaw);

@@ -101,7 +101,26 @@ private:
   bool _writeConfig(uint16_t value);
   bool _readConversion(uint16_t& out);
   bool _startConversion(uint8_t channel);
-  bool _waitAndRead(uint8_t channel);
+
+  // v4.1.1 audit: non-blocking state machine replaces _waitAndRead polling.
+  //   State IDLE         → if interval elapsed, start conversion → State CONVERTING
+  //   State CONVERTING  → wait ADS1115_CONV_TIME_MS at 860 SPS = ~1.2 ms
+  //                       (no delay!) → State READY
+  //   State READY       → read conversion register, update channel → State IDLE
+  enum class State : uint8_t {
+    Idle = 0,
+    Converting,
+    Ready,
+  };
+  State    _state = State::Idle;
+  unsigned long _convStartMs = 0;
+  uint8_t  _convChannel = 0;  // channel currently being converted
+
+  // I2C failure recovery
+  uint8_t  _consecutiveErrors = 0;
+  unsigned long _nextRetryMs = 0;
+  static constexpr uint16_t MAX_CONSECUTIVE_ERRORS = 10;
+  static constexpr uint32_t RECOVERY_RETRY_MS = 60000;
 };
 
 // Pre-defined instances (brief §13, §16)

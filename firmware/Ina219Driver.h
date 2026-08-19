@@ -73,6 +73,14 @@ private:
   float    _emaCurrent = 0.0f;   // EMA smoothing (brief §45)
   bool     _emaInit = false;
 
+  // v4.1.1 audit: I2C failure recovery — after MAX consecutive errors,
+  // enter cooldown for RECOVERY_RETRY_MS (60 s) to free I2C bus bandwidth
+  // for other sensors (brief §46).
+  uint8_t  _consecutiveErrors = 0;
+  unsigned long _nextRetryMs = 0;
+  static constexpr uint16_t MAX_CONSECUTIVE_ERRORS = 10;
+  static constexpr uint32_t RECOVERY_RETRY_MS = 60000;
+
   // Register addresses (INA219 datasheet)
   enum Reg : uint8_t {
     REG_CONFIG     = 0x00,

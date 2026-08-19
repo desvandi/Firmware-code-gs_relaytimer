@@ -1,10 +1,23 @@
 // =============================================================================
-// Ads1115Driver.cpp — 4-channel 16-bit I²C ADC, raw I²C
+// Ads1115Driver.cpp — 4-channel 16-bit I²C ADC, non-blocking state machine
 // =============================================================================
-// Each tick() starts ONE single-shot conversion on the next channel in the
-// round-robin and reads the previous channel's result. With 860 SPS rate
-// (1.16 ms per conversion) and 8 channels across 2 devices, a complete refresh
-// takes ~8 ticks ≈ 800 ms at 100 ms tick interval. (Brief §44.)
+// v4.1.1 audit fix: replaced previous _waitAndRead polling (up to 50 ms
+// blocking) with a non-blocking state machine. Per brief §44.
+//
+// Each tick() advances the state machine:
+//   State IDLE         → if interval elapsed, _startConversion(nextChannel),
+//                         _convStartMs = now, _state = CONVERTING
+//   State CONVERTING  → if now - _convStartMs >= ADS1115_CONV_TIME_MS,
+//                         _state = READY (fall through)
+//   State READY       → _readConversion + apply divider + cal,
+//                         advance _nextChannel round-robin,
+//                         _state = IDLE
+//
+// At 860 SPS, conversion takes ~1.2 ms. With 100 ms tick interval, we
+// have plenty of margin. No delay() calls anywhere.
+//
+// I2C failure recovery: after MAX_CONSECUTIVE_ERRORS (10) consecutive
+// failures, enter cooldown for RECOVERY_RETRY_MS (60 s) to free the bus.
 //
 // Calibration:  ADS reads raw mV at the input pin. Vinput = raw * divider.
 //   vCalibrated = vRaw * gainCal + offsetCal
@@ -30,6 +43,9 @@ Ads1115Driver adsCell2(Battery::ADS1115_CELL2_ADDR,
 
 // LSB for ±6.144 V FSR (gain 2/3) = 6.144 / 32768 = 187.5 µV
 static constexpr float ADS_LSB_V = 0.0001875f;
+// Conversion time at 860 SPS = 1/860 ≈ 1.16 ms. Use 3 ms for safety margin
+// (covers all data rates ≤ 860 SPS — none of our channels use slower rates).
+static constexpr uint16_t ADS1115_CONV_TIME_MS = 3;
 
 Ads1115Driver::Ads1115Driver(uint8_t address, float gain, float dividerRatio,
                              float gainCal, float offsetCal)
@@ -52,9 +68,10 @@ bool Ads1115Driver::_readConversion(uint16_t& out) {
   Wire.write(REG_CONVERSION);
   if (Wire.endTransmission(false) != 0) return false;
   if (Wire.requestFrom((int)_address, 2) != 2) return false;
+  // v4.1.1 audit: reduce timeout from 50 ms to 10 ms
   uint32_t start = millis();
   while (Wire.available() < 2) {
-    if (millis() - start > 50) return false;
+    if (millis() - start > 10) return false;
   }
   uint8_t hi = Wire.read();
   uint8_t lo = Wire.read();
@@ -67,53 +84,7 @@ bool Ads1115Driver::_startConversion(uint8_t channel) {
   // MUX bits for single-ended AIN-GND: 0b100 + channel (0..3)
   uint16_t mux = (uint16_t)(0x04 | (channel & 0x03)) << MUX_SHIFT;
   uint16_t cfg = CFG_SINGLE_SHOT | mux | CFG_MODE_SINGLE | CFG_DR_860SPS | CFG_COMP_OFF;
-  // PGA bits = 000 for ±6.144 V (gain 2/3) — already 0 in our config
   return _writeConfig(cfg);
-}
-
-bool Ads1115Driver::_waitAndRead(uint8_t channel) {
-  // Wait for conversion complete (bit15 of config = 1)
-  uint32_t start = millis();
-  uint16_t cfg;
-  do {
-    Wire.beginTransmission(_address);
-    Wire.write(REG_CONFIG);
-    if (Wire.endTransmission(false) != 0) return false;
-    if (Wire.requestFrom((int)_address, 2) != 2) return false;
-    uint32_t wait = millis();
-    while (Wire.available() < 2) {
-      if (millis() - wait > 50) return false;
-    }
-    uint8_t hi = Wire.read();
-    uint8_t lo = Wire.read();
-    cfg = ((uint16_t)hi << 8) | lo;
-    if (millis() - start > 50) return false;  // 50 ms timeout
-  } while ((cfg & 0x8000) == 0);
-
-  uint16_t raw;
-  if (!_readConversion(raw)) return false;
-
-  // Convert: 16-bit signed raw → voltage at pin = raw * LSB
-  int16_t signedRaw = (int16_t)raw;
-  float pinV = signedRaw * ADS_LSB_V;
-
-  // Sanity check: pin voltage must be in [0, gain]
-  if (pinV < -0.5f || pinV > (_gain + 0.5f)) {
-    _channels[channel].status = AdsStatus::OutOfRange;
-    return false;
-  }
-
-  // Apply divider ratio to recover the actual input voltage
-  float inputV = pinV * _dividerRatio;
-
-  // Apply two-point calibration
-  float calibratedV = inputV * _gainCal + _offsetCal;
-
-  _channels[channel].rawVoltageV = inputV;
-  _channels[channel].voltageV = calibratedV;
-  _channels[channel].timestamp = millis();
-  _channels[channel].status = AdsStatus::Ok;
-  return true;
 }
 
 bool Ads1115Driver::begin() {
@@ -122,38 +93,126 @@ bool Ads1115Driver::begin() {
     _channels[i] = {};
     _channels[i].status = AdsStatus::NotInitialized;
   }
-  // Probe device by writing a config
-  if (!_writeConfig(CFG_SINGLE_SHOT | CFG_MODE_SINGLE | CFG_DR_860SPS | CFG_COMP_OFF)) {
+  // Probe device by writing a config + reading back to verify (industrial grade)
+  uint16_t probeCfg = CFG_SINGLE_SHOT | CFG_MODE_SINGLE | CFG_DR_860SPS | CFG_COMP_OFF;
+  if (!_writeConfig(probeCfg)) {
     Serial.printf("[ADS1115 0x%02X] probe failed — sensor not present?\n", _address);
     return false;
   }
   delay(2);
+
+  // v4.1.1 audit: read back config to verify device responded
+  Wire.beginTransmission(_address);
+  Wire.write(REG_CONFIG);
+  if (Wire.endTransmission(false) != 0) {
+    Serial.printf("[ADS1115 0x%02X] config readback failed\n", _address);
+    return false;
+  }
+  if (Wire.requestFrom((int)_address, 2) != 2) {
+    Serial.printf("[ADS1115 0x%02X] config readback short\n", _address);
+    return false;
+  }
+  uint32_t start = millis();
+  while (Wire.available() < 2) {
+    if (millis() - start > 10) {
+      Serial.printf("[ADS1115 0x%02X] config readback timeout\n", _address);
+      return false;
+    }
+  }
+  (void)Wire.read();
+  (void)Wire.read();  // discard — we just verified I2C responds
+
   _available = true;
-  Serial.printf("[ADS1115 0x%02X] initialized: PGA=±%.3f V, divider=×%.2f, cal=(g=%.4f, o=%.4f)\n",
+  _state = State::Idle;
+  _nextChannel = 0;
+  _consecutiveErrors = 0;
+  _nextRetryMs = 0;
+  Serial.printf("[ADS1115 0x%02X] initialized: PGA=%.3f V, divider=x%.2f, cal=(g=%.4f, o=%.4f)\n",
                 _address, (double)_gain, (double)_dividerRatio,
                 (double)_gainCal, (double)_offsetCal);
-  // Kick off first conversion
-  _startConversion(0);
-  _nextChannel = 0;
   return true;
 }
 
 void Ads1115Driver::tick() {
   if (!_available) return;
   unsigned long now = millis();
-  if (now - _lastReadMs < Battery::ADS1115_INTERVAL_MS) return;
-  _lastReadMs = now;
 
-  // Read previous conversion result, then start next.
-  uint8_t chToRead = _nextChannel;
-  if (!_waitAndRead(chToRead)) {
-    _channels[chToRead].status = AdsStatus::I2cError;
-    // Mark stale (do NOT overwrite last good value — just flag status)
+  // Cooldown after sustained failure
+  if (_nextRetryMs > 0 && now < _nextRetryMs) return;
+  if (_nextRetryMs > 0 && now >= _nextRetryMs) {
+    _nextRetryMs = 0;
+    _consecutiveErrors = 0;
+    _state = State::Idle;
+    Serial.printf("[ADS1115 0x%02X] retrying after recovery cooldown\n", _address);
   }
-  // Advance round-robin
-  _nextChannel = (_nextChannel + 1) & 0x03;
-  if (!_startConversion(_nextChannel)) {
-    _channels[_nextChannel].status = AdsStatus::I2cError;
+
+  // Throttle tick rate (don't start a new conversion too soon after the last)
+  if (_state == State::Idle && (now - _lastReadMs < Battery::ADS1115_INTERVAL_MS)) return;
+
+  switch (_state) {
+    case State::Idle: {
+      // Start conversion on next round-robin channel
+      _convChannel = _nextChannel;
+      if (!_startConversion(_convChannel)) {
+        _channels[_convChannel].status = AdsStatus::I2cError;
+        if (++_consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          _nextRetryMs = now + RECOVERY_RETRY_MS;
+          Serial.printf("[ADS1115 0x%02X] %u consecutive errors — cooldown %lu s\n",
+                        _address, _consecutiveErrors, RECOVERY_RETRY_MS / 1000);
+        }
+        _lastReadMs = now;
+        return;
+      }
+      _convStartMs = now;
+      _state = State::Converting;
+      // fall through to check if already past conversion time
+      [[fallthrough]];
+    }
+    case State::Converting: {
+      if (now - _convStartMs < ADS1115_CONV_TIME_MS) return;  // not ready yet
+      _state = State::Ready;
+      [[fallthrough]];
+    }
+    case State::Ready: {
+      uint16_t raw;
+      if (!_readConversion(raw)) {
+        _channels[_convChannel].status = AdsStatus::I2cError;
+        if (++_consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          _nextRetryMs = now + RECOVERY_RETRY_MS;
+        }
+        _state = State::Idle;
+        _lastReadMs = now;
+        return;
+      }
+      // Convert: 16-bit signed raw → voltage at pin = raw * LSB
+      int16_t signedRaw = (int16_t)raw;
+      float pinV = signedRaw * ADS_LSB_V;
+
+      // Sanity check: pin voltage must be in [0, gain]
+      if (pinV < -0.5f || pinV > (_gain + 0.5f)) {
+        _channels[_convChannel].status = AdsStatus::OutOfRange;
+        _state = State::Idle;
+        _lastReadMs = now;
+        return;
+      }
+
+      // Apply divider ratio to recover the actual input voltage
+      float inputV = pinV * _dividerRatio;
+      // Apply two-point calibration
+      float calibratedV = inputV * _gainCal + _offsetCal;
+
+      _channels[_convChannel].rawVoltageV = inputV;
+      _channels[_convChannel].voltageV = calibratedV;
+      _channels[_convChannel].timestamp = now;
+      _channels[_convChannel].status = AdsStatus::Ok;
+      _consecutiveErrors = 0;
+
+      // Advance round-robin
+      _nextChannel = (_nextChannel + 1) & 0x03;
+      _state = State::Idle;
+      _lastReadMs = now;
+      break;
+    }
   }
 }
 

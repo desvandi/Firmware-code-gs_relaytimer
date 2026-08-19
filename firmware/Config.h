@@ -105,7 +105,9 @@ namespace Core {
   constexpr uint16_t MQTT_KEEPALIVE_SEC = 60;
   constexpr uint16_t MQTT_RECONNECT_DELAY_MS = 5000;
   constexpr uint16_t MQTT_STATUS_PUBLISH_INTERVAL_MS = 5000;
-  constexpr uint16_t MQTT_BUFFER_SIZE = 4096;
+  constexpr uint16_t MQTT_BUFFER_SIZE = 16384;  // v4.1.1 audit: was 4096 (too small for
+                                                 // battery/powerFlow/environment blocks which
+                                                 // push payload to ~5 KB). 16 KB gives margin.
   constexpr uint8_t MQTT_PASSWORD_LEN = 8;  // 8-char alphanumeric topic password
 
   // TLS root CA for MQTT broker (PEM format, multi-line string).
