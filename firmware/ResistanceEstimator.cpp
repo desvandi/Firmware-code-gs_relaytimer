@@ -232,7 +232,8 @@ void ResistanceEstimator::_evaluateCells(const float vPre[Battery::NUM_CELLS],
       continue;
     }
     _cellRes[i].resistanceOhms = r;
-    _cellRes[i].sampleWindowMs = windowMs;  // inherit window (unused in API but stored)
+    // v4.3.8 D-018 FIX: removed _cellRes[i].sampleWindowMs — field doesn't
+    // exist in CellResistanceResult struct (only in PackResistanceResult).
     _cellRes[i].timestamp = millis();
     _cellRes[i].valid = true;
     _cellRes[i].quality = (std::fabs(dI) >= 5.0f * Battery::RESISTANCE_MIN_DELTA_I_A)
@@ -286,12 +287,7 @@ bool ResistanceEstimator::runLoadStepTest() {
   uint8_t ch = Battery::TEST_LOAD_RELAY_CHANNEL - 1;  // 0-based
   Services::relayEngine.setManual(ch, true);  // request ON through full pipeline
   // Give tick() a cycle to process the arbitration
-  unsigned long settleEnd = millis() + Battery::TEST_LOAD_SETTLE_MS;
-  while (millis() < settleEnd) {
-    esp_task_wdt_reset();
-    delay(10);
-  }
-  // NON-blocking settle — yield to main loop; rest of test continues on next tick
+  // v4.3.8 D-018 FIX: removed duplicate settle block (was declared twice)
   unsigned long settleEnd = millis() + Battery::TEST_LOAD_SETTLE_MS;
   while (millis() < settleEnd) {
     esp_task_wdt_reset();

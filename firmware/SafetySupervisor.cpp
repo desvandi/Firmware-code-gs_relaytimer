@@ -17,6 +17,7 @@
 //   RELAY_ANTI_CHATTER — when InhibitChatter blocks any transition
 // =============================================================================
 #include "SafetySupervisor.h"
+#include "Globals.h"  // v4.3.8 D-019 FIX: Core::channels[], Core::relayState[] etc. declared here
 #include "LogService.h"
 #include <cstdio>
 

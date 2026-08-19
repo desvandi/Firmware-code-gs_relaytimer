@@ -231,6 +231,11 @@ bool MqttClient::_connect() {
   return false;
 }
 
+// v4.3.8 D-016 FIX CORRECTED: forward declaration MUST be BEFORE call site.
+// v4.3.7 placed it AFTER the call (line 271 vs call at line 265) — violates
+// C++ name lookup. Moved here, before loop() which calls it.
+static void replaySpooledTelemetry();
+
 void MqttClient::loop() {
   // v4.3.6 D-003 FIX: emit heartbeat for task stall detection
   Services::health.recordHeartbeat(Services::TaskId::Mqtt);
@@ -265,10 +270,8 @@ void MqttClient::loop() {
   replaySpooledTelemetry();
 }
 
-// v4.3.7 D-016 FIX: forward declaration — function is defined below at ~line 415
-// but called above in loop(). Without this declaration, PlatformIO build fails:
-//   error: 'replaySpooledTelemetry' was not declared in this scope
-static void replaySpooledTelemetry();
+// v4.3.7 D-016 FIX (REMOVED — was placed AFTER call site, violated C++ name lookup).
+// Correct forward declaration is now at line 237, BEFORE loop().
 
 bool MqttClient::isConnected() {
   return _mqtt.connected();
