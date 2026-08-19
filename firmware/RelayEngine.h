@@ -38,8 +38,7 @@ public:
   void applyChannelState(uint8_t idx, bool newState);
 
 private:
-  bool _computeChannel(uint8_t idx, uint16_t currentMin, int weekdayIdx,
-                       Core::RelaySource& outSource);
+  // v4.3.4: _computeChannel removed — logic moved to CommandArbiter::arbitrate()
 };
 
 extern RelayEngine relayEngine;
