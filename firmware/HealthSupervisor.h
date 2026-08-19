@@ -153,8 +153,30 @@ public:
   // Reset reason classification (matches esp_reset_reason_t values)
   static const char* resetReasonStr(uint8_t reason);
 
-  // v4.3 P1-010: Get aggregated health state
+  // v4.3.2 B06: Get aggregated health state
   HealthState getSystemState() const { return _snapshot.systemState; }
+
+  // v4.3.3 B06: Health action policy — query what actions should be active
+  // Per ChatGPT: "Untuk setiap state, dokumentasikan: entry condition, exit
+  // condition, relay policy, scheduler policy, remote-control policy, recovery"
+  bool shouldInhibitScheduler() const {
+    return _snapshot.systemState == HealthState::Failed ||
+           _snapshot.systemState == HealthState::Recovering ||
+           _snapshot.bootLoopDetected;
+  }
+  bool shouldForceAllRelaysOff() const {
+    return _snapshot.systemState == HealthState::Failed ||
+           _snapshot.bootLoopDetected;
+  }
+  bool shouldInhibitRemoteControl() const {
+    return _snapshot.systemState == HealthState::Failed ||
+           _snapshot.systemState == HealthState::Recovering;
+  }
+
+  // v4.3.3 B07: Boot-loop safe recovery mode
+  bool isInRecoveryMode() const { return _recoveryMode; }
+  void enterRecoveryMode();
+  void exitRecoveryMode();  // controlled exit — operator must explicitly call
 
 private:
   HealthSnapshot _snapshot = {};
@@ -175,6 +197,9 @@ private:
 
   // v4.3 P1-010: Compute aggregated health state from snapshot
   void _recomputeSystemState();
+
+  // v4.3.3 B07: boot-loop recovery mode flag
+  bool _recoveryMode = false;
 };
 
 extern HealthSupervisor health;

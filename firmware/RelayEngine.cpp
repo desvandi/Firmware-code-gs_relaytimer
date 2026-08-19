@@ -92,8 +92,35 @@ void RelayEngine::tick() {
     currentMin = h * 60 + mi;
   }
 
+  // v4.3.3 B06: Health action policy.
+  // Per ChatGPT: "fault komunikasi tidak mematikan local control yang tidak
+  // bergantung pada komunikasi. Critical subsystem failure → safe behavior."
+  // If health state = FAILED or boot-loop detected:
+  //   - Force ALL relays to OFF (safe state)
+  //   - Skip arbitration (no commands processed)
+  //   - Skip scheduler (inhibited)
+  //   - Allow manual control ONLY (operator must explicitly exit recovery)
+  if (Services::health.shouldForceAllRelaysOff()) {
+    for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
+      if (Core::relayState[i]) {
+        applyChannelState(i, false);
+        Core::relaySource[i] = Core::RelaySource::Off;
+        char msg[80];
+        snprintf(msg, sizeof(msg), "CH%u FORCE OFF — health FAILED/safe state", i + 1);
+        Services::Log.append(Core::LogType::Error, msg, i + 1);
+      }
+    }
+    // In recovery mode: skip normal arbitration entirely
+    if (Services::health.isInRecoveryMode()) {
+      return;  // No arbitration, no scheduler, no PIR — manual control only
+    }
+  }
+
   // PIR debounce update (always runs — PIR is local, doesn't need RTC)
-  Drivers::pir.tick();
+  // But skip if scheduler inhibited (health FAILED)
+  if (!Services::health.shouldInhibitScheduler()) {
+    Drivers::pir.tick();
+  }
 
   for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
     // 1. CommandArbiter computes desired state + source + priority

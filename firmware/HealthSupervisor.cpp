@@ -181,12 +181,12 @@ void HealthSupervisor::recordBoot() {
     _snapshot.bootLoopDetected = true;
     alarms.raise("BOOT_LOOP", AlarmSeverity::Critical,
                  "Boot loop detected — 3+ boots in 60 seconds");
+    enterRecoveryMode();  // v4.3.3 B07: enter safe recovery mode
   } else if (_snapshot.bootCount > 3 && _snapshot.watchdogResets >= 3) {
-    // Heuristic: if we've rebooted 3+ times and at least 3 were watchdog resets,
-    // likely a crash loop (no RTC → can't detect time window, use count heuristic)
     _snapshot.bootLoopDetected = true;
     alarms.raise("BOOT_LOOP", AlarmSeverity::Critical,
-                 "Boot loop suspected — high watchdog reset count relative to boot count");
+                 "Boot loop suspected — high watchdog reset count");
+    enterRecoveryMode();  // v4.3.3 B07
   }
 
   // Persist updated counters + boot timestamp ring buffer
@@ -342,6 +342,27 @@ void HealthSupervisor::_recomputeSystemState() {
     }
   }
   _snapshot.systemState = newState;
+}
+
+// v4.3.3 B07: Boot-loop safe recovery mode.
+// Per ChatGPT: "BOOT_LOOP → safe state → disable risky automation →
+// preserve diagnostic state → safe relay state → controlled recovery"
+void HealthSupervisor::enterRecoveryMode() {
+  if (_recoveryMode) return;
+  _recoveryMode = true;
+  _snapshot.systemState = HealthState::Failed;
+  alarms.raise("RECOVERY_MODE", AlarmSeverity::Critical,
+               "Boot-loop detected — entering safe recovery mode. All relays forced OFF. Scheduler inhibited. Manual control only.");
+  Serial.println("[HEALTH] RECOVERY MODE ENTERED — all automation inhibited");
+}
+
+void HealthSupervisor::exitRecoveryMode() {
+  if (!_recoveryMode) return;
+  _recoveryMode = false;
+  _snapshot.bootLoopDetected = false;
+  alarms.clear("RECOVERY_MODE");
+  Serial.println("[HEALTH] RECOVERY MODE EXITED — operator-controlled exit. Resuming normal operation.");
+  // System will naturally transition to HEALTHY on next tick if no new faults
 }
 
 } // namespace Services
