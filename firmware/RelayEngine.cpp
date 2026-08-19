@@ -212,6 +212,17 @@ void RelayEngine::forceRefresh() {
 // call will return Safety source with targetState=false (overriding manual).
 void RelayEngine::setManual(uint8_t idx, bool on) {
   if (idx >= Core::NUM_CHANNELS) return;
+  // v4.3.5 AUDIT FIX: reject commands when system in recovery/FAILED state.
+  // Per ChatGPT: shouldInhibitRemoteControl() must be called — not just declared.
+  if (Services::health.shouldInhibitRemoteControl()) {
+    char msg[96];
+    snprintf(msg, sizeof(msg),
+             "CH%u command REJECTED — system in %s state (recovery/FAILED)",
+             idx + 1,
+             Services::healthStateStr(Services::health.getSystemState()));
+    Services::Log.append(Core::LogType::Error, msg, idx + 1);
+    return;  // reject — do not modify channel state
+  }
   Core::channels[idx].modeAuto = false;
   Core::channels[idx].manualState = on;
   Storage::config.markDirty();

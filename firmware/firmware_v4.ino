@@ -263,8 +263,9 @@ void setup() {
   // ---------- AUTH ----------
   Services::auth.begin();
 
-  // ---------- OTA ----------
-  Services::ota.begin();
+  // ---------- OTA (already initialized early for boot health check) ----------
+  // Services::ota.begin() called at line 182 for R10B-6 boot health check.
+  // Do NOT call again — begin() is idempotent but redundant call is dead code.
 
   // ---------- MQTT (remote internet access via CGNAT) ----------
   Services::mqtt.begin();

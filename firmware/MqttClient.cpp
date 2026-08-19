@@ -18,6 +18,7 @@
 #include "Json.h"
 #include "BatteryStatusSerializer.h"  // v4.1 — same battery/powerFlow/environment blocks as REST
 #include "BatteryConfig.h"
+#include "TelemetrySpool.h"  // v4.3.5 — wire spool/replay into MQTT publish path
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
 #include <WiFiClient.h>
@@ -256,6 +257,10 @@ void MqttClient::loop() {
     _lastPublishMs = now;
     publishStatus();
   }
+
+  // v4.3.5 AUDIT FIX: replay spooled telemetry from store-and-forward buffer.
+  // Drains at controlled rate (2 records/sec) when MQTT is connected.
+  replaySpooledTelemetry();
 }
 
 bool MqttClient::isConnected() {
@@ -388,7 +393,22 @@ void MqttClient::publishStatus() {
 
   String json;
   serializeJson(doc, json);
-  _mqtt.publish(_topicStatus.c_str(), (const uint8_t*)json.c_str(), json.length(), false);  // no retain (too big)
+  bool published = _mqtt.publish(_topicStatus.c_str(), (const uint8_t*)json.c_str(), json.length(), false);
+  // v4.3.5 AUDIT FIX: spool telemetry on publish failure for store-and-forward.
+  if (!published) {
+    Services::telemetrySpool.spool(
+      Core::metrics.telemetrySequence,
+      (uint32_t)Drivers::rtc.getUnixTime(),
+      json.c_str(), (uint16_t)json.length()
+    );
+  }
+}
+
+// v4.3.5 AUDIT FIX: replay spooled telemetry on reconnect.
+// Called from loop() when MQTT is connected — drains spool at controlled rate.
+static void replaySpooledTelemetry() {
+  if (Services::telemetrySpool.isEmpty()) return;
+  Services::telemetrySpool.replay();
 }
 
 // ---------------------------------------------------------------------------
