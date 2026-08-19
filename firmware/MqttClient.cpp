@@ -232,6 +232,8 @@ bool MqttClient::_connect() {
 }
 
 void MqttClient::loop() {
+  // v4.3.6 D-003 FIX: emit heartbeat for task stall detection
+  Services::health.recordHeartbeat(Services::TaskId::Mqtt);
   if (!_initialized) return;
   if (!TimerNet::wifi.isConnected()) return;
 

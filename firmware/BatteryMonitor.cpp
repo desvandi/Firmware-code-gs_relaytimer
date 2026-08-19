@@ -27,6 +27,14 @@
 #include <Preferences.h>
 #include <cmath>
 
+// v4.3.6 D-004 FIX: bring Drivers:: types into scope for this translation unit.
+// BatteryMonitor.cpp references Ina219Reading, AdsStatus, Ina219Status without
+// Drivers:: qualification. Without these using declarations, the file does NOT
+// compile (30+ errors). This is the root cause of the P0 build failure.
+using Drivers::Ina219Reading;
+using Drivers::Ina219Status;
+using Drivers::AdsStatus;
+
 namespace Services {
 
 BatteryMonitor battery;
@@ -300,6 +308,9 @@ void BatteryMonitor::_updatePowerAndEnergy() {
     //     - when charging (Pbattery < 0): predicted = Pmppt - |Pb_charge|
     //     - when discharging (Pbattery > 0): predicted = Pmppt + Pb_discharge
     // This single signed formula covers both branches without conditional logic.
+    // v4.3.6 D-004 FIX: pRight was used but never declared.
+    // pRight = actual Pinverter (right-hand side of consistency equation).
+    float pRight = _telemetry.inverterDcPower;
     float predictedInv = _telemetry.mpptPower + _telemetry.batteryPower;
     float err = pRight - predictedInv;
     _telemetry.powerFlow.consistencyError = err;

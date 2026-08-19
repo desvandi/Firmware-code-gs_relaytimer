@@ -50,7 +50,7 @@ namespace Core {
   // NOT IMPLEMENTED IN SOFTWARE (require physical hardware — P1-012, P1-013,
   // P1-017): Ed25519 known-answer test, 12-case power-loss test, Secure Boot
   // provisioning. These remain NOT EXECUTED — HARDWARE REQUIRED per brief §107.
-  constexpr char FIRMWARE_VERSION[] = "4.3.0";
+  constexpr char FIRMWARE_VERSION[] = "4.3.6";
   constexpr char BUILD_DATE[] = __DATE__ " " __TIME__;
   constexpr uint8_t CONFIG_VERSION = 2;  // bump when schedule.json schema changes
   constexpr char DEVICE_MODEL[] = "ESP32-WROOM-32 Timer12 v4.3 (industrial-grade R2)";

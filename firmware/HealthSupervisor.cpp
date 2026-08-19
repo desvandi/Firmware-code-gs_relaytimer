@@ -210,8 +210,11 @@ void HealthSupervisor::recordHeartbeat(TaskId id) {
   if ((uint8_t)id >= TASK_COUNT) return;
   _lastHeartbeatMs[(uint8_t)id] = millis();
 }
+// v4.3.6 D-008 FIX: recordCrash() accessed _snapshot.lastCrashUptime which
+// doesn't exist in HealthSnapshot. The field exists in Core::SystemMetrics
+// (Types.h). Fixed to write to Core::metrics.lastCrashUptime instead.
 void HealthSupervisor::recordCrash(uint32_t uptimeAtCrash) {
-  _snapshot.lastCrashUptime = uptimeAtCrash;
+  Core::metrics.lastCrashUptime = uptimeAtCrash;
 }
 
 void HealthSupervisor::setRtcStatus(RtcStatus s) {

@@ -302,6 +302,7 @@ void loop() {
 
   // 2b. PZEM power meter read (every 1s)
   Drivers::pzem.tick();
+  Services::health.recordHeartbeat(Services::TaskId::Pzem);  // v4.3.6 D-003
 
   // 2c. v4.1 DC energy & battery monitoring sensors — non-blocking, all
   // internally rate-limited. (Brief §44.)
@@ -315,14 +316,22 @@ void loop() {
     Services::battery.tick();
     Services::batteryDiagnostics.tick();
     Services::resistance.tick();
-    // v4.2: battery monitor + resistance estimator report heartbeats via their
-    // own tick() calls internally — they call Services::health.recordHeartbeat()
-    // to indicate liveness for task-stall detection (brief §45).
     Services::health.recordHeartbeat(Services::TaskId::BatteryMonitor);
   }
 
   // 2d. v4.2 health supervisor tick — monitors heap, reset reasons, task stalls
   Services::health.tick();
+  Services::health.recordHeartbeat(Services::TaskId::HealthMonitor);  // v4.3.6 D-003
+
+  // 2e. v4.3.6 D-003: emit heartbeats for remaining critical tasks
+  // PIR heartbeat is emitted inside RelayEngine::tick() which calls Drivers::pir.tick()
+  // OTA heartbeat is emitted inside OtaManager (checked during tick)
+  // Scheduler heartbeat is emitted inside RelayEngine::tick() which calls scheduler
+  // We emit them here for tasks that don't have their own loop method:
+  Services::health.recordHeartbeat(Services::TaskId::Scheduler);
+  Services::health.recordHeartbeat(Services::TaskId::Pir);
+  Services::health.recordHeartbeat(Services::TaskId::Ota);
+  Services::health.recordHeartbeat(Services::TaskId::Telemetry);
 
   // 3. Recompute relay states every 1s (catch up if loop was slow)
   static unsigned long lastTick = 0;

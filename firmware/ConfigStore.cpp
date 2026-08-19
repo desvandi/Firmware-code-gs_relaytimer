@@ -154,6 +154,16 @@ void ConfigStore::resetChannels() {
     Core::channels[i].energyWh = 0;
     Core::channels[i].wattage = 10;
     Core::channels[i].lastOnMs = 0;
+    // v4.3.6 D-005 FIX: initialize ALL safety fields — previously omitted,
+    // leaving stale values after factory reset if previously modified.
+    Core::channels[i].maxOnTimeSec = 0;          // unlimited by default
+    Core::channels[i].minOnTimeSec = 0;
+    Core::channels[i].minOffTimeSec = 0;
+    Core::channels[i].minSwitchIntervalSec = 0;
+    Core::channels[i].bootPolicy = (uint8_t)Core::BootPolicy::BootOff;  // safe default
+    Core::channels[i].lastTransitionMs = 0;
+    Core::channels[i].onSinceMs = 0;
+    Core::channels[i].maxOnTimeForced = false;
     for (int j = 0; j < Core::MAX_SCHEDULES; j++) {
       Core::channels[i].sched[j].onTime[0] = '\0';
       Core::channels[i].sched[j].offTime[0] = '\0';
