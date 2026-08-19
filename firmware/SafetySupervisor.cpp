@@ -126,13 +126,18 @@ uint8_t SafetySupervisor::checkMaxOnTimeExceeded() {
     if (ch.onSinceMs == 0) continue;           // never turned ON (shouldn't happen)
     unsigned long elapsedSec = (now - ch.onSinceMs) / 1000UL;
     if (elapsedSec >= ch.maxOnTimeSec) {
-      // Force OFF this channel
+      // v4.3.1 D-007: enter TRIPPED state (not just set flag)
       ch.maxOnTimeForced = true;
+      _lockoutState[i] = SafetyLockoutState::Tripped;
       alarms.raise(Err::RELAY_MAX_ON_TIME, AlarmSeverity::Critical,
-                   "maxOnTime exceeded — channel FORCE OFF");
-      // Clear the force flag will require operator acknowledgement (future)
+                   "maxOnTime exceeded — channel FORCE OFF (TRIPPED)");
       return i;
     }
+  }
+  // v4.3.1 D-007: advance CLEARED → ARMED → NORMAL for channels that have
+  // been cleared by operator
+  for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
+    armForNormalOperation(i);
   }
   return 0xFF;
 }
@@ -146,35 +151,69 @@ void SafetySupervisor::reset() {
   _bootStatesApplied = false;
 }
 
-// v4.3 audit P1-003: Explicit safety alarm acknowledgement.
+// v4.3.1 D-007: Explicit safety state machine per ChatGPT audit.
+//   NORMAL → TRIPPED → ACKNOWLEDGED → CLEARED → ARMED → NORMAL
 //
-// Per ChatGPT audit:
-//   "fungsi setManual() sendiri bukan acknowledgement protocol.
-//    Artinya semantics: manual command sekaligus menjadi:
-//    safety override acknowledgement — ini terlalu implicit.
+// Per audit: "Acknowledgement = operator mengetahui alarm. Bukan:
+//   acknowledgement = sistem otomatis boleh menghidupkan relay."
 //
-//    Yang benar: Harus dipisahkan: SET_RELAY dan ACK_SAFETY_ALARM
-//    MAX_ON_TIME → FORCED OFF → LOCKOUT → operator acknowledges alarm
-//    → explicit CLEAR → relay may be enabled again"
+// State transition rules:
+//   NORMAL → TRIPPED: automatic when checkMaxOnTimeExceeded() detects limit
+//   TRIPPED → ACKNOWLEDGED: only via acknowledgeSafetyAlarm() call
+//   ACKNOWLEDGED → CLEARED: only via clearSafetyLockout() call
+//   CLEARED → ARMED: automatic on next tick() (after clearing maxOnTimeForced)
+//   ARMED → NORMAL: automatic on next tick() (no new trip)
 //
-// This function performs the explicit CLEAR step. setManual() will NOT
-// clear the lockout — the PWA must call this endpoint separately before
-// issuing a manual ON command for a locked-out channel.
+// maxOnTimeForced flag is set when entering TRIPPED, cleared when entering
+// CLEARED. Between TRIPPED and CLEARED, all ON commands are blocked.
 bool SafetySupervisor::acknowledgeSafetyAlarm(uint8_t idx) {
   if (idx >= Core::NUM_CHANNELS) return false;
-  if (!Core::channels[idx].maxOnTimeForced) return false;
+  // Can only ACK from TRIPPED state
+  if (_lockoutState[idx] != SafetyLockoutState::Tripped) {
+    return false;  // not in tripped state, nothing to acknowledge
+  }
+  _lockoutState[idx] = SafetyLockoutState::Acknowledged;
+  alarms.acknowledge(Err::RELAY_MAX_ON_TIME);
+  // maxOnTimeForced STAYS TRUE — relay still forced OFF
+  char msg[80];
+  snprintf(msg, sizeof(msg), "CH%u safety alarm acknowledged (still locked)", idx + 1);
+  // Caller logs to activity log
+  return true;
+}
+
+bool SafetySupervisor::clearSafetyLockout(uint8_t idx) {
+  if (idx >= Core::NUM_CHANNELS) return false;
+  // Can only CLEAR from ACKNOWLEDGED state
+  if (_lockoutState[idx] != SafetyLockoutState::Acknowledged) {
+    return false;  // must acknowledge first
+  }
+  _lockoutState[idx] = SafetyLockoutState::Cleared;
+  // NOW clear maxOnTimeForced — relay can be re-enabled by next manual command
   Core::channels[idx].maxOnTimeForced = false;
   alarms.clear(Err::RELAY_MAX_ON_TIME);
-  alarms.acknowledge(Err::RELAY_MAX_ON_TIME);
-  char msg[64];
-  snprintf(msg, sizeof(msg), "CH%u safety lockout cleared by operator", idx + 1);
-  // Log to activity log via caller (avoids circular include with LogService)
+  char msg[80];
+  snprintf(msg, sizeof(msg), "CH%u safety lockout CLEARED — relay can be re-enabled", idx + 1);
   return true;
+}
+
+void SafetySupervisor::armForNormalOperation(uint8_t idx) {
+  if (idx >= Core::NUM_CHANNELS) return;
+  if (_lockoutState[idx] == SafetyLockoutState::Cleared) {
+    _lockoutState[idx] = SafetyLockoutState::Armed;
+  } else if (_lockoutState[idx] == SafetyLockoutState::Armed) {
+    _lockoutState[idx] = SafetyLockoutState::Normal;
+  }
+}
+
+SafetyLockoutState SafetySupervisor::getLockoutState(uint8_t idx) const {
+  if (idx >= Core::NUM_CHANNELS) return SafetyLockoutState::Normal;
+  return _lockoutState[idx];
 }
 
 bool SafetySupervisor::isSafetyLockoutActive(uint8_t idx) const {
   if (idx >= Core::NUM_CHANNELS) return false;
-  return Core::channels[idx].maxOnTimeForced;
+  SafetyLockoutState s = _lockoutState[idx];
+  return s != SafetyLockoutState::Normal && s != SafetyLockoutState::Armed;
 }
 
 } // namespace Services

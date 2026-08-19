@@ -101,6 +101,8 @@
 // v4.3 audit P1-001, P1-002: CommandArbiter + InterlockEngine
 #include "CommandArbiter.h"
 #include "InterlockEngine.h"
+// v4.3.1 audit D-005: TelemetrySpool (store-and-forward software architecture)
+#include "TelemetrySpool.h"
 
 // Web
 #include "HttpServer.h"
@@ -205,6 +207,9 @@ void setup() {
   esp_task_wdt_reset();
   // v4.3 audit P1-001, P1-002: CommandArbiter + InterlockEngine
   Services::interlock.begin();      // no groups registered by default — owner configures via PWA or NVS
+  esp_task_wdt_reset();
+  // v4.3.1 audit D-005: TelemetrySpool init (RAM ring buffer, no NVS yet)
+  Services::telemetrySpool.begin();
   esp_task_wdt_reset();
 
   // ---------- DRIVERS: RTC + Relays ----------

@@ -32,7 +32,8 @@
 // =============================================================================
 #include "ResistanceEstimator.h"
 #include "BatteryDiagnostics.h"
-#include "RelayDriver.h"
+#include "RelayEngine.h"  // v4.3.1 D-001: use forceChannelState() instead of direct Drivers::relay
+#include "RelayDriver.h"  // kept for legacy reference; no direct setChannel() calls
 #include <cmath>
 #include <algorithm>
 #include <esp_task_wdt.h>
@@ -276,9 +277,19 @@ bool ResistanceEstimator::runLoadStepTest() {
   _testRunning = true;
   _testStartMs = millis();
 
-  // Energize test load relay (channel is 1-based; RelayDriver::setChannel takes 0-based idx)
+  // Energize test load relay via UNIFIED GPIO path (v4.3.1 D-001 fix).
+  // Per audit P1-004: NO direct Drivers::relay.setChannel() calls outside
+  // RelayEngine::applyChannelState(). Use forceChannelState() which routes
+  // through the unified actuator + records transition in
+  // SafetySupervisor + InterlockEngine.
+  // Safety lockout (maxOnTimeForced) still wins — forceChannelState returns
+  // false if blocked, and we abort the test.
   uint8_t ch = Battery::TEST_LOAD_RELAY_CHANNEL - 1;  // 0-based
-  Drivers::relay.setChannel(ch, true);
+  if (!Services::relayEngine.forceChannelState(ch, true)) {
+    Serial.println("[RES] test load force-ON blocked by safety lockout — abort");
+    _testRunning = false;
+    return false;
+  }
   // NON-blocking settle — yield to main loop; rest of test continues on next tick
   unsigned long settleEnd = millis() + Battery::TEST_LOAD_SETTLE_MS;
   while (millis() < settleEnd) {
@@ -294,8 +305,8 @@ bool ResistanceEstimator::runLoadStepTest() {
   for (uint8_t i = 0; i < Battery::NUM_CELLS; i++)
     vCellPost[i] = cellsPost[i].voltageV;
 
-  // De-energize relay
-  Drivers::relay.setChannel(ch, false);
+  // De-energize relay via UNIFIED path (v4.3.1 D-001 fix)
+  Services::relayEngine.forceChannelState(ch, false);
   _testRunning = false;
 
   if (!postOk) return false;

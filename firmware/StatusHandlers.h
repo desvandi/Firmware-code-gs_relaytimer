@@ -18,6 +18,7 @@
 #include "Config.h"
 #include "Globals.h"
 #include "BatteryStatusSerializer.h"  // v4.1 — extends /api/status with battery/powerFlow/environment
+#include "SafetySupervisor.h"          // v4.3.1 D-007 — safetyLockoutState serialization
 
 namespace Web { namespace Handlers {
 
@@ -57,7 +58,30 @@ inline void handleStatus() {
     ch["manualState"] = Core::channels[i].manualState;
     ch["pirEnabled"] = Core::channels[i].pirEnabled;
     ch["pirHoldTime"] = Core::channels[i].pirHoldTime;
-    ch["state"] = Core::relayState[i];
+    // v4.3.1 D-002: state separation — desired/reported/physical
+    //   desiredState = what operator/automation requested (manualState or schedule)
+    //   reportedState = what device ACK'd (software GPIO state — relayState)
+    //   physicalState = null when no aux contact feedback (StateConfidence != VERIFIED)
+    //   stateConfidence = SOFTWARE_ONLY (current HW limitation, no aux feedback)
+    ch["state"] = Core::relayState[i];  // legacy field (backward compat — = reportedState)
+    ch["desiredState"] = Core::channels[i].modeAuto
+                          ? (Core::relaySource[i] != Core::RelaySource::Off)
+                          : Core::channels[i].manualState;
+    ch["reportedState"] = Core::relayState[i];
+    // v4.3.1 D-002 fix: physicalState MUST be null when confidence != VERIFIED.
+    // Using `false` for UNKNOWN is semantically wrong (false = OFF, not UNKNOWN).
+    if (Core::relayStateConfidence[i] == Core::StateConfidence::Verified) {
+      ch["physicalState"] = Core::relayPhysicalState[i];
+    } else {
+      ch["physicalState"] = nullptr;  // UNKNOWN — no aux contact feedback
+    }
+    ch["stateConfidence"] = Core::stateConfidenceStr(Core::relayStateConfidence[i]);
+    ch["stateSequence"] = Core::relayStateSequence[i];
+    ch["stateTimestamp"] = (uint64_t)Core::relayStateTimestamp[i];
+    ch["fault"] = Core::relayFault[i];
+    // v4.3.1 D-007: safety lockout state
+    ch["safetyLockoutState"] = Services::safetyLockoutStateStr(
+        Services::safety.getLockoutState(i));
     const char* srcStr =
       Core::relaySource[i] == Core::RelaySource::Manual ? "manual" :
       Core::relaySource[i] == Core::RelaySource::Schedule ? "schedule" :

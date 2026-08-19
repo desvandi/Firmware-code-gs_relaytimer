@@ -26,6 +26,28 @@
 
 namespace Services {
 
+// v4.3.1 audit D-007: Explicit safety lockout state machine per ChatGPT audit:
+//   NORMAL → TRIPPED → ACKNOWLEDGED → CLEARED → ARMED → NORMAL
+// Per audit: "Acknowledgement = operator mengetahui alarm. Bukan:
+//   acknowledgement = sistem otomatis boleh menghidupkan relay."
+enum class SafetyLockoutState : uint8_t {
+  Normal       = 0,  // no safety trip, relay controllable
+  Tripped       = 1,  // maxOnTime triggered, relay FORCED OFF, no re-enable
+  Acknowledged = 2,  // operator saw alarm, lockout STILL ACTIVE
+  Cleared      = 3,  // operator cleared lockout, relay still OFF, can re-enable
+  Armed         = 4,  // system armed, normal operation resumes
+};
+inline const char* safetyLockoutStateStr(SafetyLockoutState s) {
+  switch (s) {
+    case SafetyLockoutState::Normal:       return "NORMAL";
+    case SafetyLockoutState::Tripped:      return "TRIPPED";
+    case SafetyLockoutState::Acknowledged: return "ACKNOWLEDGED";
+    case SafetyLockoutState::Cleared:      return "CLEARED";
+    case SafetyLockoutState::Armed:         return "ARMED";
+  }
+  return "NORMAL";
+}
+
 enum class SafetyDecision : uint8_t {
   Allow          = 0,  // Transition permitted
   InhibitMinOn   = 1,  // Block OFF — minOnTime not yet elapsed
@@ -70,20 +92,28 @@ public:
   // 0xFF if none. Called in a loop until it returns 0xFF.
   uint8_t checkMaxOnTimeExceeded();
 
-  // v4.3 audit P1-003: EXPLICIT safety alarm acknowledgement.
-  // Manual relay commands (setManual) NO LONGER auto-clear maxOnTimeForced.
-  // Operator must call this explicitly to clear the safety lockout.
-  // Returns true if the alarm was cleared; false if no lockout was active.
-  bool acknowledgeSafetyAlarm(uint8_t idx);
+  // v4.3.1 D-007: Explicit safety state machine — ACK != CLEAR per ChatGPT audit.
+  //   NORMAL → TRIPPED → ACKNOWLEDGED → CLEARED → ARMED → NORMAL
+  // acknowledgeSafetyAlarm(): operator SEES the alarm (TRIPPED → ACKNOWLEDGED).
+  //   Lockout STILL ACTIVE. Relay still forced OFF. No re-enable possible.
+  // clearSafetyLockout(): operator explicitly clears (ACKNOWLEDGED → CLEARED).
+  //   Relay still OFF but next manual command CAN re-enable.
+  // armForNormalOperation(): CLEARED → ARMED → NORMAL (auto in tick).
+  bool acknowledgeSafetyAlarm(uint8_t idx);   // TRIPPED → ACKNOWLEDGED (no clear!)
+  bool clearSafetyLockout(uint8_t idx);        // ACKNOWLEDGED → CLEARED
+  void armForNormalOperation(uint8_t idx);    // CLEARED → ARMED (auto in tick)
 
-  // v4.3 audit P1-003: Check whether a channel is in safety lockout.
-  bool isSafetyLockoutActive(uint8_t idx) const;
+  // Query the current safety lockout state
+  SafetyLockoutState getLockoutState(uint8_t idx) const;
+  bool isSafetyLockoutActive(uint8_t idx) const;  // true if state != NORMAL && != ARMED
 
   // Reset all runtime tracking (e.g., on factory reset)
   void reset();
 
 private:
   bool _bootStatesApplied = false;
+  // v4.3.1 D-007: per-channel safety lockout state
+  SafetyLockoutState _lockoutState[Core::NUM_CHANNELS] = {};
 };
 
 extern SafetySupervisor safety;

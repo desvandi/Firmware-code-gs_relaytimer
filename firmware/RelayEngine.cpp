@@ -45,17 +45,41 @@ namespace Services {
 
 RelayEngine relayEngine;
 
-// v4.3 P1-004: SINGLE authoritative GPIO mutation function.
-// All paths (maxOnTime force-off, normal transition, boot policy) must
+// v4.3.1 D-001: SINGLE authoritative GPIO mutation function.
+// All paths (maxOnTime force-off, normal transition, boot policy, test-load)
 // route through this function. No other code may call
 // Drivers::relay.setChannel() except this function + RelayDriver::allOff()
 // (which is for factory reset only).
-static void applyChannelState(uint8_t idx, bool newState) {
+void RelayEngine::applyChannelState(uint8_t idx, bool newState) {
   if (idx >= Core::NUM_CHANNELS) return;
   Drivers::relay.setChannel(idx, newState);
   Core::relayState[idx] = newState;
+  // Update physical state tracking (P1-005, P1-014)
+  // Without aux contact feedback, physicalState is UNKNOWN — we set
+  // confidence to SOFTWARE_ONLY (not VERIFIED). physicalState[] stays
+  // false but stateConfidence indicates we don't actually know.
+  Core::relayStateConfidence[idx] = Core::StateConfidence::SoftwareOnly;
+  Core::relayStateSequence[idx]++;
+  Core::relayStateTimestamp[idx] = millis();
   Services::safety.recordTransition(idx, newState);
   Services::interlock.recordTransition(idx, newState);
+}
+
+// v4.3.1 D-001: forceChannelState — for test-load / commissioning paths.
+// Routes through applyChannelState (unified GPIO path) but skips safety
+// evaluation (caller assumes responsibility). Safety lockout still wins.
+bool RelayEngine::forceChannelState(uint8_t idx, bool newState) {
+  if (idx >= Core::NUM_CHANNELS) return false;
+  // Safety lockout always wins — cannot force ON while maxOnTimeForced
+  if (newState && Core::channels[idx].maxOnTimeForced) {
+    char msg[80];
+    snprintf(msg, sizeof(msg), "CH%u forceChannelState(%s) BLOCKED — safety lockout active",
+             idx + 1, newState ? "ON" : "OFF");
+    Services::Log.append(Core::LogType::Error, msg, idx + 1);
+    return false;
+  }
+  applyChannelState(idx, newState);
+  return true;
 }
 
 void RelayEngine::tick() {
