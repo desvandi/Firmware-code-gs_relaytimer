@@ -32,7 +32,7 @@
 // =============================================================================
 #include "ResistanceEstimator.h"
 #include "BatteryDiagnostics.h"
-#include "RelayEngine.h"  // v4.3.1 D-001: use forceChannelState() instead of direct Drivers::relay
+#include "RelayEngine.h"  // v4.3.2 BLOCKER-01: use setManual() through full arbitration
 #include "RelayDriver.h"  // kept for legacy reference; no direct setChannel() calls
 #include <cmath>
 #include <algorithm>
@@ -277,18 +277,19 @@ bool ResistanceEstimator::runLoadStepTest() {
   _testRunning = true;
   _testStartMs = millis();
 
-  // Energize test load relay via UNIFIED GPIO path (v4.3.1 D-001 fix).
-  // Per audit P1-004: NO direct Drivers::relay.setChannel() calls outside
-  // RelayEngine::applyChannelState(). Use forceChannelState() which routes
-  // through the unified actuator + records transition in
-  // SafetySupervisor + InterlockEngine.
-  // Safety lockout (maxOnTimeForced) still wins — forceChannelState returns
-  // false if blocked, and we abort the test.
+  // v4.3.2 BLOCKER-01: ResistanceEstimator uses setManual() which goes
+  // through the FULL arbitration pipeline:
+  //   setManual() → tick() → CommandArbiter → Safety → Interlock → applyChannelState
+  // No bypass. Safety lockout, interlock, minOnTime/minOffTime all respected.
+  // If safety lockout is active, the next tick() will return Safety source
+  // with targetState=false, and the relay will NOT turn ON.
   uint8_t ch = Battery::TEST_LOAD_RELAY_CHANNEL - 1;  // 0-based
-  if (!Services::relayEngine.forceChannelState(ch, true)) {
-    Serial.println("[RES] test load force-ON blocked by safety lockout — abort");
-    _testRunning = false;
-    return false;
+  Services::relayEngine.setManual(ch, true);  // request ON through full pipeline
+  // Give tick() a cycle to process the arbitration
+  unsigned long settleEnd = millis() + Battery::TEST_LOAD_SETTLE_MS;
+  while (millis() < settleEnd) {
+    esp_task_wdt_reset();
+    delay(10);
   }
   // NON-blocking settle — yield to main loop; rest of test continues on next tick
   unsigned long settleEnd = millis() + Battery::TEST_LOAD_SETTLE_MS;
@@ -306,7 +307,7 @@ bool ResistanceEstimator::runLoadStepTest() {
     vCellPost[i] = cellsPost[i].voltageV;
 
   // De-energize relay via UNIFIED path (v4.3.1 D-001 fix)
-  Services::relayEngine.forceChannelState(ch, false);
+  Services::relayEngine.setManual(ch, false);  // request OFF through full pipeline
   _testRunning = false;
 
   if (!postOk) return false;

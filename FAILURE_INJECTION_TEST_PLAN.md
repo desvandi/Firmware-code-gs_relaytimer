@@ -111,14 +111,14 @@ Per audit brief §107: "Gunakan: PASS / FAIL / NOT EXECUTED — HARDWARE REQUIRE
 |---|---|---|---|---|---|
 | TEST-ARB | 7 | 4 | — | 3 | — |
 | TEST-INT | 6 | 5 | — | 1 | — |
-| TEST-SAF | 8 | 6 | — | 1 | — |
+| TEST-SAF | 8 | 7 | — | 1 | — |
 | TEST-TXN | 6 | 1 | — | 5 | — |
 | TEST-HEALTH | 7 | 4 | — | 2 | 1 |
 | TEST-OTA | 9 | — | 4 | 5 | — |
 | TEST-SPOOL | 5 | 4 | — | 1 | — |
-| **TOTAL** | **48** | **24** | **4** | **18** | **1** |
+| **TOTAL** | **48** | **25** | **4** | **18** | **1** |
 
-**PASS (logic + host):** 28 tests
+**PASS (logic + host):** 29 tests
 **NOT EXECUTED — HARDWARE REQUIRED:** 18 tests
 **NOT EXECUTED — PENDING (implementation deferred):** 1 test
 

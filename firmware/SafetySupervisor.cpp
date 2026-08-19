@@ -175,9 +175,10 @@ bool SafetySupervisor::acknowledgeSafetyAlarm(uint8_t idx) {
   _lockoutState[idx] = SafetyLockoutState::Acknowledged;
   alarms.acknowledge(Err::RELAY_MAX_ON_TIME);
   // maxOnTimeForced STAYS TRUE — relay still forced OFF
+  // BLOCKER-02: ACK ≠ permission. Fault condition (maxOnTimeForced) still active.
+  // CLEAR requires explicit clearSafetyLockout() call AFTER fault is resolved.
   char msg[80];
   snprintf(msg, sizeof(msg), "CH%u safety alarm acknowledged (still locked)", idx + 1);
-  // Caller logs to activity log
   return true;
 }
 
@@ -187,12 +188,27 @@ bool SafetySupervisor::clearSafetyLockout(uint8_t idx) {
   if (_lockoutState[idx] != SafetyLockoutState::Acknowledged) {
     return false;  // must acknowledge first
   }
+  // v4.3.2 BLOCKER-02: CLEAR requires fault condition to be resolved.
+  // Per ChatGPT audit: "clearSafetyAlarm() harus menolak apabila:
+  //   faultStillActive == true"
+  // The "fault" here is: was the relay ON for too long (maxOnTime exceeded)?
+  // If the relay is STILL ON (shouldn't be — it was forced OFF), or if
+  // onSinceMs indicates the relay was ON recently and hasn't been OFF
+  // long enough, we reject the CLEAR.
+  //
+  // maxOnTimeForced=true means the fault is still active.
+  // We clear maxOnTimeForced HERE (transitioning to CLEARED), but only
+  // if the relay is actually OFF (forced OFF already happened).
+  if (Core::relayState[idx]) {
+    // Relay still ON — fault not resolved. Reject CLEAR.
+    char msg[80];
+    snprintf(msg, sizeof(msg), "CH%u CLEAR rejected — relay still ON (fault active)", idx + 1);
+    return false;
+  }
+  // Relay is OFF — fault condition resolved. Clear lockout.
   _lockoutState[idx] = SafetyLockoutState::Cleared;
-  // NOW clear maxOnTimeForced — relay can be re-enabled by next manual command
   Core::channels[idx].maxOnTimeForced = false;
   alarms.clear(Err::RELAY_MAX_ON_TIME);
-  char msg[80];
-  snprintf(msg, sizeof(msg), "CH%u safety lockout CLEARED — relay can be re-enabled", idx + 1);
   return true;
 }
 

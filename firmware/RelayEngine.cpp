@@ -65,23 +65,6 @@ void RelayEngine::applyChannelState(uint8_t idx, bool newState) {
   Services::interlock.recordTransition(idx, newState);
 }
 
-// v4.3.1 D-001: forceChannelState — for test-load / commissioning paths.
-// Routes through applyChannelState (unified GPIO path) but skips safety
-// evaluation (caller assumes responsibility). Safety lockout still wins.
-bool RelayEngine::forceChannelState(uint8_t idx, bool newState) {
-  if (idx >= Core::NUM_CHANNELS) return false;
-  // Safety lockout always wins — cannot force ON while maxOnTimeForced
-  if (newState && Core::channels[idx].maxOnTimeForced) {
-    char msg[80];
-    snprintf(msg, sizeof(msg), "CH%u forceChannelState(%s) BLOCKED — safety lockout active",
-             idx + 1, newState ? "ON" : "OFF");
-    Services::Log.append(Core::LogType::Error, msg, idx + 1);
-    return false;
-  }
-  applyChannelState(idx, newState);
-  return true;
-}
-
 void RelayEngine::tick() {
   // §44: record heartbeat for task stall detection
   Services::health.recordHeartbeat(Services::TaskId::RelayEngine);
