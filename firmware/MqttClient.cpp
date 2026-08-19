@@ -265,6 +265,11 @@ void MqttClient::loop() {
   replaySpooledTelemetry();
 }
 
+// v4.3.7 D-016 FIX: forward declaration — function is defined below at ~line 415
+// but called above in loop(). Without this declaration, PlatformIO build fails:
+//   error: 'replaySpooledTelemetry' was not declared in this scope
+static void replaySpooledTelemetry();
+
 bool MqttClient::isConnected() {
   return _mqtt.connected();
 }
