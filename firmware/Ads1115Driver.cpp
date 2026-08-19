@@ -23,6 +23,12 @@
 //   vCalibrated = vRaw * gainCal + offsetCal
 // (Brief §12: support voltageGain + voltageOffset.)
 // =============================================================================
+// BATTERY_MONITORING_ENABLED guard — file compiles to nothing when battery
+// monitoring is disabled (saves flash for relay-only installations).
+#include "BatteryConfig.h"
+#if !BATTERY_ENABLED
+// File intentionally empty when battery monitoring is disabled.
+#else
 #include "Ads1115Driver.h"
 #include "Config.h"
 #include <Wire.h>
@@ -233,3 +239,5 @@ uint32_t Ads1115Driver::getChannelTime(uint8_t ch) const {
 }
 
 } // namespace Drivers
+
+#endif // BATTERY_ENABLED

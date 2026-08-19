@@ -13,6 +13,12 @@
 // Output is EMA-smoothed (brief §45). Raw samples may be used by ResistanceEstimator
 // (which has its own buffer) so over-filtering of the smoothed output is OK.
 // =============================================================================
+// BATTERY_MONITORING_ENABLED guard — file compiles to nothing when battery
+// monitoring is disabled (saves flash for relay-only installations).
+#include "BatteryConfig.h"
+#if !BATTERY_ENABLED
+// File intentionally empty when battery monitoring is disabled.
+#else
 #include "BatteryVoltageDriver.h"
 #include "Ads1115Driver.h"
 #include "Config.h"
@@ -148,3 +154,5 @@ void BatteryVoltageDriver::tick() {
 }
 
 } // namespace Drivers
+
+#endif // BATTERY_ENABLED

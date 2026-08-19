@@ -22,14 +22,30 @@
 
 #include <cstdint>
 
+// v4.3.11: Preprocessor-level enable/disable for battery monitoring.
+// When BATTERY_MONITORING_ENABLED is NOT defined, all battery .cpp files
+// compile to nothing (saves ~200KB flash). Relay/scheduler/PIR/PZEM/
+// MQTT/REST/OTA remain fully operational.
+// To ENABLE: add -DBATTERY_MONITORING_ENABLED to build_flags (PlatformIO)
+//   or uncomment the #define below (Arduino IDE).
+// To DISABLE: leave commented (saves flash for relay-only installations).
+// #define BATTERY_MONITORING_ENABLED
+
+#ifdef BATTERY_MONITORING_ENABLED
+  #define BATTERY_ENABLED 1
+#else
+  #define BATTERY_ENABLED 0
+#endif
+
 namespace Battery {
 
 // ---------- FIRMWARE FEATURE FLAG ----------
 // Master switch for the entire DC energy / battery monitoring subsystem.
-// When false, all battery drivers return unavailable and the SystemStatus
-// payload omits the battery/powerFlow/environment blocks. Relay/scheduler/
-// PIR/PZEM/MQTT/REST/OTA remain fully operational. (Brief §46, §47.)
-constexpr bool ENABLED = true;
+// When false (BATTERY_MONITORING_ENABLED not defined), all battery drivers
+// return unavailable and the SystemStatus payload omits the battery/powerFlow/
+// environment blocks. Relay/scheduler/PIR/PZEM/MQTT/REST/OTA remain fully
+// operational. (Brief §46, §47.)
+constexpr bool ENABLED = (BATTERY_ENABLED == 1);
 
 // ---------- BATTERY CHEMISTRY / TOPOLOGY ----------
 // 8S LiFePO4, nominal 24 V. (Brief §3.)

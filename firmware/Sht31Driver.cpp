@@ -29,6 +29,12 @@
 //
 // CRC-8: poly=0x31, init=0xFF
 // =============================================================================
+// BATTERY_MONITORING_ENABLED guard — file compiles to nothing when battery
+// monitoring is disabled (saves flash for relay-only installations).
+#include "BatteryConfig.h"
+#if !BATTERY_ENABLED
+// File intentionally empty when battery monitoring is disabled.
+#else
 #include "Sht31Driver.h"
 #include "Config.h"
 #include <Wire.h>
@@ -200,3 +206,5 @@ void Sht31Driver::tick() {
 }
 
 } // namespace Drivers
+
+#endif // BATTERY_ENABLED

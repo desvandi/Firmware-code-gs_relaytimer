@@ -30,6 +30,12 @@
 // No blocking delay that prevents watchdog — the test is implemented as a
 // state machine that yields to the main loop.
 // =============================================================================
+// BATTERY_MONITORING_ENABLED guard — file compiles to nothing when battery
+// monitoring is disabled (saves flash for relay-only installations).
+#include "BatteryConfig.h"
+#if !BATTERY_ENABLED
+// File intentionally empty when battery monitoring is disabled.
+#else
 #include "ResistanceEstimator.h"
 #include "BatteryDiagnostics.h"
 #include "RelayEngine.h"  // v4.3.2 BLOCKER-01: use setManual() through full arbitration
@@ -352,3 +358,5 @@ const char* ResistanceEstimator::_qualityStr(ResistanceQuality q) const {
 }
 
 } // namespace Services
+
+#endif // BATTERY_ENABLED

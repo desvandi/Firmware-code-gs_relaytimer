@@ -9,6 +9,12 @@
 //   - overall severity: UNAVAILABLE if all sensors fault, else FAULT if any fault
 //     flag set, WARNING if cellImbalance/warning only, else NORMAL
 // =============================================================================
+// BATTERY_MONITORING_ENABLED guard — file compiles to nothing when battery
+// monitoring is disabled (saves flash for relay-only installations).
+#include "BatteryConfig.h"
+#if !BATTERY_ENABLED
+// File intentionally empty when battery monitoring is disabled.
+#else
 #include "BatteryDiagnostics.h"
 #include "Ina219Driver.h"
 #include "Ads1115Driver.h"
@@ -125,3 +131,5 @@ void BatteryDiagnostics::setCellResistanceAlarm(bool anyHigh) {
 }
 
 } // namespace Services
+
+#endif // BATTERY_ENABLED

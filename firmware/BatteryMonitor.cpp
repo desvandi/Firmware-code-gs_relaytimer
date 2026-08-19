@@ -21,6 +21,12 @@
 //         When packVoltage ≥ SOC_FULL_VOLTAGE - hysteresis → SOC = 100%
 //         When packVoltage ≤ SOC_EMPTY_VOLTAGE + hysteresis → SOC = 0%
 // =============================================================================
+// BATTERY_MONITORING_ENABLED guard — file compiles to nothing when battery
+// monitoring is disabled (saves flash for relay-only installations).
+#include "BatteryConfig.h"
+#if !BATTERY_ENABLED
+// File intentionally empty when battery monitoring is disabled.
+#else
 #include "BatteryMonitor.h"
 #include "Config.h"
 #include "LogService.h"
@@ -452,3 +458,5 @@ bool BatteryMonitor::getLatestVi(float& v, float& i, uint32_t& ts) const {
 }
 
 } // namespace Services
+
+#endif // BATTERY_ENABLED

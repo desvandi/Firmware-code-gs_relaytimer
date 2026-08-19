@@ -18,6 +18,12 @@
 //
 // All I2C failures mark isAvailable()=false — no blocking retry. (Brief §46.)
 // =============================================================================
+// BATTERY_MONITORING_ENABLED guard — file compiles to nothing when battery
+// monitoring is disabled (saves flash for relay-only installations).
+#include "BatteryConfig.h"
+#if !BATTERY_ENABLED
+// File intentionally empty when battery monitoring is disabled.
+#else
 #include "Ina219Driver.h"
 #include "Config.h"  // Core::I2C_SDA / SCL (already initialized by DS3231)
 #include <Wire.h>
@@ -201,3 +207,5 @@ void Ina219Driver::tick() {
 }
 
 } // namespace Drivers
+
+#endif // BATTERY_ENABLED
