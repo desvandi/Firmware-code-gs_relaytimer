@@ -157,16 +157,6 @@ ArbitrationResult CommandArbiter::processCommand(const CommandRequest& req) {
   // Per ChatGPT: "Unknown command: REJECT. Jangan menggunakan blacklist."
   // Only SET_RELAY_STATE, SET_MODE, ACK_ALARM, CLEAR_ALARM are accepted.
   // PULSE, TOGGLE, START_MOTOR, etc. → REJECT.
-  switch (req.commandType) {
-    case CommandSource::Safety:  // not a command type — wrong enum, but allow compile
-      // This shouldn't happen — CommandSource and SupportedCommandType are different enums
-      break;
-    default:
-      break;
-  }
-  // Actually SupportedCommandType is a separate enum — let's check it properly:
-  // If commandType is not one of the 4 known values, reject.
-  // Since C++ enums don't have easy range-checking, we use explicit switch:
   bool isKnownCommand = false;
   switch (req.commandType) {
     case SupportedCommandType::SetRelayState:
