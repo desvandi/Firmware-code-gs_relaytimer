@@ -98,6 +98,9 @@
 #include "AlarmRegistry.h"
 #include "SafetySupervisor.h"
 #include "HealthSupervisor.h"
+// v4.3 audit P1-001, P1-002: CommandArbiter + InterlockEngine
+#include "CommandArbiter.h"
+#include "InterlockEngine.h"
 
 // Web
 #include "HttpServer.h"
@@ -110,6 +113,12 @@ namespace Core {
   Channel channels[NUM_CHANNELS];
   bool relayState[NUM_CHANNELS] = {false};
   RelaySource relaySource[NUM_CHANNELS] = {RelaySource::Off};
+  // v4.3 audit P1-005, P1-014: physical state + confidence + sequence
+  bool relayPhysicalState[NUM_CHANNELS] = {false};  // unknown until aux feedback
+  StateConfidence relayStateConfidence[NUM_CHANNELS] = {StateConfidence::Unknown};
+  uint32_t relayStateSequence[NUM_CHANNELS] = {0};
+  unsigned long relayStateTimestamp[NUM_CHANNELS] = {0};
+  bool relayFault[NUM_CHANNELS] = {false};
   PirState pirState[NUM_PIR];
   UserConfig userConfig = {"admin", "", {0}, PBKDF2_ITERATIONS};
   SystemMetrics metrics = {0, 0, 0, {0}, true};
@@ -193,6 +202,9 @@ void setup() {
   Services::health.recordBoot();    // classifies reset reason, raises alarms
   esp_task_wdt_reset();
   Services::safety.reset();         // clear runtime tracking
+  esp_task_wdt_reset();
+  // v4.3 audit P1-001, P1-002: CommandArbiter + InterlockEngine
+  Services::interlock.begin();      // no groups registered by default — owner configures via PWA or NVS
   esp_task_wdt_reset();
 
   // ---------- DRIVERS: RTC + Relays ----------

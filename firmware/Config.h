@@ -1,6 +1,6 @@
 // =============================================================================
 // Core/Config.h — System-wide constants and configuration
-// Timer Digital Relay v4.0 — Cloud-Ready Architecture
+// Timer Digital Relay v4.3 — Industrial-Grade Hardening Round 2
 // =============================================================================
 #pragma once
 #ifndef TIMER12_CORE_CONFIG_H
@@ -9,22 +9,51 @@
 #include <Arduino.h>
 #include <cstdint>
 
+// v4.3 audit P1-016: Build profile guard. Per ChatGPT audit:
+//   "development mode harus explicitly enabled, bukan default."
+//   "PRODUCTION_BUILD harus tidak mungkin tersandung ke public broker."
+//
+// Exactly ONE of DEVELOPMENT_BUILD / STAGING_BUILD / PRODUCTION_BUILD
+// MUST be defined (via platformio.ini build_flags). If none is defined,
+// the build FAILS at compile time — no implicit default.
+#if !defined(DEVELOPMENT_BUILD) && !defined(STAGING_BUILD) && !defined(PRODUCTION_BUILD)
+  #error "Build profile not selected. Define one of: -DDEVELOPMENT_BUILD, -DSTAGING_BUILD, or -DPRODUCTION_BUILD (in platformio.ini build_flags). Production MUST use PRODUCTION_BUILD."
+#endif
+#if (defined(DEVELOPMENT_BUILD) && defined(STAGING_BUILD)) || \
+    (defined(DEVELOPMENT_BUILD) && defined(PRODUCTION_BUILD)) || \
+    (defined(STAGING_BUILD) && defined(PRODUCTION_BUILD))
+  #error "Multiple build profiles defined. Select exactly ONE of DEVELOPMENT_BUILD / STAGING_BUILD / PRODUCTION_BUILD."
+#endif
+
 // ---------- FIRMWARE VERSION ----------
 namespace Core {
-  // v4.2.0 (audit brief #2 — 115-section industrial-grade directive):
-  //   Added per-channel maxOnTime/minOnTime/minOffTime/anti-chatter (§13-16)
-  //   + boot policy per channel (§13) + RTC state machine (§18) +
-  //   sensor data quality states VALID/STALE/ERROR/UNAVAILABLE (§20) +
-  //   monotonic telemetry sequence (§22) + Health Supervisor (§44) +
-  //   Task heartbeat monitoring (§45) + Crash forensics (§47) +
-  //   Central AlarmRegistry (§60) + ErrorCodes registry (§59).
-  // Local-first (§5, §78) — all safety enforcement works without
-  // Internet/MQTT/PWA/GAS. Backward-compatible — existing SystemStatus
-  // fields remain; new health/alarms/telemetrySequence blocks are added.
-  constexpr char FIRMWARE_VERSION[] = "4.2.0";
+  // v4.3.0 (ChatGPT targeted remediation audit):
+  //   P1-001: CommandArbiter (formal arbitration engine, replaces hardcoded
+  //           precedence in RelayEngine)
+  //   P1-002: InterlockEngine (declarative mutual-exclusion groups + dead time)
+  //   P1-003: Separate ACK_SAFETY_ALARM from SET_RELAY — setManual() no longer
+  //           auto-clears maxOnTimeForced (operator must call
+  //           SafetySupervisor::acknowledgeSafetyAlarm() explicitly)
+  //   P1-004: Unified GPIO mutation — all paths through RelayEngine::
+  //           applyChannelState() → RelayDriver (single authoritative actuator)
+  //   P1-005: Separate desired/reported/physical state semantics
+  //   P1-006: COMMAND_TIMEOUT = UNKNOWN execution status (not FAILED)
+  //   P1-007: CommandSemantics enum (IDEMPOTENT_STATE vs NON_IDEMPOTENT_ACTION)
+  //           + firmware rejects non-idempotent through transaction path
+  //   P1-010: HealthSupervisor state machine (HEALTHY/WARNING/DEGRADED/FAILED/
+  //           RECOVERING) + recovery policy per subsystem
+  //   P1-011: Time-window boot loop detection (ring buffer, 3+ boots in 60s)
+  //   P1-014: Separate commandedState (software GPIO) from physicalState
+  //           (UNKNOWN without aux contact feedback)
+  //   P1-016: DEV/STAGING/PRODUCTION build profiles — no implicit default
+  //
+  // NOT IMPLEMENTED IN SOFTWARE (require physical hardware — P1-012, P1-013,
+  // P1-017): Ed25519 known-answer test, 12-case power-loss test, Secure Boot
+  // provisioning. These remain NOT EXECUTED — HARDWARE REQUIRED per brief §107.
+  constexpr char FIRMWARE_VERSION[] = "4.3.0";
   constexpr char BUILD_DATE[] = __DATE__ " " __TIME__;
   constexpr uint8_t CONFIG_VERSION = 2;  // bump when schedule.json schema changes
-  constexpr char DEVICE_MODEL[] = "ESP32-WROOM-32 Timer12 v4.2 (industrial-grade)";
+  constexpr char DEVICE_MODEL[] = "ESP32-WROOM-32 Timer12 v4.3 (industrial-grade R2)";
 
   // ---------- CHANNELS ----------
   constexpr uint8_t NUM_CHANNELS = 12;

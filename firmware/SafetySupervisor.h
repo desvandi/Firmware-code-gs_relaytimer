@@ -56,7 +56,7 @@ public:
 
   // Called from RelayEngine::tick() before applying any transition.
   // `idx` is the channel index (0..NUM_CHANNELS-1).
-  // `desired` is what RelayEngine computed (manual/schedule/PIR result).
+  // `desired` is what CommandArbiter computed (manual/schedule/PIR result).
   // `current` is the current physical relay state.
   // Returns the safety decision — RelayEngine must respect it.
   SafetyDecision evaluateTransition(uint8_t idx, bool desired, bool current);
@@ -69,6 +69,15 @@ public:
   // channels. Returns the channel index that should be force-OFF, or
   // 0xFF if none. Called in a loop until it returns 0xFF.
   uint8_t checkMaxOnTimeExceeded();
+
+  // v4.3 audit P1-003: EXPLICIT safety alarm acknowledgement.
+  // Manual relay commands (setManual) NO LONGER auto-clear maxOnTimeForced.
+  // Operator must call this explicitly to clear the safety lockout.
+  // Returns true if the alarm was cleared; false if no lockout was active.
+  bool acknowledgeSafetyAlarm(uint8_t idx);
+
+  // v4.3 audit P1-003: Check whether a channel is in safety lockout.
+  bool isSafetyLockoutActive(uint8_t idx) const;
 
   // Reset all runtime tracking (e.g., on factory reset)
   void reset();

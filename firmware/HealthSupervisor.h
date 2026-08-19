@@ -70,6 +70,28 @@ enum class TaskId : uint8_t {
 };
 constexpr uint8_t TASK_COUNT = (uint8_t)TaskId::COUNT;
 
+// v4.3 audit P1-010: Health state machine per ChatGPT audit:
+//   "Tambahkan state: HEALTHY, WARNING, DEGRADED, FAILED, RECOVERING
+//    dan recovery policy per subsystem."
+enum class HealthState : uint8_t {
+  Healthy     = 0,
+  Warning     = 1,
+  Degraded    = 2,  // one or more subsystems in fault, system operational
+  Failed       = 3,  // critical subsystem failed — system in safe state
+  Recovering  = 4,  // recovery in progress (e.g., OTA rollback, MQTT reconnect)
+};
+
+inline const char* healthStateStr(HealthState s) {
+  switch (s) {
+    case HealthState::Healthy:    return "HEALTHY";
+    case HealthState::Warning:     return "WARNING";
+    case HealthState::Degraded:    return "DEGRADED";
+    case HealthState::Failed:       return "FAILED";
+    case HealthState::Recovering: return "RECOVERING";
+  }
+  return "UNKNOWN";
+}
+
 struct HealthSnapshot {
   uint32_t uptimeSeconds;
   uint32_t bootCount;
@@ -95,6 +117,11 @@ struct HealthSnapshot {
   // Per-task heartbeat ages (ms since last heartbeat)
   uint32_t taskHeartbeatAgeMs[TASK_COUNT];
   AlarmSeverity highestAlarm;
+  // v4.3 P1-010: aggregated health state
+  HealthState systemState;
+  // v4.3 P1-011: boot loop detection (time-window based)
+  bool     bootLoopDetected;
+  uint8_t  bootsInLast60s;
 };
 
 class HealthSupervisor {
@@ -126,6 +153,9 @@ public:
   // Reset reason classification (matches esp_reset_reason_t values)
   static const char* resetReasonStr(uint8_t reason);
 
+  // v4.3 P1-010: Get aggregated health state
+  HealthState getSystemState() const { return _snapshot.systemState; }
+
 private:
   HealthSnapshot _snapshot = {};
   RtcStatus  _rtcStatus = RtcStatus::Unsynced;
@@ -137,6 +167,14 @@ private:
   unsigned long _lastHeartbeatMs[TASK_COUNT] = {};
   unsigned long _lastTickMs = 0;
   bool _initialized = false;
+
+  // v4.3 P1-011: boot timestamp ring buffer for time-window boot loop detection
+  static constexpr uint8_t BOOT_LOOP_WINDOW = 8;
+  uint32_t _bootTimestamps[BOOT_LOOP_WINDOW] = {};
+  uint8_t  _bootTimestampIdx = 0;
+
+  // v4.3 P1-010: Compute aggregated health state from snapshot
+  void _recomputeSystemState();
 };
 
 extern HealthSupervisor health;

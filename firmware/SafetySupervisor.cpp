@@ -146,4 +146,35 @@ void SafetySupervisor::reset() {
   _bootStatesApplied = false;
 }
 
+// v4.3 audit P1-003: Explicit safety alarm acknowledgement.
+//
+// Per ChatGPT audit:
+//   "fungsi setManual() sendiri bukan acknowledgement protocol.
+//    Artinya semantics: manual command sekaligus menjadi:
+//    safety override acknowledgement — ini terlalu implicit.
+//
+//    Yang benar: Harus dipisahkan: SET_RELAY dan ACK_SAFETY_ALARM
+//    MAX_ON_TIME → FORCED OFF → LOCKOUT → operator acknowledges alarm
+//    → explicit CLEAR → relay may be enabled again"
+//
+// This function performs the explicit CLEAR step. setManual() will NOT
+// clear the lockout — the PWA must call this endpoint separately before
+// issuing a manual ON command for a locked-out channel.
+bool SafetySupervisor::acknowledgeSafetyAlarm(uint8_t idx) {
+  if (idx >= Core::NUM_CHANNELS) return false;
+  if (!Core::channels[idx].maxOnTimeForced) return false;
+  Core::channels[idx].maxOnTimeForced = false;
+  alarms.clear(Err::RELAY_MAX_ON_TIME);
+  alarms.acknowledge(Err::RELAY_MAX_ON_TIME);
+  char msg[64];
+  snprintf(msg, sizeof(msg), "CH%u safety lockout cleared by operator", idx + 1);
+  // Log to activity log via caller (avoids circular include with LogService)
+  return true;
+}
+
+bool SafetySupervisor::isSafetyLockoutActive(uint8_t idx) const {
+  if (idx >= Core::NUM_CHANNELS) return false;
+  return Core::channels[idx].maxOnTimeForced;
+}
+
 } // namespace Services

@@ -100,6 +100,35 @@ enum class RelaySource : uint8_t {
   Pir,
 };
 
+// v4.3 audit P1-005, P1-014: Per ChatGPT audit:
+//   "Untuk industrial controller saya ingin:
+//      desiredState, reportedState, physicalState,
+//      stateConfidence, stateTimestamp, stateSequence, fault"
+//
+//   "PWA shows the GPIO-commanded state, not the confirmed physical state.
+//    This is documented in the UI as 'commanded state' rather than
+//    'confirmed state'."
+//
+// These states are tracked per channel. physicalState defaults to UNKNOWN
+// because there is NO auxiliary contact feedback (documented limitation —
+// see HARDWARE_SAFETY_CONTRACT.md §9).
+enum class StateConfidence : uint8_t {
+  SoftwareOnly   = 0,  // GPIO commanded, no physical confirmation
+  Verified       = 1,  // Auxiliary contact confirms physical state (future HW)
+  Unknown        = 2,  // Never commanded, or boot state indeterminate
+  Fault          = 3,  // State drift detected or interlock violation
+};
+
+inline const char* stateConfidenceStr(StateConfidence c) {
+  switch (c) {
+    case StateConfidence::SoftwareOnly: return "SOFTWARE_ONLY";
+    case StateConfidence::Verified:      return "VERIFIED";
+    case StateConfidence::Unknown:       return "UNKNOWN";
+    case StateConfidence::Fault:         return "FAULT";
+  }
+  return "UNKNOWN";
+}
+
 // ---------- AUTH ATTEMPT (rate limiting) ----------
 struct AuthAttempt {
   uint32_t ip;              // packed IP

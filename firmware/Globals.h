@@ -13,8 +13,15 @@ namespace Core {
 // ---------- GLOBAL MUTABLE STATE ----------
 // Defined once in main .ino; declared extern here for other modules.
 extern Channel channels[NUM_CHANNELS];
-extern bool relayState[NUM_CHANNELS];
+extern bool relayState[NUM_CHANNELS];        // software commanded state (GPIO output)
 extern RelaySource relaySource[NUM_CHANNELS];
+// v4.3 audit P1-005, P1-014: physical state tracking (UNKNOWN without aux feedback)
+extern bool relayPhysicalState[NUM_CHANNELS];  // last confirmed physical state
+                                                // (false until aux contact feedback available)
+extern StateConfidence relayStateConfidence[NUM_CHANNELS];
+extern uint32_t relayStateSequence[NUM_CHANNELS];  // monotonic per-channel sequence
+extern unsigned long relayStateTimestamp[NUM_CHANNELS];  // last state change ms
+extern bool relayFault[NUM_CHANNELS];               // state drift or interlock violation
 extern PirState pirState[NUM_PIR];
 extern UserConfig userConfig;
 extern SystemMetrics metrics;

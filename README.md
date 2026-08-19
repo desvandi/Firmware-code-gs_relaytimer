@@ -1,86 +1,235 @@
-# Timer Digital Relay v4.2 — Firmware + Google Apps Script (Industrial-Grade)
+# Timer Digital Relay v4.3 — Firmware + Google Apps Script (Industrial-Grade R2)
 
-> ESP32-WROOM-32 firmware for 12-channel industrial relay control with per-channel safety limits (maxOnTime, minOnTime, anti-chatter), RTC state machine, Health Supervisor, central AlarmRegistry, monotonic telemetry sequence, NVS-persisted transaction journal, Ed25519-signed OTA, 8S LiFePO4 battery monitoring (INA219/ADS1115/SHT31), and Google Apps Script AI insights pipeline. **Local-first** — all safety logic runs on-device without Internet/MQTT/PWA/GAS.
+> **Status: 🟡 NOT PRODUCTION READY — HARDENING ROUND REQUIRED** (per ChatGPT audit)
+>
+> ESP32-WROOM-32 firmware for 12-channel industrial relay control with per-channel safety limits (maxOnTime, minOnTime, anti-chatter), RTC state machine, Health Supervisor with state machine (HEALTHY/WARNING/DEGRADED/FAILED/RECOVERING), central AlarmRegistry, monotonic telemetry sequence, formal CommandArbiter (priority-based arbitration), declarative InterlockEngine (mutual-exclusion groups with dead time), unified GPIO mutation path, explicit safety alarm acknowledgement (separate from manual relay commands), command semantics classification (IDEMPOTENT_STATE vs NON_IDEMPOTENT_ACTION), NVS-persisted transaction journal, Ed25519-signed OTA, 8S LiFePO4 battery monitoring (INA219/ADS1115/SHT31), and Google Apps Script AI insights pipeline. **Local-first** — all safety logic runs on-device without Internet/MQTT/PWA/GAS.
 
-[![Firmware Version](https://img.shields.io/badge/firmware-v4.2.0-blue)](#)
-[![Industrial Grade](https://img.shields.io/badge/grade-industrial-orange)](#industrial-grade-hardening-v42)
+[![Firmware Version](https://img.shields.io/badge/firmware-v4.3.0-blue)](#)
+[![Industrial Grade](https://img.shields.io/badge/grade-industrial-orange)](#industrial-grade-hardening-v43)
+[![Status](https://img.shields.io/badge/status-NOT%20PROD%20READY%20—%20HARDENING%20ROUND-yellow)](#production-readiness-status)
 [![Local-First](https://img.shields.io/badge/local--first-✓-green)](#local-first-control-principle)
 [![Security Audit](https://img.shields.io/badge/audit-round%2010K-brightgreen)](#security-audit-history)
 [![ESP32 Core](https://img.shields.io/badge/ESP32%20core-3.3.7-green)](#)
 [![License](https://img.shields.io/badge/license-proprietary-lightgrey)](#)
 
-This repo holds the **device-side code** for the Timer Digital Relay v4.2 system. The companion PWA dashboard lives in a separate repo: **[desvandi/Remote-Relay](https://github.com/desvandi/Remote-Relay)**.
+This repo holds the **device-side code** for the Timer Digital Relay v4.3 system. The companion PWA dashboard lives in a separate repo: **[desvandi/Remote-Relay](https://github.com/desvandi/Remote-Relay)**.
 
 ---
 
-## ⚡ What's New in v4.2 (Industrial-Grade Hardening)
+## 🟡 Production Readiness Status
 
-v4.2 implements a comprehensive 115-section industrial-grade hardening directive. Key additions:
+Per ChatGPT targeted remediation audit (v4.2 → v4.3), the following P1 blockers were addressed:
 
-### Safety-Critical (P0)
+| P1 ID | Issue | Status (v4.3) |
+|---|---|---|
+| P1-001 | Formal Command Arbitration Engine | ✅ `CommandArbiter` module — produces `ArbitrationResult{targetState, source, priority, reason, requestId}` |
+| P1-002 | Formal Interlock Engine | ✅ `InterlockEngine` module — declarative mutual-exclusion groups + dead time |
+| P1-003 | Separate safety acknowledgement from manual command | ✅ `SafetySupervisor::acknowledgeSafetyAlarm()` — `setManual()` no longer auto-clears lockout |
+| P1-004 | Unify all GPIO mutation through one path | ✅ All transitions now flow through `RelayEngine::applyChannelState()` — single authoritative actuator |
+| P1-005 | Separate desired/reported/physical state semantics | ✅ Added `relayPhysicalState[]`, `relayStateConfidence[]`, `relayStateSequence[]`, `relayStateTimestamp[]`, `relayFault[]` globals + PWA `ChannelState` type |
+| P1-006 | COMMAND_TIMEOUT = UNKNOWN execution status | ✅ PWA `CommandExecutionState` type — `TIMEOUT` is distinct from `FAILED` |
+| P1-007 | Command semantics classification | ✅ `CommandSemantics` enum (IDEMPOTENT_STATE / NON_IDEMPOTENT_ACTION); firmware rejects non-idempotent through transaction path |
+| P1-010 | HealthSupervisor state machine | ✅ `HealthState` enum (HEALTHY/WARNING/DEGRADED/FAILED/RECOVERING) + `_recomputeSystemState()` policy |
+| P1-011 | Time-window boot loop detection | ✅ Ring buffer of last 8 boot timestamps + `bootsInLast60s` counter + `BOOT_LOOP` alarm |
+| P1-014 | Separate commandedState from physicalState | ✅ `relayPhysicalState[]` defaults to `false` (UNKNOWN) — PWA `StateConfidence::SoftwareOnly` reflects no-aux-feedback limitation |
+| P1-016 | DEV/STAGING/PRODUCTION build profiles | ✅ Compile-time guard in `Config.h` — build FAILS if no profile selected |
 
-- **Per-channel safety limits** (audit brief §13-16):
-  - `maxOnTimeSec` — automatic FORCE OFF after configured duration (e.g. 7200s = 2h)
-  - `minOnTimeSec` / `minOffTimeSec` — inhibit premature ON/OFF transitions (protect motors, contactors)
-  - `minSwitchIntervalSec` — anti-chatter filter (block rapid ON/OFF cycles from noisy PIR or unstable sensors)
-  - `bootPolicy` — `BOOT_OFF` / `BOOT_ON` / `RESTORE_LAST` / `SAFE_STATE` per channel
-- **RTC state machine** (§18-19): explicit `VALID` / `INVALID` / `UNSYNCED` states.
-  Scheduler is **inhibited** when RTC is not VALID — prevents time-based
-  commands from executing against a wrong clock.
-- **Sensor data quality states** (§20-21): `VALID` / `STALE` / `ERROR` /
-  `UNAVAILABLE` — invalid sensor readings are NEVER silently reported as 0.
-- **Local-first safety** (§5, §78): all safety logic runs on-device without
-  Internet, MQTT, PWA, or GAS. If all connectivity is lost for 24 hours,
-  local automation + safety limits continue to function.
+### Remaining blockers (NOT software-fixable — require hardware):
 
-### Reliability (P1)
+| P1 ID | Issue | Why hardware-required |
+|---|---|---|
+| P1-008 | Durable telemetry store-and-forward | Needs ESP32 flash wear testing across reboots |
+| P1-009 | Transactional config A/B recovery | Needs ESP32 power-loss test harness |
+| P1-012 | Ed25519 known-answer test | Needs ESP32 toolchain (mbedtls Ed25519 KAT) |
+| P1-013 | 12-case power-loss test | Needs physical ESP32 + relay hardware |
+| P1-015 | MQTT browser credential blast-radius | Architectural — needs Auth Gateway deployment |
+| P1-017 | Secure Boot + Flash Encryption provisioning | Needs disposable ESP32 for provisioning verification |
 
-- **Monotonic telemetry sequence** (§22): every status publication carries
-  an incrementing `telemetrySequence` — PWA/GAS can detect packet loss or
-  reordering.
-- **Health Supervisor** (§44): tracks uptime, boot count, last reset reason
-  (POWERON/EXT/WDT/BROWNOUT/...), watchdog reset count, brownout count,
-  free heap, minimum free heap observed, WiFi reconnect count, MQTT
-  reconnect count, per-task heartbeat ages.
-- **RTOS task heartbeat monitoring** (§45): every critical task (RelayEngine,
-  MQTT, Telemetry, Scheduler, PIR, PZEM, OTA, HealthMonitor, BatteryMonitor)
-  records a heartbeat. If any task stalls for >10 s, a `TASK_STALL_*` alarm
-  is raised.
-- **Crash forensics** (§47): `bootCount`, `lastResetReason`,
-  `lastResetReasonStr`, `watchdogResets`, `brownoutResets` are persisted
-  across reboots in NVS namespace `health`.
+**These 6 items remain NOT EXECUTED — HARDWARE REQUIRED per audit brief §107. Owner must execute on physical hardware before declaring production-ready.**
 
-### Observability (P1)
+---
 
-- **Central AlarmRegistry** (§60): all alarms have `code`, `severity`
-  (INFO/WARNING/CRITICAL), `active`, `acknowledged`, `raisedAt`,
-  `clearedAt`, `message`. Minimum alarm set per brief:
-  device offline, MQTT failure, RTC invalid, PZEM failure, PIR failure,
-  over/undervoltage, overcurrent, overpower, storage failure, OTA failure,
-  auth failure, repeated reboot, watchdog, brownout, state drift,
-  interlock violation.
-- **Error code registry** (§59): deterministic `ERR_<DOMAIN>_<NNN>` strings
-  (e.g. `ERR_RELAY_002` for maxOnTime, `ERR_RTC_001` for invalid RTC).
-  PWA can match on these to render localized messages.
+## ⚡ What's New in v4.3 (ChatGPT Targeted Remediation)
 
-### How to configure per-channel safety limits
+v4.3 implements the 11 P1 blockers identified by ChatGPT's source-code re-audit. Per the audit directive: "DO NOT ADD FEATURES RANDOMLY. Perform an independent source-code re-audit against the existing Industrial-Grade Directive." This is targeted remediation, not feature addition.
 
-All limits default to `0` (= unlimited/inactive). Configure per-channel
-in `Channel` struct (Types.h) or via NVS-backed config (future PWA
-Settings page):
+### P1-001: CommandArbiter (formal arbitration engine)
 
-```cpp
-// Example: CH1 = heater, force OFF after 2 hours, min 60s ON, min 60s OFF
-channels[0].maxOnTimeSec = 7200;
-channels[0].minOnTimeSec = 60;
-channels[0].minOffTimeSec = 60;
-channels[0].minSwitchIntervalSec = 5;
-channels[0].bootPolicy = (uint8_t)BootPolicy::BootOff;  // safe default
+Replaces the hardcoded precedence logic in `RelayEngine::_computeChannel()` with a formal `CommandArbiter` module that produces `ArbitrationResult{targetState, source, priority, reason, vetoed, vetoReason}`.
+
+```
+Input sources (manual/schedule/PIR/safety)
+     ↓
+CommandArbiter::arbitrate() → ArbitrationResult{targetState, source, priority, reason}
+     ↓
+InterlockEngine::evaluateTransition() → may BLOCK (mutual exclusion, dead time)
+     ↓
+SafetySupervisor::evaluateTransition() → may INHIBIT (minOnTime, anti-chatter, maxOnTime lockout)
+     ↓
+RelayEngine::applyChannelState() ← SINGLE authoritative GPIO mutation path
+     ↓
+RelayDriver::setChannel()
+     ↓
+Physical GPIO
 ```
 
+### P1-002: InterlockEngine (declarative mutual-exclusion groups)
+
+Implements interlock groups for forward/reverse, charge/discharge, motor contactor pairs:
+
+```cpp
+uint8_t motorGroup[] = {0, 1};  // CH1 = FORWARD, CH2 = REVERSE
+Services::interlock.registerGroup(
+    "motor_fwd_rev",
+    Services::InterlockType::MutualExclusion,
+    motorGroup, 2,
+    1000  // 1s dead time between OFF one and ON another
+);
+```
+
+When CH1 is ON, attempts to turn CH2 ON are BLOCKED with `ERR_RELAY_006` alarm. After CH1 turns OFF, a 1000 ms dead time must elapse before CH2 can turn ON.
+
+### P1-003: Separate safety acknowledgement from manual command
+
+Per ChatGPT audit: "fungsi setManual() sendiri bukan acknowledgement protocol. Yang benar: Harus dipisahkan: SET_RELAY dan ACK_SAFETY_ALARM"
+
+**Before (v4.2 — buggy):**
+```cpp
+void RelayEngine::setManual(uint8_t idx, bool on) {
+  Core::channels[idx].maxOnTimeForced = false;  // ❌ auto-clears safety lockout
+  Services::alarms.clear(Err::RELAY_MAX_ON_TIME);  // ❌ implicit acknowledgement
+  // ...
+}
+```
+
+**After (v4.3 — explicit):**
+```cpp
+void RelayEngine::setManual(uint8_t idx, bool on) {
+  // ✅ Does NOT clear maxOnTimeForced — operator must call
+  //    SafetySupervisor::acknowledgeSafetyAlarm() explicitly.
+  //    If lockout is active, arbitrate() returns Safety source
+  //    with targetState=false, overriding this manual command.
+  Core::channels[idx].modeAuto = false;
+  Core::channels[idx].manualState = on;
+}
+
+// Separate explicit acknowledgement API:
+bool SafetySupervisor::acknowledgeSafetyAlarm(uint8_t idx);  // clears lockout
+bool SafetySupervisor::isSafetyLockoutActive(uint8_t idx) const;
+```
+
+### P1-004: Unified GPIO mutation path
+
+Before v4.3, the `maxOnTime` force-OFF path called `Drivers::relay.setChannel()` directly, bypassing the safety/interlock gates. This created two physical actuation paths. v4.3 unifies ALL GPIO mutation through `RelayEngine::applyChannelState()`:
+
+```cpp
+// v4.3 P1-004: SINGLE authoritative GPIO mutation function.
+// All paths (maxOnTime force-off, normal transition, boot policy) must
+// route through this function. No other code may call
+// Drivers::relay.setChannel() except this function + RelayDriver::allOff()
+// (which is for factory reset only).
+static void applyChannelState(uint8_t idx, bool newState) {
+  Drivers::relay.setChannel(idx, newState);
+  Core::relayState[idx] = newState;
+  Services::safety.recordTransition(idx, newState);
+  Services::interlock.recordTransition(idx, newState);
+}
+```
+
+### P1-005, P1-014: Separate desired/reported/physical state
+
+Per ChatGPT audit: "Untuk industrial controller saya ingin: desiredState, reportedState, physicalState, stateConfidence, stateTimestamp, stateSequence, fault"
+
+Added globals:
+- `relayPhysicalState[NUM_CHANNELS]` — last confirmed physical state (false/UNKNOWN without aux feedback)
+- `relayStateConfidence[NUM_CHANNELS]` — `SOFTWARE_ONLY` / `VERIFIED` / `UNKNOWN` / `FAULT`
+- `relayStateSequence[NUM_CHANNELS]` — monotonic per-channel counter
+- `relayStateTimestamp[NUM_CHANNELS]` — last state change ms
+- `relayFault[NUM_CHANNELS]` — state drift or interlock violation
+
+PWA type `ChannelState` mirrors this:
+```typescript
+type ChannelState = {
+  desiredState: boolean;
+  reportedState: boolean;
+  physicalState: boolean | null;  // null = UNKNOWN without aux feedback
+  stateConfidence: StateConfidence;
+  stateTimestamp: number;
+  stateSequence: number;
+  fault: boolean;
+};
+```
+
+### P1-006: COMMAND_TIMEOUT = UNKNOWN execution status
+
+Per ChatGPT audit: "UI harus membedakan: COMMAND_TIMEOUT dengan COMMAND_FAILED dan UNKNOWN_EXECUTION_STATUS. Karena timeout berarti: 'kita tidak tahu apakah command telah dieksekusi'."
+
+PWA `CommandExecutionState` type now has 8 explicit states:
+- `COMMAND_PENDING` — sent, waiting for ACK
+- `CONFIRMED_ON` / `CONFIRMED_OFF` — ACK received
+- `TIMEOUT` — UNKNOWN execution (device may have executed, may not have)
+- `FAILED` — ACK received with success=false
+- `DEVICE_OFFLINE` — no ACK possible
+- `UNKNOWN` — never commanded
+- `STATE_DRIFT` — desired != reported for sustained period
+
+### P1-007: Command semantics classification
+
+Per ChatGPT audit: "logical idempotency ≠ physical side-effect idempotency. Untuk SET CH1 ON dua kali: ON ON secara logical memang idempotent. Tetapi untuk PULSE/TOGGLE/START_MOTOR/TRIGGER_CONTACTOR/RESET: tidak lagi aman."
+
+Firmware `CommandSemantics` enum + `CommandArbiter::processCommand()` rejects `NON_IDEMPOTENT_ACTION` through the transactional (replay-safe) path:
+```cpp
+if (req.semantics == CommandSemantics::NonIdempotentAction) {
+  r.vetoed = true;
+  setReasonStr(r.vetoReason, ..., "non-idempotent action rejected — use IDEMPOTENT_STATE only");
+  return r;
+}
+```
+
+### P1-010: HealthSupervisor state machine
+
+Per ChatGPT audit: "Tambahkan state: HEALTHY, WARNING, DEGRADED, FAILED, RECOVERING dan recovery policy per subsystem."
+
+`HealthState` enum + `_recomputeSystemState()` policy:
+- `FAILED` — boot loop OR RTC invalid OR filesystem/NVS not OK
+- `DEGRADED` — any sensor UNAVAILABLE/ERROR OR task stalled >30s
+- `WARNING` — any active WARNING alarm
+- `HEALTHY` — no active alarms
+
+### P1-011: Time-window boot loop detection
+
+Per ChatGPT audit: "Harus dibuat benar-benar time-window based: bootTimestamp ring buffer — 3+ boots in 60 seconds → BOOT_LOOP"
+
+Replaced the v4.2 buggy `bootCount > lastBootCount + 5` heuristic with a ring buffer of last 8 boot timestamps persisted in NVS:
+```cpp
+static constexpr uint8_t BOOT_LOOP_WINDOW = 8;
+uint32_t _bootTimestamps[BOOT_LOOP_WINDOW] = {};
+uint8_t  _bootTimestampIdx = 0;
+```
+
+Detection logic: count boots in last 60 seconds; if ≥3 → `BOOT_LOOP` CRITICAL alarm + `bootLoopDetected=true`.
+
+### P1-016: DEV/STAGING/PRODUCTION build profiles
+
+Per ChatGPT audit: "development mode harus explicitly enabled, bukan default. PRODUCTION_BUILD harus tidak mungkin tersandung ke public broker."
+
+Compile-time guard in `Config.h`:
+```cpp
+#if !defined(DEVELOPMENT_BUILD) && !defined(STAGING_BUILD) && !defined(PRODUCTION_BUILD)
+  #error "Build profile not selected. Define one of: -DDEVELOPMENT_BUILD, -DSTAGING_BUILD, or -DPRODUCTION_BUILD"
+#endif
+```
+
+Three explicit envs in `platformio.ini`:
+- `[env:development]` → `-DDEVELOPMENT_BUILD` (HiveMQ public, no auth, CORS *)
+- `[env:staging]` → `-DSTAGING_BUILD` (real broker, self-signed certs allowed, CORS *)
+- `[env:production]` → `-DPRODUCTION_BUILD` (TLS + auth + CA + non-wildcard CORS — fail-closed)
+
+No implicit default — operator MUST choose.
+
 ---
 
-## 🏭 Industrial-Grade Hardening (v4.2)
+## 🏭 Industrial-Grade Hardening (v4.3)
 
 ### Local-First Control Principle
 
@@ -96,6 +245,7 @@ relay state. If all cloud connectivity is lost:
 | maxOnTime FORCE OFF | ✅ Yes |
 | minOnTime / anti-chatter | ✅ Yes |
 | Boot policy | ✅ Yes |
+| InterlockEngine (mutual exclusion) | ✅ Yes |
 | Audit log (LittleFS) | ✅ Yes |
 | Transaction journal (NVS) | ✅ Yes |
 | OTA rollback detection | ✅ Yes |
@@ -103,7 +253,20 @@ relay state. If all cloud connectivity is lost:
 | PWA control | ❌ Disabled until reconnect |
 | GAS AI insights | ❌ Disabled |
 
-### Architecture
+### Key v4.3 Modules
+
+| Module | File | Audit P1 | Purpose |
+|---|---|---|---|
+| `CommandArbiter.{h,cpp}` | P1-001 | Formal arbitration engine → `ArbitrationResult{targetState, source, priority, reason}` |
+| `InterlockEngine.{h,cpp}` | P1-002 | Declarative mutual-exclusion groups + dead time |
+| `SafetySupervisor.{h,cpp}` | P1-003, P1-004 | Per-channel maxOnTime/minOnTime/anti-chatter + explicit acknowledge API |
+| `HealthSupervisor.{h,cpp}` | P1-010, P1-011 | Health state machine + time-window boot loop detection |
+| `ErrorCodes.h` | §59 | Centralized `ERR_<DOMAIN>_<NNN>` registry |
+| `AlarmRegistry.{h,cpp}` | §60 | Central alarm engine with severity levels |
+| `BatteryMonitor.{h,cpp}` | §21-28 (v4.1) | 8S LiFePO4 cell + power + energy + SOC |
+| `BatteryStatusSerializer.h` | §31-33 | Shared REST+MQTT telemetry serializer |
+
+### Architecture (v4.3)
 
 ```
                     ┌─────────────────────┐
@@ -113,7 +276,8 @@ relay state. If all cloud connectivity is lost:
                                ▼
                     ┌─────────────────────┐
                     │       PWA           │
-                    │ UI / RBAC / State   │
+                    │ UI / State Model    │
+                    │ (CommandExecutionState) │
                     └──────────┬──────────┘
                                │
                                ▼
@@ -133,43 +297,24 @@ relay state. If all cloud connectivity is lost:
              │ ESP32 AUTHORITATIVE EDGE       │
              │ CONTROLLER                     │
              │                                │
-             │ Auth / Command Validation      │
-             │ Arbitration / Interlock        │
-             │ Scheduler / PIR / Relay Engine │
+             │ CommandArbiter                  │
+             │   ↓                            │
+             │ InterlockEngine                │
+             │   ↓                            │
              │ SafetySupervisor               │
+             │   ↓                            │
+             │ RelayEngine (unified GPIO)     │
+             │   ↓                            │
+             │ RelayDriver                    │
+             │                                │
              │ HealthSupervisor               │
              │ AlarmRegistry                  │
-             │ OTA                            │
+             │ OTA / Auth / TransactionJournal│
              └───────────────┬────────────────┘
                              │
                              ▼
                     PHYSICAL HARDWARE
 ```
-
-### Key v4.2 Modules
-
-| Module | File | Brief § | Purpose |
-|---|---|---|---|
-| `ErrorCodes.h` | 59 | Centralized `ERR_<DOMAIN>_<NNN>` registry |
-| `AlarmRegistry.{h,cpp}` | 60 | Central alarm engine with severity levels |
-| `SafetySupervisor.{h,cpp}` | 13-16 | Per-channel maxOnTime/minOnTime/anti-chatter |
-| `HealthSupervisor.{h,cpp}` | 44, 45, 47 | Health metrics + task heartbeats + crash forensics |
-| `BatteryMonitor.{h,cpp}` | 21-28 (v4.1) | 8S LiFePO4 cell + power + energy + SOC |
-| `BatteryDiagnostics.{h,cpp}` | 30 (v4.1) | Battery fault detection |
-| `ResistanceEstimator.{h,cpp}` | 25-29 (v4.1) | ΔV/ΔI dynamic resistance estimate |
-| `BatteryStatusSerializer.h` | 31-33 | Shared REST+MQTT telemetry serializer |
-
-### Command Priority (audit brief §8)
-
-```
-SAFETY (1000) > EMERGENCY/INTERLOCK (900) > MANUAL AUTHORIZED (800) >
-MAINTENANCE (700) > REMOTE AUTOMATION (600) > SCHEDULE (500) >
-PIR (400) > DEFAULT (100)
-```
-
-In v4.2 the existing `Manual > PIR > Schedule > Off` priority is preserved
-(backward compat). The full numeric priority will be activated in v4.3 when
-the command arbitration engine (§7) is implemented.
 
 ---
 
@@ -181,7 +326,7 @@ In addition to this README, see:
 |---|---|
 | [SECURITY.md](./SECURITY.md) | Security model, attack surface, hardening checklist |
 | [PROTOCOL.md](./PROTOCOL.md) | MQTT/REST message protocol, packet format, QoS |
-| [DEPLOYMENT.md](./DEPLOYMENT.md) | Production deployment guide |
+| [DEPLOYMENT.md](./DEPLOYMENT.md) | Production deployment guide (DEV/STAGING/PROD build profiles) |
 | [TEST_PLAN.md](./TEST_PLAN.md) | Required test matrix (unit / integration / fault injection / power-loss) |
 | [DISASTER_RECOVERY.md](./DISASTER_RECOVERY.md) | Device replacement, credential recovery, OTA recovery |
 | [HARDWARE_SAFETY_CONTRACT.md](./HARDWARE_SAFETY_CONTRACT.md) | GPIO, relay polarity, PSU, grounding, isolation |
@@ -189,6 +334,12 @@ In addition to this README, see:
 | [COMPATIBILITY_MATRIX.md](./COMPATIBILITY_MATRIX.md) | PWA/Firmware/Protocol version compatibility |
 
 ---
+
+## 🔧 Existing v4.0/v4.1/v4.2 Documentation
+
+The sections below are preserved from previous versions. They remain accurate
+for all existing features. The v4.3 additions are layered on top — no existing
+behavior has been removed.
 
 ## 🔧 Existing v4.0/v4.1 Documentation
 
