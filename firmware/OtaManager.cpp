@@ -270,40 +270,65 @@ void OtaManager::handleUpload(WebServer& server, const String& filename,
     hashHex[64] = '\0';
     Serial.printf("[OTA] Computed SHA-256: %s\n", hashHex);
 
-    // REAUDIT-FW-OTA-002: Anti-downgrade check
-    // Read the new firmware's version from the uploaded binary (first 256 bytes
-    // contain the version string in the format "Timer12-vX.Y.Z" at a known offset).
-    // For simplicity, we check the X-Firmware-Version header if provided by PWA.
-    // This is a BEST-EFFORT anti-downgrade — the real check happens on next boot
-    // in markBootHealthy() which compares against the running version.
+    // REAUDIT3-FW-OTA-001 FIX (2026-08-20): Anti-downgrade check is now MANDATORY.
+    // The auditor correctly identified that optional verification is security theater —
+    // an attacker simply omits the header to bypass all checks. Now: if the
+    // X-Firmware-Version header is missing, OTA is REJECTED. No exceptions.
     String newVersion = server.header("X-Firmware-Version");
-    if (newVersion.length() > 0) {
-      Serial.printf("[OTA] New firmware version: %s (current: %s)\n",
-                    newVersion.c_str(), Core::FIRMWARE_VERSION);
-      // Parse and compare versions
+    if (newVersion.length() == 0) {
+      Serial.println("[OTA] REJECTED: X-Firmware-Version header MANDATORY (anti-downgrade)");
+      Services::Log.append(Core::LogType::Error,
+        "OTA upload REJECTED: X-Firmware-Version header required (anti-downgrade)", 0);
+      Update.abort();
+      _updating = false;
+      _totalReceived = 0;
+      return;
+    }
+    Serial.printf("[OTA] New firmware version: %s (current: %s)\n",
+                  newVersion.c_str(), Core::FIRMWARE_VERSION);
+    {
       int newMajor, newMinor, newPatch;
       int curMajor, curMinor, curPatch;
-      if (sscanf(newVersion.c_str(), "%d.%d.%d", &newMajor, &newMinor, &newPatch) == 3 &&
-          sscanf(Core::FIRMWARE_VERSION, "%d.%d.%d", &curMajor, &curMinor, &curPatch) == 3) {
-        if (newMajor < curMajor ||
-            (newMajor == curMajor && newMinor < curMinor) ||
-            (newMajor == curMajor && newMinor == curMinor && newPatch < curPatch)) {
-          Serial.println("[OTA] REJECTED: downgrade attempt (anti-downgrade)");
-          Services::Log.append(Core::LogType::Error,
-            "OTA upload REJECTED: firmware downgrade not allowed", 0);
-          Update.abort();
-          _updating = false;
-          _totalReceived = 0;
-          return;
-        }
-        Serial.println("[OTA] Anti-downgrade check PASSED");
+      if (sscanf(newVersion.c_str(), "%d.%d.%d", &newMajor, &newMinor, &newPatch) != 3 ||
+          sscanf(Core::FIRMWARE_VERSION, "%d.%d.%d", &curMajor, &curMinor, &curPatch) != 3) {
+        Serial.println("[OTA] REJECTED: version format unparseable");
+        Services::Log.append(Core::LogType::Error,
+          "OTA upload REJECTED: version format unparseable", 0);
+        Update.abort();
+        _updating = false;
+        _totalReceived = 0;
+        return;
       }
+      if (newMajor < curMajor ||
+          (newMajor == curMajor && newMinor < curMinor) ||
+          (newMajor == curMajor && newMinor == curMinor && newPatch < curPatch)) {
+        Serial.println("[OTA] REJECTED: downgrade attempt (anti-downgrade)");
+        Services::Log.append(Core::LogType::Error,
+          "OTA upload REJECTED: firmware downgrade not allowed", 0);
+        Update.abort();
+        _updating = false;
+        _totalReceived = 0;
+        return;
+      }
+      Serial.println("[OTA] Anti-downgrade check PASSED");
     }
 
-    // REAUDIT-FW-OTA-002: Verify SHA-256 if expected hash provided
+    // REAUDIT3-FW-OTA-001 FIX (2026-08-20): SHA-256 verification is now MANDATORY.
+    // The auditor correctly identified that optional hash verification is useless —
+    // an attacker simply omits X-Expected-SHA256 to install arbitrary firmware.
+    // Now: if the header is missing, OTA is REJECTED. No exceptions.
     String expectedHash = server.header("X-Expected-SHA256");
-    if (expectedHash.length() > 0) {
-      expectedHash.toUpperCase();
+    if (expectedHash.length() == 0) {
+      Serial.println("[OTA] REJECTED: X-Expected-SHA256 header MANDATORY");
+      Services::Log.append(Core::LogType::Error,
+        "OTA upload REJECTED: X-Expected-SHA256 header required", 0);
+      Update.abort();
+      _updating = false;
+      _totalReceived = 0;
+      return;
+    }
+    expectedHash.toUpperCase();
+    {
       String computedUpper = String(hashHex);
       computedUpper.toUpperCase();
       if (expectedHash != computedUpper) {
@@ -317,9 +342,6 @@ void OtaManager::handleUpload(WebServer& server, const String& filename,
         return;
       }
       Serial.println("[OTA] SHA-256 verification PASSED");
-    } else {
-      Serial.println("[OTA] WARNING: No X-Expected-SHA256 header — hash not verified");
-      Serial.println("[OTA] Computed hash for reference: " + String(hashHex));
     }
 
     if (!Update.end(true)) {
