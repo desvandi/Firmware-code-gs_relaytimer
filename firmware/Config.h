@@ -58,13 +58,13 @@ namespace Core {
   // NOT IMPLEMENTED IN SOFTWARE (require physical hardware — P1-012, P1-013,
   // P1-017): Ed25519 known-answer test, 12-case power-loss test, Secure Boot
   // provisioning. These remain NOT EXECUTED — HARDWARE REQUIRED per brief §107.
-  // On-target Ed25519 KAT self-test (RFC 8032 §7.1 published vectors)
-  constexpr char FIRMWARE_VERSION[] = "4.3.12";
+  // REAUDIT6-FW-OTA-001 FIX: KAT test vectors corrected (were wrong transcription)
+  constexpr char FIRMWARE_VERSION[] = "4.3.13";
   // Build timestamp — reproducible builds use the git commit timestamp.
   // For reproducibility, BUILD_DATE is now a fixed string set at release time.
   // Override via -DBUILD_DATE='"..."' in platformio.ini build_flags if needed.
 #ifndef BUILD_DATE
-  constexpr char BUILD_DATE[] = "v4.3.12-release";
+  constexpr char BUILD_DATE[] = "v4.3.13-release";
 #else
   // BUILD_DATE is defined externally (e.g., via -DBUILD_DATE='"..."')
 #endif
