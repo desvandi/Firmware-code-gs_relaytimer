@@ -3,6 +3,7 @@
 // =============================================================================
 #include "Crypto.h"
 #include "RtcDriver.h"
+#include "ed25519-donna.h"  // AUD-FW-OTA-001 FIX: self-contained Ed25519 verification
 #include <esp_system.h>
 #include <mbedtls/md.h>
 #include <mbedtls/base64.h>
@@ -333,95 +334,30 @@ bool ed25519VerifyHash(const char* publicKeyHex,
     return false;
   }
 
-  // audit-fixes: PSA Crypto API for Ed25519 requires a custom-built ESP32
-  //   framework with CONFIG_MBEDTLS_ECP_DP_ED25519_ENABLED=y in sdkconfig.
-  //   The default prebuilt arduino-esp32 framework does NOT include Ed25519
-  //   curve support, so the PSA functions are declared but their symbols
-  //   are missing → linker fails.
+  // AUD-FW-OTA-001 FIX (Opsi B): Use self-contained ed25519-donna library.
+  // Previously this used PSA Crypto (psa/crypto.h) which has C++ compatibility
+  // issues in the prebuilt arduino-esp32 framework — causing compile errors
+  // when MBEDTLS_ED25519_SUPPORTED was defined.
   //
-  //   Rather than block the entire build, we guard the PSA path. When
-  //   MBEDTLS_ED25519_SUPPORTED is NOT defined (default), OTA Ed25519
-  //   verification always returns false → OTA is effectively disabled.
-  //   This matches the existing fail-closed behavior (empty
-  //   OTA_ED25519_PUBLIC_KEY_HEX also disables OTA).
+  // Now: ed25519_donna_verify() is pure C, no PSA Crypto dependency, no
+  // framework rebuild needed. Uses mbedtls/sha512.h (already in framework,
+  // C++ compatible) for SHA-512 internally.
   //
-  //   To ENABLE Ed25519 verification, define MBEDTLS_ED25519_SUPPORTED in
-  //   build_flags after rebuilding the ESP32 framework with Ed25519 support.
-  //   See firmware README "Known Limitations #3".
-  #if defined(MBEDTLS_ED25519_SUPPORTED)
-  // R10D-1: Use PSA Crypto API with CORRECT identifiers per PSA/Mbed TLS spec.
-  // AUD-FW-OTA-001: This code path is NON-FUNCTIONAL in default build because
-  // MBEDTLS_ED25519_SUPPORTED is NOT defined in platformio.ini. See comment there.
-  // PSA Crypto headers have C++ compatibility issues that prevent enabling this.
-  #include <psa/crypto.h>
+  // This enables BOTH MQTT OTA (via MqttClient OTA handler) AND REST OTA
+  // (via OtaManager::handleUpload) to verify Ed25519 signatures.
+  int result = ed25519_donna_verify(signature, publicKey, hashBytes, hashLen);
 
-  // Initialize PSA (idempotent — safe to call multiple times)
-  psa_status_t status = psa_crypto_init();
-  if (status != PSA_SUCCESS) {
-    Serial.printf("[Ed25519] psa_crypto_init failed: %d\n", (int)status);
-    memset(publicKey, 0, sizeof(publicKey));
-    memset(signature, 0, sizeof(signature));
-    return false;
-  }
-
-  // R10D-1 FIX: Correct PSA key type for Ed25519.
-  // Ed25519 = ECC on Twisted Edwards curve family, 255 bits.
-  // Previous code used PSA_KEY_TYPE_ED25519_PUBLIC_KEY which does NOT exist
-  // in the PSA standard — it would cause a compile error.
-  psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
-  psa_set_key_type(&attrs,
-    PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_TWISTED_EDWARDS));
-  psa_set_key_bits(&attrs, 255);  // Ed25519 curve size
-  psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_VERIFY_MESSAGE);
-  // R10D-1 FIX: Correct algorithm identifier is PSA_ALG_PURE_EDDSA,
-  // NOT PSA_ALG_PURE_ED25519 (which does not exist in PSA standard).
-  psa_set_key_algorithm(&attrs, PSA_ALG_PURE_EDDSA);
-
-  // Import the public key
-  psa_key_id_t key_id = 0;
-  status = psa_import_key(&attrs, publicKey, 32, &key_id);
-  if (status != PSA_SUCCESS) {
-    Serial.printf("[Ed25519] psa_import_key failed: %d\n", (int)status);
-    Serial.println("[Ed25519] If PSA_ECC_FAMILY_TWISTED_EDWARDS is not defined,");
-    Serial.println("[Ed25519]   Ed25519 is not compiled into this ESP32 mbedtls config.");
-    Serial.println("[Ed25519]   Enable via menuconfig → Component config → mbedTLS →");
-    Serial.println("[Ed25519]   Elliptic Curve DH/DSA (enable ED25519).");
-    memset(publicKey, 0, sizeof(publicKey));
-    memset(signature, 0, sizeof(signature));
-    return false;
-  }
-
-  // R10D-1 FIX: Verify using PSA_ALG_PURE_EDDSA (not PSA_ALG_PURE_ED25519).
-  // PSA_ALG_PURE_EDDSA signs the message directly — we pass the 32-byte SHA-256 hash.
-  status = psa_verify_message(key_id, PSA_ALG_PURE_EDDSA,
-                               hashBytes, hashLen,
-                               signature, 64);
-
-  // Clean up
-  psa_destroy_key(key_id);
+  // Clean up sensitive data
   memset(publicKey, 0, sizeof(publicKey));
   memset(signature, 0, sizeof(signature));
 
-  if (status != PSA_SUCCESS) {
-    Serial.printf("[Ed25519] Verification FAILED (PSA error: %d)\n", (int)status);
+  if (result == 1) {
+    Serial.println("[Ed25519] Signature verified OK (ed25519-donna, self-contained)");
+    return true;
+  } else {
+    Serial.println("[Ed25519] Verification FAILED (ed25519-donna)");
     return false;
   }
-
-  Serial.println("[Ed25519] Signature verified OK (PSA Crypto, PureEdDSA)");
-  return true;
-  #else
-  // audit-fixes: Ed25519 not compiled into this framework build.
-  //   OTA via MQTT is disabled because signature verification cannot succeed.
-  //   This matches the fail-closed contract: OTA requires Ed25519 signature
-  //   verification, and an unverifiable signature = no OTA.
-  Serial.println("[Ed25519] NOT AVAILABLE — PSA Crypto Ed25519 support not compiled in.");
-  Serial.println("[Ed25519] Define MBEDTLS_ED25519_SUPPORTED in build_flags after");
-  Serial.println("[Ed25519]   rebuilding ESP32 framework with CONFIG_MBEDTLS_ECP_DP_ED25519_ENABLED=y");
-  Serial.println("[Ed25519] OTA via MQTT will be REJECTED (fail-closed).");
-  memset(publicKey, 0, sizeof(publicKey));
-  memset(signature, 0, sizeof(signature));
-  return false;
-  #endif
 }
 
 } // namespace Utils
