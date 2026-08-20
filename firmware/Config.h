@@ -59,7 +59,14 @@ namespace Core {
   // P1-017): Ed25519 known-answer test, 12-case power-loss test, Secure Boot
   // provisioning. These remain NOT EXECUTED — HARDWARE REQUIRED per brief §107.
   constexpr char FIRMWARE_VERSION[] = "4.3.8";
-  constexpr char BUILD_DATE[] = __DATE__ " " __TIME__;
+  // Build timestamp — reproducible builds use the git commit timestamp.
+  // For reproducibility, BUILD_DATE is now a fixed string set at release time.
+  // Override via -DBUILD_DATE='"..."' in platformio.ini build_flags if needed.
+#ifndef BUILD_DATE
+  constexpr char BUILD_DATE[] = "v4.3.8-release";
+#else
+  // BUILD_DATE is defined externally (e.g., via -DBUILD_DATE='"..."')
+#endif
   constexpr uint8_t CONFIG_VERSION = 2;  // bump when schedule.json schema changes
   constexpr char DEVICE_MODEL[] = "ESP32-WROOM-32 Timer12 v4.3 (industrial-grade R2)";
 
@@ -358,10 +365,12 @@ namespace Core {
   // ---------- DEFAULT TIMEZONE ----------
   constexpr const char* DEFAULT_TIMEZONE = "Asia/Jakarta";
 
-  // ---------- JWT (mock secret — burn into NVS in production) ----------
-  // In production: store a per-device random 32-byte secret in Preferences/NVS
-  // at first boot. Here we use a compile-time constant for demonstration.
-  constexpr const char* JWT_SECRET_DEFAULT = "Timer12-v4.0-CHANGE-ME-IN-PRODUCTION";
+  // ---------- JWT (per-device random secret, stored in NVS) ----------
+  // Phase I (Blocker Closure Directive 2026-08-20): JWT_SECRET_DEFAULT has
+  // been REMOVED from the source. The previous compile-time constant
+  // "Timer12-v4.0-CHANGE-ME-IN-PRODUCTION" was a security risk. ConfigStore
+  // generates a random 32-byte secret per device at first boot and stores it
+  // in NVS. There is NO compile-time default. DO NOT re-add it.
 }
 
 #endif // TIMER12_CORE_CONFIG_H

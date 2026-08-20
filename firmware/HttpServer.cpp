@@ -4,6 +4,7 @@
 #include "HttpServer.h"
 #include "AuthHandlers.h"
 #include "StatusHandlers.h"
+#include "InsightsHandlers.h"  // Phase B (P0-01): /api/insights endpoint
 #include "RelayHandlers.h"
 #include "ScheduleHandlers.h"
 #include "ChannelHandlers.h"  // audit-fixes-v2 (P1-1): /api/channel endpoint
@@ -141,6 +142,9 @@ void HttpServer::_registerRoutes() {
   http.on("/api/status", HTTP_GET, Web::Handlers::handleStatus);
   http.on("/api/version", HTTP_GET, Web::Handlers::handleVersion);
   http.on("/api/health", HTTP_GET, Web::Handlers::handleHealth);
+
+  // Phase B (P0-01): AI insights — ESP32 proxies authenticated GET to GAS.
+  http.on("/api/insights", HTTP_GET, Web::Handlers::handleInsights);
 
   // Relay
   http.on("/api/relay", HTTP_POST, Web::Handlers::handleRelay);

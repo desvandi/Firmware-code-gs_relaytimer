@@ -1,4 +1,4 @@
-# Timer Digital Relay v4.3 — Firmware + Google Apps Script
+# Timer Digital Relay v4.3.8 — Firmware + Google Apps Script
 
 > ESP32-WROOM-32 firmware for 12-channel industrial relay control with per-channel safety limits (maxOnTime, minOnTime, anti-chatter), RTC state machine, Health Supervisor, central AlarmRegistry, formal CommandArbiter, declarative InterlockEngine, unified GPIO mutation path, explicit safety alarm acknowledgement, command semantics whitelist, NVS-persisted transaction journal, Ed25519-signed OTA, 8S LiFePO4 battery monitoring (INA219/ADS1115/SHT31), and Google Apps Script AI insights. **Local-first** — all safety logic runs on-device without Internet/MQTT/PWA/GAS.
 
@@ -13,10 +13,19 @@
 
 ## Status
 
-✅ **SOFTWARE PRODUCTION-READY** — verified by independent auditor across 4 audit rounds.
-`pio run -e production` exits 0 (zero errors, zero warnings). All P0 software blockers resolved.
+⚠️ **SELF-VERIFICATION COMPLETE** (Blocker Closure Directive 2026-08-20, Phases B-K).
+`pio run -e production` exits 0 (zero errors, zero warnings). All P0/P1 software blockers
+from the directive are implemented + tested with reproducible evidence — see
+`VERSION_MATRIX.md §9` for the per-phase evidence matrix.
 
-Hardware acceptance (12 test items) deferred — see `PRODUCTION_GRADE_SCORECARD.md` for details.
+**NOT INDEPENDENT AUDIT PASS** — per directive §53, the engineer who implemented
+the fixes cannot self-certify "Independent re-audit PASS". A separate independent
+audit must review the final state.
+
+**HARDWARE ACCEPTANCE: NOT EXECUTED — HARDWARE REQUIRED** — Phase 34 hardware
+acceptance matrix cannot be executed in a software-only environment.
+
+**SYSTEM PRODUCTION READY: NO** — pending independent audit + hardware acceptance.
 
 ---
 

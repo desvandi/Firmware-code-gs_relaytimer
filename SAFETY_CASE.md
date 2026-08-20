@@ -1,4 +1,4 @@
-# Safety Case — Timer Digital Relay v4.2
+# Safety Case — Timer Digital Relay v4.3.8
 
 > Implements safety case requirements from the Industrial-Grade
 > Implementation Directive §101, §113.
@@ -149,7 +149,7 @@ SAFE STATE / RECOVERY / TEST.
 | Field | Value |
 |---|---|
 | **Hazard** | Firmware crashes due to out-of-memory |
-| **Cause** | (a) Large JSON allocation (e.g., oversized config import) (b) Memory fragmentation from repeated String allocations (c) MQTT packet too large (v4.1.0 had 4 KB buffer, v4.1.1+ has 16 KB) |
+| **Cause** | (a) Large JSON allocation (e.g., oversized config import) (b) Memory fragmentation from repeated String allocations (c) MQTT packet too large (firmware v4.1.0 had 4 KB buffer, v4.1.1+ has 16 KB — current v4.3.8 retains 16 KB) |
 | **Risk** | LOW — watchdog catches and reboots. Recovery automatic. |
 | **Prevention** | (a) `requireBody(MAX_BODY_SIZE=16384)` rejects oversized REST bodies (b) ArduinoJson DynamicJsonDocument with fixed size (c) Health Supervisor raises LOW_HEAP alarm at <20 KB free |
 | **Detection** | (a) Health Supervisor tracks `freeHeap`, `minFreeHeap`, `largestFreeBlock` (b) LOW_HEAP alarm at <20 KB (c) Boot reason captures crash type (watchdog) |
@@ -176,7 +176,7 @@ SAFE STATE / RECOVERY / TEST.
 
 ## Summary: Hazard Severity Matrix
 
-| Hazard ID | Hazard | Risk | Mitigation status (v4.2) |
+| Hazard ID | Hazard | Risk | Mitigation status (v4.3.8) |
 |---|---|---|---|
 | HTR-001 | Heater remains ON | HIGH | ✅ maxOnTime FORCE OFF (local-first) |
 | MTR-001 | Motor chatter | MEDIUM | ✅ minSwitchInterval anti-chatter |

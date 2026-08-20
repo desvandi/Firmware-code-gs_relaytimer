@@ -1,4 +1,4 @@
-# Hardware Safety Contract — Timer Digital Relay v4.2
+# Hardware Safety Contract — Timer Digital Relay v4.3.8
 
 > Implements the hardware-software contract requirements from the
 > Industrial-Grade Implementation Directive §69, §70, §71, §102.
@@ -14,12 +14,12 @@
 | RAM | 520 KB SRAM | 320 KB available to app after WiFi/BLE stack |
 | WiFi | 802.11 b/g/n @ 2.4 GHz | CGNAT-friendly via MQTT outbound |
 | Bluetooth | BLE 4.2 (unused) | |
-| Operating voltage | 3.3 V logic | 5 V-tolerant digital inputs on GPIO pins |
+| Operating voltage | 3.3 V logic | **NOT 5 V-tolerant** — ESP32 GPIOs are 3.3 V only. Applying 5 V to any GPIO (including the so-called "input-only" pins 34/35/36/39) will damage the SoC. The earlier "5 V-tolerant digital inputs" claim in this document was INCORRECT and has been removed (Phase 19 reconciliation). All 5 V signals (PIR, PZEM RX, external triggers) MUST pass through a level shifter or resistor divider before reaching any ESP32 GPIO. |
 | Boot strapping | GPIO0, GPIO2, GPIO12, GPIO15 | Boot mode + flash voltage — DO NOT repurpose |
 
 ---
 
-## 2. GPIO Allocation (firmware v4.2 — DO NOT REPURPOSE WITHOUT AUDIT)
+## 2. GPIO Allocation (firmware v4.3.8 — DO NOT REPURPOSE WITHOUT AUDIT)
 
 ### 2.1 Relay Outputs (12 channels, active-LOW module)
 
@@ -135,7 +135,7 @@ contact surface and reduces lifespan.
 
 ESP32 has built-in brownout detector (default threshold ~2.43 V).
 When triggered, the chip resets with reason `RTCWDT_BROWN_OUT_RESET`
-(code 11). The firmware v4.2 Health Supervisor tracks this in NVS
+(code 11). The firmware v4.3.8 Health Supervisor tracks this in NVS
 (`brn_cnt`) and raises a `BROWNOUT_RESET` alarm on next boot.
 
 If brownouts are frequent:
@@ -295,7 +295,7 @@ Mutual exclusion: CH1 ON → CH2 cannot be ON (and vice versa)
 Dead time: 500 ms between OFF of one and ON of other
 ```
 
-In v4.2, this is implemented in software (SafetySupervisor) per brief §9.
+In v4.3.8, this is implemented in software (SafetySupervisor) per brief §9.
 For mission-critical applications:
 
 - **Add a hardware interlock** (mechanical, electrical, or solid-state)

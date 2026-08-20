@@ -1,4 +1,4 @@
-# Protocol Specification — Timer Digital Relay v4.2
+# Protocol Specification — Timer Digital Relay v4.3.8
 
 > Implements the protocol requirements from the Industrial-Grade
 > Implementation Directive §24-29, §35-36, §67.
@@ -50,6 +50,7 @@ or:
 | GET | /api/status | JWT | Full SystemStatus telemetry (brief §31) |
 | GET | /api/version | JWT | Firmware version + OTA info |
 | GET | /api/health | JWT | Hardware diagnostics |
+| GET | /api/insights | JWT | AI insights (Phase B — ESP32 proxies authenticated GET to GAS; PWA never sees GAS credentials) |
 | POST | /api/relay | JWT + CSRF | Relay ON/OFF/set_mode (with requestId) |
 | POST | /api/channel | JWT + CSRF | Rename channel (with requestId) |
 | POST | /api/schedule | JWT + CSRF | Upsert schedule (with requestId) |

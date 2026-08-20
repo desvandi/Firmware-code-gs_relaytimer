@@ -1,4 +1,4 @@
-# Deployment Guide — Timer Digital Relay v4.2
+# Deployment Guide — Timer Digital Relay v4.3.8
 
 > Implements deployment requirements from the Industrial-Grade Implementation
 > Directive §50, §80-84, §103.
@@ -42,7 +42,7 @@ Do you need AI insights?
 - [ ] Set `ALLOWED_CORS_ORIGINS` to your PWA's Vercel URL (NOT `*`)
 - [ ] Set `GAS_INSIGHTS_URL` to your deployed GAS Web App URL (or leave empty to disable AI)
 - [ ] Build: `pio run -e production` (uses `-DPRODUCTION_BUILD` flag — fail-closed)
-- [ ] Sign the binary: `python3 scripts/sign_firmware.py firmware.bin 4.2.0`
+- [ ] Sign the binary: `python3 scripts/sign_firmware.py firmware.bin 4.3.8`
 - [ ] Upload signed binary + `.sha256` + `.sig` + `.ota.json` to GitHub Releases
 
 ### 2.2 MQTT Broker (Mosquitto)

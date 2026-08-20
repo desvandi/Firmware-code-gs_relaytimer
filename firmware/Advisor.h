@@ -1,9 +1,10 @@
 // =============================================================================
 // AI/Advisor.h — GAS integration (ESP32 → Google Apps Script → Gemini)
 // -----------------------------------------------------------------------------
-// ESP32 POSTs logs + status summary to GAS Web App every hour.
-// GAS calls Gemini API, caches insights for 1 hour.
-// PWA GETs insights from same GAS URL every 5 minutes.
+// Phase B: Added fetchInsights() — authenticated GET to GAS for /api/insights.
+// Canonical HMAC contract (must match code.gs/Code.gs):
+//   POST: "POST\n" + timestamp + "\n" + nonce + "\n" + deviceId + "\n" + body
+//   GET:  "GET\n"  + timestamp + "\n" + nonce + "\n" + deviceId + "\n" + ""
 // =============================================================================
 #pragma once
 #ifndef TIMER12_AI_ADVISOR_H
@@ -15,19 +16,14 @@ namespace AI {
 
 class Advisor {
 public:
-  // Initialize with GAS endpoint URL from Config.h
   void begin(const String& gasUrl = "");
-
-  // Called from main loop() — posts logs to GAS every hour (non-blocking)
   void tick();
 
-  // Check if GAS is configured (URL not empty)
+  // Phase B: Fetch insights from GAS via authenticated GET.
+  String fetchInsights();
+
   bool isConfigured() const { return _gasUrl.length() > 0; }
-
-  // Get last sync timestamp (0 = never synced)
   unsigned long getLastSyncMs() const { return _lastSyncMs; }
-
-  // Get last sync result (true = success)
   bool getLastSyncSuccess() const { return _lastSyncSuccess; }
 
 private:
@@ -37,6 +33,7 @@ private:
 
   bool _postToGAS();
   String _buildPayload();
+  String _buildAuthenticatedUrl(const String& method, const String& body);
 };
 
 extern Advisor advisor;

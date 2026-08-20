@@ -1,44 +1,57 @@
 /**
- * Timer Digital Relay v4.0 — Google Apps Script (AI Insights via Gemini)
+ * Timer Digital Relay v4.3.8 — Google Apps Script (AI Insights via Gemini)
  *
- * Round 10A fixes (audit round 10):
- *   R10A-1: HMAC metadata moved from HTTP headers → URL query parameters.
- *           GAS Web App event object does NOT expose HTTP request headers;
- *           previous http.addHeader() approach was silently broken.
- *           Auth metadata now sent as: ?deviceId=...&timestamp=...&nonce=...&signature=...
- *   R10A-2: Nonce check wrapped in LockService.getScriptLock() for atomicity.
- *           Previous check-then-claim had race condition (two concurrent
- *           requests could both pass the check).
+ * Independent Production Hardening (2026-08-20):
+ *   PH2-1: doGet() now requires the SAME HMAC auth as doPost(). Anonymous
+ *          device ID alone no longer grants access. The browser MUST NOT
+ *          call this endpoint directly; the ESP32 fetches insights via its
+ *          own authenticated REST /api/insights and re-serves them to the
+ *          PWA through authenticated REST. The PWA-side NEXT_PUBLIC_GAS_
+ *          INSIGHTS_URL env var is now DEPRECATED for direct browser use.
+ *   PH2-2: action=health no longer exposes geminiConfigured / geminiModel /
+ *          cacheTtlMs. Only a minimal liveness signal { status: 'ok' } is
+ *          returned publicly. Operational metadata requires HMAC auth.
+ *   PH2-3: Rate limiter is now atomic — nonce check, nonce claim, AND rate-
+ *          limit read-check-increment all happen INSIDE the same
+ *          LockService.getScriptLock() critical section.
+ *   PH3-1: GEMINI_MODEL centralized in getGeminiModel_() with override via
+ *          Script Property 'GEMINI_MODEL'. Default = 'gemini-2.5-flash'.
+ *   PH3-3: AI failure isolation: every Gemini failure path returns mock
+ *          insights with source='mock'.
+ *   PH4-1: All Number(x) || 0 / || 50 fallbacks removed from buildPrompt.
+ *   PH6-1: action.type='apply_suggestion' is a NON-ACTUATING advisory label.
  *
- * Privacy: ESP32 sends anonymous device ID (first 16 chars of SHA-256(MAC)).
- *   Gemini never sees the real MAC. The anonymous ID is used as a cache key
- *   and to look up the per-device HMAC secret from Script Properties.
- *
- * Deploy as a Google Apps Script Web App:
- * 1. Open https://script.google.com → New Project
- * 2. Paste this code
- * 3. Set GEMINI_API_KEY in Project Settings → Script Properties
- * 4. For each ESP32 device, add a Script Property:
- *    Key:   DEVICE_<anonymousId>_SECRET
- *    Value: <64 hex chars from Serial Monitor>
- *    (anonymousId = first 16 chars of SHA-256(MAC), printed on boot)
- * 5. Deploy → New Deployment → Type: Web App
- *    - Execute as: Me
- *    - Who has access: Anyone (anonymous — HMAC provides auth)
- * 6. Copy deployment URL → set as GAS_INSIGHTS_URL in firmware Config.h
- *    and NEXT_PUBLIC_GAS_INSIGHTS_URL in Vercel env vars.
- *
- * ESP32 sends:
- *   POST <GAS_URL>?deviceId=<16hex>&timestamp=<unixSec>&nonce=<16hex>&signature=<64hex>
- *   Body: { mac, status: {...}, logs: [...] }
- *   Canonical = timestamp + "\n" + nonce + "\n" + deviceId + "\n" + body
- *   signature = HMAC-SHA256(secret, canonical)
+ * Canonical HMAC contract (must match firmware Advisor.cpp):
+ *   POST: "POST\n" + timestamp + "\n" + nonce + "\n" + deviceId + "\n" + body
+ *   GET:  "GET\n"  + timestamp + "\n" + nonce + "\n" + deviceId + "\n" + ""
  */
 
 // === CONFIG ===
 const GEMINI_API_KEY = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
-const GEMINI_MODEL = 'gemini-1.5-flash';
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+const GEMINI_MODEL_DEFAULT = 'gemini-2.5-flash';
+const SUPPORTED_MODELS_ = [
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-lite',
+  'gemini-1.5-flash',
+  'gemini-1.5-flash-8b',
+];
+
+function getGeminiModel_() {
+  const configured = PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL');
+  const model = (configured && String(configured).trim()) || GEMINI_MODEL_DEFAULT;
+  if (SUPPORTED_MODELS_.indexOf(model) < 0) {
+    Logger.log('WARNING: GEMINI_MODEL="' + model + '" not on allowlist. Falling back to ' + GEMINI_MODEL_DEFAULT);
+    return GEMINI_MODEL_DEFAULT;
+  }
+  return model;
+}
+
+function getGeminiUrl_() {
+  return `https://generativelanguage.googleapis.com/v1beta/models/${getGeminiModel_()}:generateContent?key=${GEMINI_API_KEY}`;
+}
 
 // Cache config
 const CACHE_KEY_PREFIX = 'insights_';
@@ -48,13 +61,13 @@ const CACHE_TTL_MS = 60 * 60 * 1000;        // 1 hour (insights)
 const DATA_TTL_MS = 6 * 60 * 60 * 1000;     // 6 hours (raw logs)
 const NONCE_TTL_SEC = 600;                   // 10 min (nonce replay window)
 
-// audit-fixes (P1-25): per-device rate limiting.
-// Each device can submit at most MAX_POSTS_PER_HOUR posts per hour.
-// Without this, an attacker who steals a device's HMAC secret could spam
-// Gemini requests (cost + quota abuse). CacheService keys are per-device.
+// PH2-3: Per-device rate limiting — ALGORITHM DOCUMENTATION
+// Algorithm: SLIDING WINDOW with TTL reset on each successful increment.
+// ATOMICITY: nonce check + nonce claim + rate-limit read + rate-limit
+//   increment ALL happen inside LockService.getScriptLock().
 const RATE_KEY_PREFIX = 'rate_';
 const MAX_POSTS_PER_HOUR = 10;                // 10 posts/hour (firmware posts 1/hour)
-const RATE_WINDOW_SEC = 3600;                 // 1 hour
+const RATE_WINDOW_SEC = 3600;                 // 1 hour sliding window
 
 // Validation limits (P1 #15)
 const MAX_BODY_SIZE = 16384;                  // 16 KB
@@ -100,32 +113,98 @@ function normalizeDeviceId(id) {
 }
 
 /**
- * GET endpoint — PWA fetches insights for a specific device.
- * PWA does NOT have the HMAC secret (only ESP32 does), so GET uses
- * a simpler auth model: the anonymous device ID itself is the "key".
+ * GET endpoint — PH2-1: now requires the SAME HMAC auth as doPost().
+ * Anonymous device ID alone no longer grants access.
+ * Public liveness probe: action=health with NO auth returns ONLY { status: 'ok' }.
  */
 function doGet(e) {
-  const mac = normalizeDeviceId(e.parameter.mac);
-  if (!isValidDeviceId(mac)) {
-    return jsonOut({ success: false, error: 'Invalid device ID (must be 16 hex chars)' });
-  }
+  const params = e.parameter || {};
+  const action = params.action || 'insights';
 
-  const action = e.parameter.action || 'insights';
-
-  if (action === 'insights') {
-    return getInsights(mac);
-  } else if (action === 'health') {
+  // PH2-2: Public liveness probe — minimal information only.
+  if (action === 'health' && !params.signature) {
     return jsonOut({
       success: true,
       status: 'ok',
-      geminiConfigured: !!GEMINI_API_KEY,
-      geminiModel: GEMINI_MODEL,
-      cacheTtlMs: CACHE_TTL_MS,
-      serverTime: new Date().toISOString(),
     });
   }
 
-  return jsonOut({ success: false, error: 'Unknown action: ' + action });
+  // PH2-1: All other GET actions require HMAC auth (same as doPost).
+  const lock = LockService.getScriptLock();
+  try {
+    if (!lock.tryLock(30000)) {
+      return jsonOut({ success: false, error: 'Server busy — could not acquire lock' });
+    }
+
+    const deviceId = normalizeDeviceId(params.deviceId);
+    const timestampStr = params.timestamp || '';
+    const nonce = params.nonce || '';
+    const signature = (params.signature || '').toUpperCase();
+
+    if (!isValidDeviceId(deviceId)) {
+      return jsonOut({ success: false, error: 'Authentication required', code: 401 });
+    }
+    if (!timestampStr || !nonce || !signature) {
+      return jsonOut({ success: false, error: 'Authentication required', code: 401 });
+    }
+
+    const secretKey = 'DEVICE_' + deviceId + '_SECRET';
+    const secretHex = PropertiesService.getScriptProperties().getProperty(secretKey);
+    if (!secretHex || secretHex.length !== 64) {
+      return jsonOut({ success: false, error: 'Authentication required', code: 401 });
+    }
+
+    const timestamp = parseInt(timestampStr, 10);
+    if (isNaN(timestamp)) {
+      return jsonOut({ success: false, error: 'Invalid timestamp parameter' });
+    }
+    const serverTime = Math.floor(Date.now() / 1000);
+    if (Math.abs(serverTime - timestamp) > TIMESTAMP_TOLERANCE_SEC) {
+      return jsonOut({ success: false, error: 'Timestamp out of tolerance (±5 min)' });
+    }
+
+    const nonceCacheKey = NONCE_KEY_PREFIX + deviceId + '_' + nonce;
+    const existingNonce = CacheService.getScriptCache().get(nonceCacheKey);
+    if (existingNonce) {
+      return jsonOut({ success: false, error: 'Nonce already used (replay detected)' });
+    }
+
+    const canonical = 'GET\n' + timestampStr + '\n' + nonce + '\n' + deviceId + '\n';
+    const secretBytes = Utilities.computeHmacSha256Signature(
+      canonical,
+      Utilities.newBlob(hexToBytes_(secretHex)).getBytes()
+    );
+    const computedSigHex = bytesToHex_(secretBytes).toUpperCase();
+
+    if (!constantTimeEquals_(signature, computedSigHex)) {
+      return jsonOut({ success: false, error: 'Invalid signature' });
+    }
+
+    CacheService.getScriptCache().put(nonceCacheKey, '1', NONCE_TTL_SEC);
+    lock.releaseLock();
+
+    if (action === 'insights') {
+      return getInsights(deviceId);
+    } else if (action === 'health') {
+      return jsonOut({
+        success: true,
+        status: 'ok',
+        geminiConfigured: !!GEMINI_API_KEY,
+        geminiModel: getGeminiModel_(),
+        cacheTtlMs: CACHE_TTL_MS,
+        serverTime: new Date().toISOString(),
+      });
+    }
+
+    return jsonOut({ success: false, error: 'Unknown action: ' + action });
+  } catch (err) {
+    Logger.log('doGet error: ' + err);
+    return jsonOut({ success: false, error: String(err) });
+  } finally {
+    if (lock.hasLock()) {
+      lock.releaseLock();
+    }
+  }
 }
 
 /**
@@ -200,8 +279,8 @@ function doPost(e) {
     }
 
     // Compute expected HMAC
-    // Canonical = timestamp + "\n" + nonce + "\n" + deviceId + "\n" + rawBody
-    const canonical = timestampStr + '\n' + nonce + '\n' + deviceId + '\n' + rawBody;
+    // PH2-1: Canonical includes method='POST' to prevent GET signature replay.
+    const canonical = 'POST\n' + timestampStr + '\n' + nonce + '\n' + deviceId + '\n' + rawBody;
     const secretBytes = Utilities.computeHmacSha256Signature(
       canonical,
       Utilities.newBlob(hexToBytes_(secretHex)).getBytes()
@@ -214,10 +293,23 @@ function doPost(e) {
       return jsonOut({ success: false, error: 'Invalid signature' });
     }
 
+    // PH2-3: Rate limit check + increment INSIDE the lock (was after lock release → TOCTOU race).
+    const rateKey = RATE_KEY_PREFIX + deviceId;
+    const currentRate = parseInt(CacheService.getScriptCache().get(rateKey) || '0', 10);
+    if (currentRate >= MAX_POSTS_PER_HOUR) {
+      Logger.log('Rate limit exceeded for device ' + deviceId + ': ' + currentRate + '/' + MAX_POSTS_PER_HOUR);
+      lock.releaseLock();
+      return jsonOut({
+        success: false,
+        error: 'Rate limit exceeded (max ' + MAX_POSTS_PER_HOUR + ' posts/hour per device)'
+      });
+    }
+    CacheService.getScriptCache().put(rateKey, String(currentRate + 1), RATE_WINDOW_SEC);
+
     // Mark nonce as used (still inside lock — atomic)
     CacheService.getScriptCache().put(nonceCacheKey, '1', NONCE_TTL_SEC);
 
-    // Release lock — rest of processing (JSON parse, Gemini call) doesn't need lock
+    // Release lock — rest of processing doesn't need lock
     lock.releaseLock();
 
     // Parse body
@@ -240,25 +332,6 @@ function doPost(e) {
     if (typeof status !== 'object' || status === null) {
       return jsonOut({ success: false, error: 'Invalid status (must be object)' });
     }
-
-    // audit-fixes (P1-25): per-device rate limiting.
-    //   Even with valid HMAC, an attacker who steals a device's secret could
-    //   spam POST requests to exhaust Gemini quota / run up cost. Firmware
-    //   legitimately posts once per hour; we allow up to MAX_POSTS_PER_HOUR
-    //   (default 10) per device per hour as a safety margin for retries.
-    //   Excess requests are rejected with 429 (still inside the lock so the
-    //   nonce is consumed — prevents replay of the same request).
-    const rateKey = RATE_KEY_PREFIX + mac;
-    const currentRate = parseInt(CacheService.getScriptCache().get(rateKey) || '0', 10);
-    if (currentRate >= MAX_POSTS_PER_HOUR) {
-      Logger.log('Rate limit exceeded for device ' + mac + ': ' + currentRate + '/' + MAX_POSTS_PER_HOUR + ' posts/hour');
-      return jsonOut({
-        success: false,
-        error: 'Rate limit exceeded (max ' + MAX_POSTS_PER_HOUR + ' posts/hour per device)'
-      });
-    }
-    // Increment counter (TTL = RATE_WINDOW_SEC so window resets after 1 hour)
-    CacheService.getScriptCache().put(rateKey, String(currentRate + 1), RATE_WINDOW_SEC);
 
     // Validate channel names + log messages (truncate if too long)
     if (status.channels) {
@@ -351,11 +424,15 @@ function getInsights(mac) {
 /**
  * Call Gemini API with prompt built from logs + status
  */
+// PH3-3: AI failure isolation. generateInsights() NEVER throws to the caller.
 function generateInsights(mac, logs, status) {
   if (!GEMINI_API_KEY) {
-    Logger.log('GEMINI_API_KEY not set — returning mock insights');
+    Logger.log('GEMINI_API_KEY not set — returning mock insights (AI unavailable, relay control unaffected)');
     return getMockInsights(mac);
   }
+
+  const model = getGeminiModel_();
+  const geminiUrl = getGeminiUrl_();
 
   const prompt = buildPrompt(mac, logs, status);
 
@@ -375,8 +452,30 @@ function generateInsights(mac, logs, status) {
       muteHttpExceptions: true,
     };
 
-    const response = UrlFetchApp.fetch(GEMINI_URL, options);
-    const result = JSON.parse(response.getContentText());
+    const response = UrlFetchApp.fetch(geminiUrl, options);
+    const responseCode = response.getResponseCode();
+    const responseText = response.getContentText();
+
+    if (responseCode === 404 || responseCode === 400) {
+      const errSnippet = responseText.slice(0, 500);
+      if (errSnippet.indexOf('not found') >= 0 ||
+          errSnippet.indexOf('not_supported') >= 0 ||
+          errSnippet.indexOf('deprecated') >= 0 ||
+          errSnippet.indexOf('model') >= 0) {
+        Logger.log('Gemini model error (model="' + model + '"): ' + errSnippet +
+                  ' — update Script Property GEMINI_MODEL. Returning mock insights. ' +
+                  'Relay control is unaffected (AI is advisory only).');
+        return getMockInsights(mac);
+      }
+    }
+
+    if (responseCode !== 200) {
+      Logger.log('Gemini HTTP ' + responseCode + ': ' + responseText.slice(0, 500) +
+                ' — returning mock insights. Relay control unaffected.');
+      return getMockInsights(mac);
+    }
+
+    const result = JSON.parse(responseText);
 
     if (result.candidates && result.candidates[0]) {
       const text = result.candidates[0].content.parts[0].text;
@@ -386,7 +485,7 @@ function generateInsights(mac, logs, status) {
       return getMockInsights(mac);
     }
   } catch (err) {
-    Logger.log('Gemini API error: ' + err);
+    Logger.log('Gemini API error: ' + err + ' — returning mock insights. Relay control unaffected.');
     return getMockInsights(mac);
   }
 }
@@ -411,30 +510,36 @@ function buildPrompt(mac, logs, status) {
   // audit-fixes: sanitize each channel name before embedding in prompt.
   //   Channel names come from device config (user-settable). Truncate + strip
   //   control chars + angle brackets to prevent prompt-escape attempts.
+  // PH4-1: ch.energyWh / ch.wattage no longer fall back to 0 / 10. Use 'N/A'.
   const channelSummary = channels.map(ch => {
     const safeName = sanitizeForPrompt(ch.name || 'CH' + ch.id);
+    const energy = (ch.energyWh == null) ? 'N/A' : formatNum_(ch.energyWh);
+    const wattage = (ch.wattage == null) ? 'N/A' : formatNum_(ch.wattage);
     return `CH${ch.id} "${safeName}": ${ch.state ? 'ON' : 'OFF'} via ${ch.source}, mode=${ch.modeAuto ? 'auto' : 'manual'}, ` +
-      `energy=${ch.energyWh || 0}Wh, wattage=${ch.wattage || 10}W`;
+      `energy=${energy} Wh, wattage=${wattage} W`;
   }).join('\n');
 
   // Include PZEM power meter data if available
   let pzemSummary = '';
   if (status.voltage !== undefined) {
-    const energyTodayKwh = status.energyToday || 0;
-    const costTodayRp = Math.round(energyTodayKwh * ELECTRICITY_RATE_RUPIAH_PER_KWH);
-
+    // PH4-1: All Number(x) || 0 / || 50 fallbacks removed. Invalid PZEM
+    //   telemetry arrives at Gemini as 'N/A' via formatNum_().
+    const energyTodayKwh = (status.energyToday == null) ? null : Number(status.energyToday);
+    const costTodayRp = (energyTodayKwh == null || !isFinite(energyTodayKwh))
+      ? null
+      : Math.round(energyTodayKwh * ELECTRICITY_RATE_RUPIAH_PER_KWH);
     pzemSummary = `POWER METER (PZEM-004T v3.0):
-  Voltage: ${Number(status.voltage) || 0}V
-  Current: ${Number(status.current) || 0}A
-  Active Power: ${Number(status.power) || 0}W
-  Apparent Power: ${Number(status.apparentPower) || 0}VA
-  Reactive Power: ${Number(status.reactivePower) || 0}VAR
-  Energy Total: ${Number(status.energy) || 0}kWh
-  Energy Today: ${Number(energyTodayKwh) || 0}kWh (est. Rp ${Number(costTodayRp) || 0})
-  Frequency: ${Number(status.frequency) || 50}Hz
-  Power Factor: ${Number(status.powerFactor) || 0}
-  Max Power Today: ${Number(status.powerMax) || 0}W
-  Avg Power Today: ${Number(status.powerAvg) || 0}W`;
+  Voltage: ${formatNum_(status.voltage)} V
+  Current: ${formatNum_(status.current)} A
+  Active Power: ${formatNum_(status.power)} W
+  Apparent Power: ${formatNum_(status.apparentPower)} VA
+  Reactive Power: ${formatNum_(status.reactivePower)} VAR
+  Energy Total: ${formatNum_(status.energy)} kWh
+  Energy Today: ${formatNum_(energyTodayKwh)} kWh (est. Rp ${formatNum_(costTodayRp)})
+  Frequency: ${formatNum_(status.frequency)} Hz
+  Power Factor: ${formatNum_(status.powerFactor)}
+  Max Power Today: ${formatNum_(status.powerMax)} W
+  Avg Power Today: ${formatNum_(status.powerAvg)} W`;
   }
 
   // v4.1 (brief §42): DC Energy & Battery Monitoring summary.
@@ -528,7 +633,7 @@ Respond ONLY with the JSON array. No markdown fences. No prose. No explanations 
 === END OF INSTRUCTIONS ===
 
 <UNTRUSTED_DATA>
-DEVICE: anonymous ID ${mac}, Firmware ${sanitizeForPrompt(status.firmwareVersion || '4.1.0')}, Uptime ${Number(status.uptimeSeconds) || 0}s
+DEVICE: anonymous ID ${mac}, Firmware ${sanitizeForPrompt(status.firmwareVersion || 'unknown')}, Uptime ${formatNum_(status.uptimeSeconds)} s
 ${pzemSummary}
 ${batterySummary}
 ${powerFlowSummary}
@@ -657,6 +762,7 @@ function validateInsight(ins, mac, idx) {
     action = { label: label, type: type };
   }
 
+  // PH6-1: action.type='apply_suggestion' is a NON-ACTUATING advisory label.
   return {
     id: `gemini-${mac}-${Date.now()}-${idx}`,
     generatedAt: Date.now(),
@@ -667,6 +773,7 @@ function validateInsight(ins, mac, idx) {
     body: body,
     channelId: channelId,
     action: action,
+    advisoryOnly: true,
   };
 }
 

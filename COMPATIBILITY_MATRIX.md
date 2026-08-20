@@ -1,4 +1,4 @@
-# Compatibility Matrix — Timer Digital Relay v4.2
+# Compatibility Matrix — Timer Digital Relay v4.3.8
 
 > Implements compatibility requirements from the Industrial-Grade
 > Implementation Directive §66, §67.
@@ -17,13 +17,13 @@
 
 ---
 
-## 2. Current Versions (v4.2.0 release)
+## 2. Current Versions (v4.3.8 release)
 
 | Component | Version |
 |---|---|
-| Firmware | 4.2.0 |
-| PWA | 4.2.0 |
-| Protocol | 4 (implicit — adds health/alarms/telemetrySequence fields) |
+| Firmware | 4.3.8 |
+| PWA | 4.3.8 (aligned with firmware — see VERSION_MATRIX.md) |
+| Protocol | 5 (adds command arbitration, interlock, device shadow, store-and-forward telemetry spool, RBAC placeholders) |
 | Config schema | 2 (unchanged from v4.0 — schedule.json format stable) |
 | Transaction journal schema | 1 (unchanged from PD-001) |
 
@@ -33,6 +33,8 @@
 
 | PWA Version | Firmware Version | Protocol Version | Status | Notes |
 |---|---|---|---|---|
+| **4.3.8** | **4.3.8** | 5 | ✅ Full | All features: commandArbitration + interlock + deviceShadow + battery + powerFlow + environment + health + alarms + telemetrySequence + telemetrySpool (RAM) |
+| 4.3.x | 4.2.x | 4 | ✅ Backward-compatible | PWA renders gracefully; arbitration/interlock/shadow fields omitted → PWA shows "legacy mode" |
 | **4.2.x** | **4.2.x** | 4 | ✅ Full | All features: battery + powerFlow + environment + health + alarms + telemetrySequence |
 | 4.2.x | 4.1.x | 3 | ✅ Backward-compatible | Battery + powerFlow + environment. Health/alarms fields omitted → PWA shows "N/A". |
 | 4.2.x | 4.0.x | 2 | ✅ Backward-compatible | Relay + PZEM only. Battery/health/alarms fields omitted → PWA shows "N/A". |
@@ -43,7 +45,7 @@
 | 4.0.x | 4.0.x | 2 | ✅ Compatible | v4.0 release set |
 
 **Key principle**: PWA must always render gracefully when firmware omits
-new fields. All v4.2 fields are `?: optional` in TypeScript — never required.
+new fields. All v4.x fields are `?: optional` in TypeScript — never required.
 
 ---
 
@@ -70,12 +72,15 @@ new fields. All v4.2 fields are `?: optional` in TypeScript — never required.
 - Added: sensor data quality states (SensorStatus VALID/STALE/ERROR/UNAVAILABLE)
 - Backward compatible: v4.1 PWA ignores new fields
 
-### Future Protocol v5 (firmware v4.3+ — not yet released)
-- Command arbitration engine (priority numeric: SAFETY 1000, EMERGENCY 900, MANUAL 800, etc.)
-- Interlock groups (configuration-driven mutual exclusion)
-- Device shadow (desired vs reported state)
-- Store-and-forward telemetry backlog
-- Multi-user RBAC (OWNER/ADMIN/OPERATOR/VIEWER)
+### Future Protocol v5 (firmware v4.3+ — RELEASED in v4.3.8)
+- Command arbitration engine (priority numeric: SAFETY 1000, EMERGENCY 900, MANUAL 800, etc.) — IMPLEMENTED in CommandArbiter.{h,cpp}
+- Interlock groups (configuration-driven mutual exclusion) — IMPLEMENTED in InterlockEngine.{h,cpp}
+- Device shadow (desired vs reported state) — IMPLEMENTED (ChannelState in Types.h)
+- Store-and-forward telemetry backlog — IMPLEMENTED in TelemetrySpool.{h,cpp} (RAM-only — see D-006 / Phase 8 for NVS persistence roadmap)
+- Multi-user RBAC (OWNER/ADMIN/OPERATOR/VIEWER) — NOT YET IMPLEMENTED (roadmap)
+- Phase 2.1 (2026-08-20): AI insights now flow PWA → ESP32 /api/insights → GAS (HMAC-authenticated on GET). Direct browser→GAS access closed.
+- Phase 3 (2026-08-20): Gemini model centralized, default gemini-2.5-flash, overridable via Script Property GEMINI_MODEL with allowlist validation.
+- Phase 4 (2026-08-20): Invalid sensor telemetry no longer fabricated as 0/50Hz/10W in AI prompts — arrives as 'N/A'.
 
 ---
 

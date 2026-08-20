@@ -84,6 +84,18 @@ bool MqttClient::begin() {
     return false;
   }
 
+  // Phase 10: PRODUCTION_BUILD must NEVER fall back to a public unauthenticated broker.
+  if (strcmp(Core::MQTT_BROKER_HOST, "broker.hivemq.com") == 0 ||
+      strcmp(Core::MQTT_BROKER_HOST, "broker.emqx.io") == 0 ||
+      strcmp(Core::MQTT_BROKER_HOST, "test.mosquitto.org") == 0 ||
+      strcmp(Core::MQTT_BROKER_HOST, "public.mqtthq.com") == 0) {
+    Serial.printf("[MQTT] FATAL: PRODUCTION_BUILD refuses to connect to public broker '%s'\n",
+                  Core::MQTT_BROKER_HOST);
+    Serial.println("[MQTT] Public brokers are for development/demo only.");
+    _initialized = false;
+    return false;
+  }
+
   // CORS must not be wildcard
   if (strcmp(Core::ALLOWED_CORS_ORIGINS, "*") == 0) {
     Serial.println("[MQTT] FATAL: PRODUCTION_BUILD requires ALLOWED_CORS_ORIGINS (not '*')");

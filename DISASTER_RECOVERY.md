@@ -1,4 +1,4 @@
-# Disaster Recovery — Timer Digital Relay v4.2
+# Disaster Recovery — Timer Digital Relay v4.3.8
 
 > Implements disaster recovery requirements from the Industrial-Grade
 > Implementation Directive §68.

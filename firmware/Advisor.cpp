@@ -153,19 +153,9 @@ String Advisor::_buildPayload() {
 bool Advisor::_postToGAS() {
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(8000);  // 8s max (watchdog is 10s, leave 2s margin)
-  http.setConnectTimeout(5000);  // 5s connection timeout
+  http.setTimeout(8000);
+  http.setConnectTimeout(5000);
 
-  // P0 #7 / R10A-1 (audit round 10): Auth metadata sent as URL query
-  // parameters (NOT HTTP headers). GAS Web App event object does NOT expose
-  // HTTP request headers — previous http.addHeader("X-Timestamp") approach
-  // was silently broken (GAS received empty strings for all headers).
-  //
-  // URL format:
-  //   <GAS_URL>?deviceId=<16hex>&timestamp=<unixSec>&nonce=<16hex>&signature=<64hex>
-  // Body: JSON payload (signed as part of canonical request)
-  // Canonical = timestamp + "\n" + nonce + "\n" + deviceId + "\n" + body
-  // signature = HMAC-SHA256(deviceSecret, canonical)
   String gasSecretHex = TimerNet::wifi.getGasSecretHex();
   if (gasSecretHex.length() != Core::GAS_SECRET_LEN * 2) {
     Serial.println("[AI] ERROR: GAS secret not configured — skipping POST");
@@ -175,38 +165,11 @@ bool Advisor::_postToGAS() {
   String payload = _buildPayload();
   Serial.printf("[AI] POST payload size: %d bytes\n", payload.length());
 
-  // Build auth metadata
-  uint8_t secret[Core::GAS_SECRET_LEN];
-  Utils::hexToBytes(gasSecretHex.c_str(), secret, Core::GAS_SECRET_LEN);
-
-  uint32_t timestamp = (uint32_t)Drivers::rtc.getUnixTime();
-  String nonce = Utils::generateToken(16);  // 16 hex chars random nonce
-  String anonId = Utils::sha256Hex(TimerNet::wifi.getMacAddress()).substring(0, 16);
-
-  // Canonical = timestamp + "\n" + nonce + "\n" + deviceId + "\n" + body
-  String canonical = String(timestamp) + "\n" + nonce + "\n" + anonId + "\n" + payload;
-
-  // Compute HMAC-SHA256
-  uint8_t hmac[32];
-  Utils::hmacSha256(secret, Core::GAS_SECRET_LEN,
-                    (const uint8_t*)canonical.c_str(), canonical.length(),
-                    hmac);
-  char hmacHex[65];
-  Utils::bytesToHex(hmac, 32, hmacHex);
-  memset(secret, 0, sizeof(secret));
-  memset(hmac, 0, sizeof(hmac));
-
-  // Build URL with query parameters
-  String urlWithAuth = _gasUrl;
-  // Append or start query string
-  urlWithAuth += (urlWithAuth.indexOf('?') >= 0 ? "&" : "?");
-  urlWithAuth += "deviceId=" + anonId;
-  urlWithAuth += "&timestamp=" + String(timestamp);
-  urlWithAuth += "&nonce=" + nonce;
-  urlWithAuth += "&signature=" + String(hmacHex);
-
-  Serial.printf("[AI] HMAC signed: ts=%u nonce=%s sig=%.16s...\n",
-                timestamp, nonce.c_str(), hmacHex);
+  String urlWithAuth = _buildAuthenticatedUrl("POST", payload);
+  if (urlWithAuth.length() == 0) {
+    Serial.println("[AI] Failed to build authenticated URL — skipping POST");
+    return false;
+  }
 
   if (!http.begin(urlWithAuth)) {
     Serial.println("[AI] HTTP begin failed");
@@ -215,12 +178,8 @@ bool Advisor::_postToGAS() {
 
   http.addHeader("Content-Type", "application/json");
 
-  // Reset watchdog before blocking HTTP call
   esp_task_wdt_reset();
-
   int httpCode = http.POST(payload);
-
-  // Reset watchdog after HTTP call returns
   esp_task_wdt_reset();
 
   if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
@@ -233,6 +192,108 @@ bool Advisor::_postToGAS() {
   Serial.printf("[AI] GAS HTTP error: %d\n", httpCode);
   http.end();
   return false;
+}
+
+// Phase B: Fetch insights from GAS via authenticated GET.
+String Advisor::fetchInsights() {
+  if (!isConfigured()) {
+    Serial.println("[Insights] GAS not configured — returning mock");
+    return "{\"success\":true,\"insights\":[{\"id\":\"mock-not-configured\","
+           "\"category\":\"habit_analysis\",\"severity\":\"info\","
+           "\"title\":\"AI Insights not configured\",\"body\":\"Deploy Code.gs "
+           "and set GAS_INSIGHTS_URL in firmware Config.h.\",\"channelId\":null,"
+           "\"action\":{\"label\":\"Dismiss\",\"type\":\"dismiss\"},"
+           "\"generatedAt\":0,\"source\":\"mock\",\"advisoryOnly\":true}],"
+           "\"mock\":true,\"message\":\"GAS not configured\"}";
+  }
+
+  if (!TimerNet::wifi.isConnected()) {
+    Serial.println("[Insights] WiFi not connected — returning mock");
+    return "{\"success\":true,\"insights\":[{\"id\":\"mock-offline\","
+           "\"category\":\"fault_detection\",\"severity\":\"warning\","
+           "\"title\":\"Device offline\",\"body\":\"WiFi not connected.\",\"channelId\":null,"
+           "\"action\":{\"label\":\"Dismiss\",\"type\":\"dismiss\"},"
+           "\"generatedAt\":0,\"source\":\"mock\",\"advisoryOnly\":true}],"
+           "\"mock\":true,\"message\":\"WiFi not connected\"}";
+  }
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(8000);
+  http.setConnectTimeout(5000);
+
+  String urlWithAuth = _buildAuthenticatedUrl("GET", "");
+  if (urlWithAuth.length() == 0) {
+    return "{\"success\":false,\"error\":\"auth_url_build_failed\",\"insights\":[],\"mock\":true}";
+  }
+
+  if (!http.begin(urlWithAuth)) {
+    return "{\"success\":false,\"error\":\"http_begin_failed\",\"insights\":[],\"mock\":true}";
+  }
+
+  Serial.println("[Insights] Fetching insights from GAS (GET, HMAC-authenticated)...");
+  esp_task_wdt_reset();
+  int httpCode = http.GET();
+  esp_task_wdt_reset();
+
+  if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+    String response = http.getString();
+    Serial.printf("[Insights] GAS response (%d bytes): %.200s\n",
+                  response.length(), response.c_str());
+    http.end();
+    return response;
+  }
+
+  Serial.printf("[Insights] GAS HTTP error: %d — returning mock\n", httpCode);
+  http.end();
+  String err = "{\"success\":false,\"error\":\"http_";
+  err += String(httpCode);
+  err += "\",\"insights\":[{\"id\":\"mock-http-error\",\"category\":\"fault_detection\","
+         "\"severity\":\"info\",\"title\":\"AI Insights temporarily unavailable\","
+         "\"body\":\"GAS returned HTTP error. Relay control unaffected.\","
+         "\"channelId\":null,\"action\":{\"label\":\"Dismiss\",\"type\":\"dismiss\"},"
+         "\"generatedAt\":0,\"source\":\"mock\",\"advisoryOnly\":true}],"
+         "\"mock\":true}";
+  return err;
+}
+
+// Phase B: Build GAS URL with HMAC auth query parameters.
+String Advisor::_buildAuthenticatedUrl(const String& method, const String& body) {
+  String gasSecretHex = TimerNet::wifi.getGasSecretHex();
+  if (gasSecretHex.length() != Core::GAS_SECRET_LEN * 2) {
+    Serial.println("[AI] GAS secret not configured — cannot build auth URL");
+    return "";
+  }
+
+  uint8_t secret[Core::GAS_SECRET_LEN];
+  Utils::hexToBytes(gasSecretHex.c_str(), secret, Core::GAS_SECRET_LEN);
+
+  uint32_t timestamp = (uint32_t)Drivers::rtc.getUnixTime();
+  String nonce = Utils::generateToken(16);
+  String anonId = Utils::sha256Hex(TimerNet::wifi.getMacAddress()).substring(0, 16);
+
+  String canonical = method + "\n" + String(timestamp) + "\n" + nonce + "\n" + anonId + "\n" + body;
+
+  uint8_t hmac[32];
+  Utils::hmacSha256(secret, Core::GAS_SECRET_LEN,
+                    (const uint8_t*)canonical.c_str(), canonical.length(),
+                    hmac);
+  char hmacHex[65];
+  Utils::bytesToHex(hmac, 32, hmacHex);
+  memset(secret, 0, sizeof(secret));
+  memset(hmac, 0, sizeof(hmac));
+
+  String urlWithAuth = _gasUrl;
+  urlWithAuth += (urlWithAuth.indexOf('?') >= 0 ? "&" : "?");
+  urlWithAuth += "deviceId=" + anonId;
+  urlWithAuth += "&timestamp=" + String(timestamp);
+  urlWithAuth += "&nonce=" + nonce;
+  urlWithAuth += "&signature=" + String(hmacHex);
+
+  Serial.printf("[AI] HMAC signed (%s): ts=%u nonce=%s sig=%.16s...\n",
+                method.c_str(), timestamp, nonce.c_str(), hmacHex);
+
+  return urlWithAuth;
 }
 
 } // namespace AI

@@ -1,4 +1,4 @@
-# Test Plan — Timer Digital Relay v4.2
+# Test Plan — Timer Digital Relay v4.3.8
 
 > Implements testing requirements from the Industrial-Grade Implementation
 > Directive §85-91, §86, §107.
@@ -226,5 +226,5 @@ System is production-ready ONLY when ALL of these are false:
 - [ ] Build not reproducible
 - [ ] Test claimed PASS without evidence
 
-All items in v4.2 are either implemented and software-verified (PASS) or
+All items in v4.3.8 are either implemented and software-verified (PASS) or
 marked NOT EXECUTED — HARDWARE REQUIRED where physical hardware is needed.

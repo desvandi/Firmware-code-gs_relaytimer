@@ -1,4 +1,4 @@
-# Security Model — Timer Digital Relay v4.2
+# Security Model — Timer Digital Relay v4.3.8
 
 > Implements the security requirements from the Industrial-Grade Implementation
 > Directive §32, §34, §49-56, §80-83, §88.
