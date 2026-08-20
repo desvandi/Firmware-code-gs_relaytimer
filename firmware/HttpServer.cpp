@@ -5,6 +5,7 @@
 #include "AuthHandlers.h"
 #include "StatusHandlers.h"
 #include "InsightsHandlers.h"  // Phase B (P0-01): /api/insights endpoint
+#include "Ed25519SelfTest.h"   // On-target Ed25519 KAT
 #include "RelayHandlers.h"
 #include "ScheduleHandlers.h"
 #include "ChannelHandlers.h"  // audit-fixes-v2 (P1-1): /api/channel endpoint
@@ -145,6 +146,23 @@ void HttpServer::_registerRoutes() {
 
   // Phase B (P0-01): AI insights — ESP32 proxies authenticated GET to GAS.
   http.on("/api/insights", HTTP_GET, Web::Handlers::handleInsights);
+
+  // On-target Ed25519 KAT self-test (authenticated, 5-min cache)
+  http.on("/api/ed25519/kat", HTTP_GET, []() {
+    if (!requireAuth()) return;
+    bool force = Web::http.hasArg("force") && Web::http.arg("force") == "1";
+    Services::Ed25519KatResult r = Services::ed25519SelfTest.run(force);
+    String data = "{";
+    data += "\"allPassed\":" + String(r.allPassed ? "true" : "false") + ",";
+    data += "\"testsRun\":" + String(r.testsRun) + ",";
+    data += "\"testsPassed\":" + String(r.testsPassed) + ",";
+    data += "\"testsFailed\":" + String(r.testsFailed) + ",";
+    data += "\"totalDurationMs\":" + String(r.totalDurationMs) + ",";
+    data += "\"libraryVersion\":\"" + String(r.libraryVersion) + "\",";
+    data += "\"cached\":" + String(r.cached ? "true" : "false");
+    data += "}";
+    sendSuccess("Ed25519 KAT result", data);
+  });
 
   // Relay
   http.on("/api/relay", HTTP_POST, Web::Handlers::handleRelay);

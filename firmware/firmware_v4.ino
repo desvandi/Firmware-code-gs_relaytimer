@@ -109,6 +109,7 @@
 
 // AI
 #include "Advisor.h"
+#include "Ed25519SelfTest.h"  // On-target Ed25519 KAT self-test
 
 // ---------- GLOBAL STATE DEFINITIONS (declared extern in Core/Globals.h) ----------
 namespace Core {
@@ -222,6 +223,22 @@ void setup() {
   esp_task_wdt_reset();
   // v4.3.1 audit D-005: TelemetrySpool init (RAM ring buffer, no NVS yet)
   Services::telemetrySpool.begin();
+  esp_task_wdt_reset();
+
+  // On-target Ed25519 KAT self-test — verifies that Ed25519 signature
+  // verification works correctly on THIS device's hardware. Uses RFC 8032
+  // published test vectors. Result is cached 5 minutes + available via
+  // GET /api/ed25519/kat (authenticated). Does NOT block OTA — diagnostic only.
+  Serial.println("[Boot] Running Ed25519 KAT self-test...");
+  Services::Ed25519KatResult katResult = Services::ed25519SelfTest.run(true);
+  if (katResult.allPassed) {
+    Serial.printf("[Boot] Ed25519 KAT: PASS (%d/%d in %lu ms)\n",
+                  katResult.testsPassed, katResult.testsRun, katResult.totalDurationMs);
+  } else {
+    Serial.printf("[Boot] Ed25519 KAT: FAIL (%d/%d — Ed25519 may not work correctly)\n",
+                  katResult.testsPassed, katResult.testsRun);
+    Serial.println("[Boot] WARNING: OTA signature verification may be non-functional on this device");
+  }
   esp_task_wdt_reset();
 
   // ---------- DRIVERS: RTC + Relays ----------
