@@ -3,7 +3,7 @@
 // =============================================================================
 #include "Crypto.h"
 #include "RtcDriver.h"
-#include "ed25519-donna.h"  // AUD-FW-OTA-001 FIX: self-contained Ed25519 verification
+#include "ed25519.h"  // AUD-FW-OTA-001 FIX: orlp/ed25519 audited library
 #include <esp_system.h>
 #include <mbedtls/md.h>
 #include <mbedtls/base64.h>
@@ -334,28 +334,27 @@ bool ed25519VerifyHash(const char* publicKeyHex,
     return false;
   }
 
-  // AUD-FW-OTA-001 FIX (Opsi B): Use self-contained ed25519-donna library.
-  // Previously this used PSA Crypto (psa/crypto.h) which has C++ compatibility
-  // issues in the prebuilt arduino-esp32 framework — causing compile errors
-  // when MBEDTLS_ED25519_SUPPORTED was defined.
+  // AUD-FW-OTA-001 FIX (Opsi B, round 4): Use orlp/ed25519 audited library.
+  // Previously engineer wrote Ed25519 from scratch (ed25519-donna.c) which
+  // contained multiple crypto bugs — valid signatures were rejected.
+  // Now: using orlp/ed25519 (github.com/orlp/ed25519), public domain, audited,
+  // tested against RFC 8032 KAT vectors. Pure C, no PSA Crypto dependency.
+  // Library includes its own SHA-512 implementation (sha512.c).
   //
-  // Now: ed25519_donna_verify() is pure C, no PSA Crypto dependency, no
-  // framework rebuild needed. Uses mbedtls/sha512.h (already in framework,
-  // C++ compatible) for SHA-512 internally.
-  //
-  // This enables BOTH MQTT OTA (via MqttClient OTA handler) AND REST OTA
-  // (via OtaManager::handleUpload) to verify Ed25519 signatures.
-  int result = ed25519_donna_verify(signature, publicKey, hashBytes, hashLen);
+  // API: int ed25519_verify(sig, msg, msglen, pubkey) → returns 1 if valid
+  // We pass the 32-byte SHA-256 hash as the "message" (same convention as
+  // scripts/sign_firmware.py which signs SHA-256(firmware.bin)).
+  int result = ed25519_verify(signature, hashBytes, hashLen, publicKey);
 
   // Clean up sensitive data
   memset(publicKey, 0, sizeof(publicKey));
   memset(signature, 0, sizeof(signature));
 
   if (result == 1) {
-    Serial.println("[Ed25519] Signature verified OK (ed25519-donna, self-contained)");
+    Serial.println("[Ed25519] Signature verified OK (orlp/ed25519, audited library)");
     return true;
   } else {
-    Serial.println("[Ed25519] Verification FAILED (ed25519-donna)");
+    Serial.println("[Ed25519] Verification FAILED (orlp/ed25519)");
     return false;
   }
 }
