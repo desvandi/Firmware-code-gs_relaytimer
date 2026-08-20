@@ -1,5 +1,5 @@
 // =============================================================================
-// Ed25519SelfTest.h — On-target Ed25519 KAT self-test (RFC 8032 §7.1)
+// Ed25519SelfTest.h — On-target Ed25519 KAT self-test (cross-implementation: Python signs, C verifies)
 // -----------------------------------------------------------------------------
 // Runs Ed25519 Known Answer Tests on the ACTUAL ESP32 hardware using the
 // orlp/ed25519 library. Verifies that:

@@ -1,5 +1,5 @@
 // =============================================================================
-// Ed25519SelfTest.cpp — On-target Ed25519 KAT self-test (RFC 8032 §7.1)
+// Ed25519SelfTest.cpp — On-target Ed25519 KAT self-test (cross-implementation: Python signs, C verifies)
 // =============================================================================
 #include "Ed25519SelfTest.h"
 #include "ed25519.h"        // orlp/ed25519 audited library
@@ -71,7 +71,7 @@ bool Ed25519SelfTest::test_rfc8032_empty_message() {
 }
 
 bool Ed25519SelfTest::test_rfc8032_1byte_message() {
-  // Test 2: RFC 8032 §7.1 — 1-byte message (0x72), valid signature MUST verify
+  // Test 2: 1-byte message (Python-generated signature) (0x72), valid signature MUST verify
   int result = ed25519_verify(T2_SIG, T2_MSG, 1, T2_PUBKEY);
   if (result == 1) {
     Serial.println("[Ed25519-KAT] Test 2 (RFC 8032 1-byte msg): PASS");
