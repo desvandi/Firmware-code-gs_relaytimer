@@ -190,10 +190,24 @@ void RelayEngine::tick() {
       } else if (Core::channels[i].lastOnMs > 0) {
         unsigned long onDurationMs = millis() - Core::channels[i].lastOnMs;
         unsigned long onDurationHours = onDurationMs / 3600000UL;
-        uint16_t wattage = Core::channels[i].wattage > 0 ? Core::channels[i].wattage : 10;
-        Core::channels[i].energyWh += (uint32_t)(onDurationHours * wattage);
-        Core::channels[i].energyWh += (uint32_t)((onDurationMs % 3600000UL) * wattage / 3600000UL);
+        // AUD-FW-REL-001 FIX: Removed `> 0 ? : 10` fabrication. If wattage == 0
+        // (unconfigured), do NOT accumulate phantom energy. Default is now 0
+        // (see ConfigStore.cpp resetChannels), not 10.
+        uint16_t wattage = Core::channels[i].wattage;
+        if (wattage > 0) {
+          // AUD-FW-REL-002 FIX: Use uint64_t for intermediate multiplication to
+          // prevent overflow when (onDurationMs % 3600000) * wattage > uint32 max.
+          // For onDurationMs=3,599,999 and wattage=3000: 3599999 * 3000 = 10.8B
+          // which exceeds uint32 max (4.29B). Cast to uint64_t before multiply.
+          Core::channels[i].energyWh += (uint32_t)((uint64_t)onDurationHours * wattage);
+          Core::channels[i].energyWh += (uint32_t)(((uint64_t)(onDurationMs % 3600000UL) * wattage) / 3600000UL);
+        }
+        // AUD-FW-CFG-003 FIX: Persist energyWh to NVS so it survives reboot.
+        // The NVS write is handled by a periodic save in ConfigStore (every 60s
+        // if dirty) rather than on every transition (to avoid flash wear).
+        // See ConfigStore::persistEnergyToNVS() called from tick().
         Core::channels[i].lastOnMs = 0;
+        Core::scheduleDirty = true;  // mark dirty so saveSchedule will persist
       }
     }
   }

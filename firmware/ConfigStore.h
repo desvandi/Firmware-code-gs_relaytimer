@@ -24,6 +24,12 @@ public:
   void markDirty();
   void clearDirty();
 
+  // AUD-FW-CFG-003 FIX: Energy accounting persistence (was RAM-only, reset on reboot).
+  // loadEnergyFromNVS() is called on boot; saveEnergyToNVS() is called periodically
+  // (every ~60s if dirty) from the main loop to avoid flash wear on every transition.
+  void loadEnergyFromNVS();
+  void saveEnergyToNVS();
+
   // ---------- DEVICE CONFIG (name, timezone) ----------
   void loadDeviceConfig();
   void saveDeviceConfig();

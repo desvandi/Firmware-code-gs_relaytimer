@@ -20,10 +20,105 @@
 #include "Globals.h"  // v4.3.8 D-019 FIX: Core::channels[], Core::relayState[] etc. declared here
 #include "LogService.h"
 #include <cstdio>
+#include <Preferences.h>  // AUD-FW-CFG-002 FIX: NVS persistence for lockout state
 
 namespace Services {
 
 SafetySupervisor safety;
+
+// AUD-FW-CFG-002 FIX: NVS persistence for safety lockout state.
+// Previously _lockoutState[] was RAM-only — a TRIPPED channel would appear
+// as NORMAL after reboot, allowing operator to bypass ACK→CLEAR→ARM by
+// power-cycling. Now persisted to NVS namespace "t12_safety".
+static constexpr const char* SAFETY_NVS_NAMESPACE = "t12_safety";
+static constexpr const char* SAFETY_NVS_KEY_VERSION = "ver";
+static constexpr const char* SAFETY_NVS_KEY_LOCKOUT = "lockout";
+static constexpr const char* SAFETY_NVS_KEY_FAULT = "fault";
+static constexpr const char* SAFETY_NVS_KEY_REASON = "reason_";
+static constexpr uint8_t SAFETY_SCHEMA_VERSION = 1;
+
+void SafetySupervisor::begin() {
+  Preferences prefs;
+  if (!prefs.begin(SAFETY_NVS_NAMESPACE, true)) {
+    Serial.println("[Safety] NVS open failed (read) — starting with default states");
+    return;
+  }
+
+  uint8_t storedVer = prefs.getUChar(SAFETY_NVS_KEY_VERSION, 0);
+  if (storedVer != SAFETY_SCHEMA_VERSION) {
+    Serial.printf("[Safety] NVS schema mismatch (stored=%u, expected=%u) — starting fresh\n",
+                  storedVer, SAFETY_SCHEMA_VERSION);
+    prefs.end();
+    // Clear + write version
+    if (prefs.begin(SAFETY_NVS_NAMESPACE, false)) {
+      prefs.putUChar(SAFETY_NVS_KEY_VERSION, SAFETY_SCHEMA_VERSION);
+      prefs.end();
+    }
+    return;
+  }
+
+  // Load lockout states (12 bytes — one uint8_t per channel)
+  size_t needed = prefs.getBytesLength(SAFETY_NVS_KEY_LOCKOUT);
+  if (needed == Core::NUM_CHANNELS) {
+    prefs.getBytes(SAFETY_NVS_KEY_LOCKOUT, _lockoutState, Core::NUM_CHANNELS);
+  }
+
+  // Load fault active flags (12 bytes)
+  needed = prefs.getBytesLength(SAFETY_NVS_KEY_FAULT);
+  if (needed == Core::NUM_CHANNELS) {
+    prefs.getBytes(SAFETY_NVS_KEY_FAULT, _faultActive, Core::NUM_CHANNELS);
+  }
+
+  // Load fault reasons (12 × 32 bytes)
+  for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
+    char key[16];
+    snprintf(key, sizeof(key), "%s%d", SAFETY_NVS_KEY_REASON, i);
+    needed = prefs.getBytesLength(key);
+    if (needed > 0 && needed <= 32) {
+      prefs.getBytes(key, _faultReason[i], needed);
+      _faultReason[i][31] = '\0';  // ensure null-terminated
+    }
+  }
+
+  prefs.end();
+  Serial.println("[Safety] Loaded lockout states from NVS");
+
+  // Log any restored non-normal states
+  for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
+    if (_lockoutState[i] != SafetyLockoutState::Normal) {
+      Serial.printf("[Safety] CH%d restored to %s state (faultActive=%d, reason='%s')\n",
+                    i + 1, safetyLockoutStateStr(_lockoutState[i]),
+                    _faultActive[i] ? 1 : 0, _faultReason[i]);
+    }
+  }
+}
+
+void SafetySupervisor::_persistLockoutToNVS() {
+  Preferences prefs;
+  if (!prefs.begin(SAFETY_NVS_NAMESPACE, false)) {
+    Serial.println("[Safety] NVS open failed (write) — lockout state NOT persisted");
+    return;
+  }
+
+  prefs.putUChar(SAFETY_NVS_KEY_VERSION, SAFETY_SCHEMA_VERSION);
+  prefs.putBytes(SAFETY_NVS_KEY_LOCKOUT, _lockoutState, Core::NUM_CHANNELS);
+  prefs.putBytes(SAFETY_NVS_KEY_FAULT, _faultActive, Core::NUM_CHANNELS);
+  for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
+    char key[16];
+    snprintf(key, sizeof(key), "%s%d", SAFETY_NVS_KEY_REASON, i);
+    prefs.putBytes(key, _faultReason[i], 32);
+  }
+
+  prefs.end();
+}
+
+void SafetySupervisor::_loadLockoutFromNVS() {
+  // Alias — actual loading is done in begin() which is the public entry point.
+  // This private method exists for the header declaration; it calls begin()
+  // which does the actual work. (Kept for API symmetry with other persistence
+  // classes like TelemetrySpool.)
+  begin();
+}
 
 bool SafetySupervisor::computeBootState(uint8_t idx, bool lastKnownState) {
   if (idx >= Core::NUM_CHANNELS) return false;
@@ -135,6 +230,7 @@ uint8_t SafetySupervisor::checkMaxOnTimeExceeded() {
       _faultReason[i][sizeof(_faultReason[i]) - 1] = '\0';
       alarms.raise(Err::RELAY_MAX_ON_TIME, AlarmSeverity::Critical,
                    "maxOnTime exceeded — channel FORCE OFF (TRIPPED)");
+      _persistLockoutToNVS();  // AUD-FW-CFG-002 FIX: persist TRIPPED state
       return i;
     }
   }
@@ -204,6 +300,7 @@ bool SafetySupervisor::acknowledgeSafetyAlarm(uint8_t idx) {
   // CLEAR requires explicit clearSafetyLockout() call AFTER fault is resolved.
   char msg[80];
   snprintf(msg, sizeof(msg), "CH%u safety alarm acknowledged (still locked)", idx + 1);
+  _persistLockoutToNVS();  // AUD-FW-CFG-002 FIX: persist ACKNOWLEDGED state
   return true;
 }
 
@@ -213,10 +310,6 @@ bool SafetySupervisor::clearSafetyLockout(uint8_t idx) {
     return false;  // must acknowledge first
   }
   // v4.3.2 BLOCKER-02: CLEAR requires EXPLICIT fault condition to be resolved.
-  // Per ChatGPT: "CLEAR harus ditolak apabila faultStillActive == true"
-  // Uses _faultActive (explicit tracking) NOT relayState (inferred).
-  // _isFaultConditionResolved() checks the specific fault type's resolution
-  // precondition (for maxOnTime: relay must be OFF).
   if (_faultActive[idx] && !_isFaultConditionResolved(idx)) {
     return false;  // fault condition still active — cannot CLEAR
   }
@@ -224,6 +317,7 @@ bool SafetySupervisor::clearSafetyLockout(uint8_t idx) {
   _faultActive[idx] = false;
   Core::channels[idx].maxOnTimeForced = false;
   alarms.clear(Err::RELAY_MAX_ON_TIME);
+  _persistLockoutToNVS();  // AUD-FW-CFG-002 FIX: persist CLEARED state
   return true;
 }
 
@@ -231,8 +325,10 @@ void SafetySupervisor::armForNormalOperation(uint8_t idx) {
   if (idx >= Core::NUM_CHANNELS) return;
   if (_lockoutState[idx] == SafetyLockoutState::Cleared) {
     _lockoutState[idx] = SafetyLockoutState::Armed;
+    _persistLockoutToNVS();  // AUD-FW-CFG-002 FIX: persist ARMED state
   } else if (_lockoutState[idx] == SafetyLockoutState::Armed) {
     _lockoutState[idx] = SafetyLockoutState::Normal;
+    _persistLockoutToNVS();  // AUD-FW-CFG-002 FIX: persist NORMAL state (lockout cleared)
   }
 }
 

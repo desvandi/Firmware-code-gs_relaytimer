@@ -350,6 +350,9 @@ bool ed25519VerifyHash(const char* publicKeyHex,
   //   See firmware README "Known Limitations #3".
   #if defined(MBEDTLS_ED25519_SUPPORTED)
   // R10D-1: Use PSA Crypto API with CORRECT identifiers per PSA/Mbed TLS spec.
+  // AUD-FW-OTA-001: This code path is NON-FUNCTIONAL in default build because
+  // MBEDTLS_ED25519_SUPPORTED is NOT defined in platformio.ini. See comment there.
+  // PSA Crypto headers have C++ compatibility issues that prevent enabling this.
   #include <psa/crypto.h>
 
   // Initialize PSA (idempotent — safe to call multiple times)

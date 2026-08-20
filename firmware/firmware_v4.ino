@@ -192,6 +192,9 @@ void setup() {
   esp_task_wdt_reset();
   Storage::config.loadSchedule();
   esp_task_wdt_reset();
+  // AUD-FW-CFG-003 FIX: Load energyWh from NVS after schedule (so defaults are set first)
+  Storage::config.loadEnergyFromNVS();
+  esp_task_wdt_reset();
 
   // ---------- v4.2 INDUSTRIAL-GRADE SERVICES (brief §13-16, §18-19, §44, §60) ----------
   // AlarmRegistry + HealthSupervisor + SafetySupervisor initialize BEFORE
@@ -205,8 +208,17 @@ void setup() {
   esp_task_wdt_reset();
   Services::safety.reset();         // clear runtime tracking
   esp_task_wdt_reset();
+  // AUD-FW-CFG-002 FIX: Load persisted lockout states from NVS AFTER reset()
+  // so that TRIPPED/ACKNOWLEDGED channels are restored (reboot cannot bypass
+  // the ACK→CLEAR→ARM→NORMAL sequence).
+  Services::safety.begin();
+  esp_task_wdt_reset();
   // v4.3 audit P1-001, P1-002: CommandArbiter + InterlockEngine
   Services::interlock.begin();      // no groups registered by default — owner configures via PWA or NVS
+  esp_task_wdt_reset();
+  // AUD-FW-CMD-002 FIX: Load persisted _lastAppliedSeq from NVS so stale-command
+  // detection survives reboot (prevents replay of stale commands after power-cycle).
+  Services::arbiter.begin();
   esp_task_wdt_reset();
   // v4.3.1 audit D-005: TelemetrySpool init (RAM ring buffer, no NVS yet)
   Services::telemetrySpool.begin();
@@ -348,6 +360,9 @@ void loop() {
       (millis() - Core::lastSaveTime > Core::SAVE_DELAY_MS ||
        (Core::firstDirtySet && millis() - Core::firstDirtyTime > Core::MAX_SAVE_DELAY_MS))) {
     Storage::config.saveSchedule();
+    // AUD-FW-CFG-003 FIX: Also persist energyWh to NVS when schedule is saved.
+    // This piggybacks on the existing debounce mechanism to avoid flash wear.
+    Storage::config.saveEnergyToNVS();
   }
 
   // 5. Daily counter reset (PIR triggers, error count)

@@ -133,6 +133,11 @@ public:
   ArbitrationResult arbitrate(uint8_t channelIdx,
                                uint16_t currentMin, int weekdayIdx);
 
+  // AUD-FW-CMD-002 FIX: Load persisted _lastAppliedSeq from NVS on boot.
+  // Without this, stale-command detection is defeated after reboot (all
+  // counters reset to 0, so any commandSequence > 0 passes the check).
+  void begin();
+
   // v4.3.2 BLOCKER-04, BLOCKER-05: processCommand now enforces:
   //   1. Whitelist: commandType must be in SupportedCommandType enum (fail-closed)
   //   2. Stale: commandSequence must be > lastAppliedSequence[channel]
@@ -152,6 +157,10 @@ private:
   bool              _initialized = false;
   // v4.3.2 BLOCKER-04: per-channel monotonic command sequence
   uint32_t          _lastAppliedSeq[Core::NUM_CHANNELS] = {};
+
+  // AUD-FW-CMD-002 FIX: NVS persistence for _lastAppliedSeq.
+  void _persistSeqToNVS();
+  void _loadSeqFromNVS();
 
   bool              _evaluateManual(uint8_t idx, ArbitrationResult& out);
   bool              _evaluateSchedule(uint8_t idx, uint16_t currentMin, int weekdayIdx,

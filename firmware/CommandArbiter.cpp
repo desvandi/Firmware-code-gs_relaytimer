@@ -25,10 +25,51 @@
 #include "Globals.h"
 #include <cstring>
 #include <cstdio>
+#include <Preferences.h>  // AUD-FW-CMD-002 FIX: NVS persistence for _lastAppliedSeq
 
 namespace Services {
 
 CommandArbiter arbiter;
+
+// AUD-FW-CMD-002 FIX: NVS persistence for monotonic command sequence.
+// Previously _lastAppliedSeq[] was RAM-only — after reboot, all counters reset
+// to 0, so any commandSequence > 0 passes the stale check. An attacker (or
+// PWA retry logic) could replay stale commands after power-cycling the device.
+static constexpr const char* ARBITER_NVS_NAMESPACE = "t12_arbiter";
+static constexpr const char* ARBITER_NVS_KEY_SEQ = "last_seq";
+
+void CommandArbiter::begin() {
+  _loadSeqFromNVS();
+}
+
+void CommandArbiter::_loadSeqFromNVS() {
+  Preferences prefs;
+  if (!prefs.begin(ARBITER_NVS_NAMESPACE, true)) {
+    Serial.println("[Arbiter] NVS open failed (read) — starting with seq=0");
+    return;
+  }
+  size_t needed = prefs.getBytesLength(ARBITER_NVS_KEY_SEQ);
+  if (needed == sizeof(_lastAppliedSeq)) {
+    prefs.getBytes(ARBITER_NVS_KEY_SEQ, _lastAppliedSeq, sizeof(_lastAppliedSeq));
+    Serial.println("[Arbiter] Loaded _lastAppliedSeq from NVS");
+    for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
+      if (_lastAppliedSeq[i] > 0) {
+        Serial.printf("[Arbiter] CH%d lastSeq=%u\n", i + 1, _lastAppliedSeq[i]);
+      }
+    }
+  }
+  prefs.end();
+}
+
+void CommandArbiter::_persistSeqToNVS() {
+  Preferences prefs;
+  if (!prefs.begin(ARBITER_NVS_NAMESPACE, false)) {
+    Serial.println("[Arbiter] NVS open failed (write) — seq NOT persisted");
+    return;
+  }
+  prefs.putBytes(ARBITER_NVS_KEY_SEQ, _lastAppliedSeq, sizeof(_lastAppliedSeq));
+  prefs.end();
+}
 
 void setReasonStr(char* dst, size_t n, const char* src) {
   if (!dst || n == 0) return;
@@ -197,8 +238,11 @@ ArbitrationResult CommandArbiter::processCommand(const CommandRequest& req) {
                    "Stale/out-of-order command rejected");
       return r;
     }
-    // Update last applied sequence
-    _lastAppliedSeq[req.channelIdx] = req.commandSequence;
+    // AUD-FW-CMD-003 FIX: Do NOT update _lastAppliedSeq here (before execution).
+    // Previously the seq was consumed BEFORE the command ran, so a failed
+    // command would still consume the seq — causing a legitimate retry with
+    // the same seq to be rejected as STALE. Now the update is moved to AFTER
+    // successful execution (in each return path below).
   }
 
   // Route to appropriate handler based on command type
@@ -210,6 +254,11 @@ ArbitrationResult CommandArbiter::processCommand(const CommandRequest& req) {
     r.priority = sourcePriority(CommandSource::ManualAuth);
     r.vetoed = !ok;
     setReasonStr(r.reason, sizeof(r.reason), ok ? "alarm acknowledged" : "ACK failed");
+    // AUD-FW-CMD-003 FIX: update seq AFTER successful execution only
+    if (ok && req.commandSequence > 0) {
+      _lastAppliedSeq[req.channelIdx] = req.commandSequence;
+      _persistSeqToNVS();  // AUD-FW-CMD-002 FIX: persist to NVS
+    }
     return r;
   }
   if (req.commandType == SupportedCommandType::ClearSafetyLockout) {
@@ -219,6 +268,11 @@ ArbitrationResult CommandArbiter::processCommand(const CommandRequest& req) {
     r.priority = sourcePriority(CommandSource::ManualAuth);
     r.vetoed = !ok;
     setReasonStr(r.reason, sizeof(r.reason), ok ? "lockout cleared" : "CLEAR failed");
+    // AUD-FW-CMD-003 FIX: update seq AFTER successful execution only
+    if (ok && req.commandSequence > 0) {
+      _lastAppliedSeq[req.channelIdx] = req.commandSequence;
+      _persistSeqToNVS();  // AUD-FW-CMD-002 FIX: persist to NVS
+    }
     return r;
   }
 
@@ -231,6 +285,13 @@ ArbitrationResult CommandArbiter::processCommand(const CommandRequest& req) {
 
   Core::channels[req.channelIdx].modeAuto = false;
   Core::channels[req.channelIdx].manualState = req.targetState;
+
+  // AUD-FW-CMD-003 FIX: update seq AFTER successful execution
+  // (manualState has been set — RelayEngine::tick() will apply it)
+  if (req.commandSequence > 0) {
+    _lastAppliedSeq[req.channelIdx] = req.commandSequence;
+    _persistSeqToNVS();  // AUD-FW-CMD-002 FIX: persist to NVS
+  }
 
   _lastResult[req.channelIdx] = r;
   return r;

@@ -202,8 +202,15 @@ namespace Core {
   //   PZEM GND → GND (shared with ESP32)
   //   PZEM TX  → GPIO5 (ESP32 RX via UART1)
   //   PZEM RX  → GPIO4 (ESP32 TX via UART1)
-  //   Note: PZEM TX is 5V. ESP32 GPIO5 is 3.3V input but 5V-tolerant on digital reads.
-  //   For long-term safety, add a 1K resistor in series between PZEM TX and ESP32 RX.
+  //   AUD-FW-CFG-004 FIX (2026-08-20): ESP32 GPIO5 is 3.3V ONLY — NOT 5V-tolerant.
+  //   The previous comment claiming "5V-tolerant on digital reads" was INCORRECT
+  //   and contradicted HARDWARE_SAFETY_CONTRACT.md §1. Applying 5V to any ESP32
+  //   GPIO (including input-only pins 34/35/36/39) will damage the SoC over time
+  //   through electromigration, even if it appears to work initially.
+  //   You MUST use a proper logic level shifter (e.g., BSS138-based) or a
+  //   resistor divider (1K series + 2K to GND = 3.3V from 5V) to step PZEM TX
+  //   down to 3.3V before connecting to ESP32 GPIO5. Direct connection is
+  //   a hardware defect — do NOT ship without level shifting.
   //
   // PZEM-004T v3.0 specs:
   //   Voltage: 80-260V AC, ±0.5% accuracy

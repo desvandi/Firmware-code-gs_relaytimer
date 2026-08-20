@@ -152,7 +152,7 @@ void ConfigStore::resetChannels() {
     Core::channels[i].pirEnabled = false;
     Core::channels[i].pirHoldTime = 180;
     Core::channels[i].energyWh = 0;
-    Core::channels[i].wattage = 10;
+    Core::channels[i].wattage = 0;  // AUD-FW-REL-001 FIX: default 0 (unconfigured), not 10 (fabricated)
     Core::channels[i].lastOnMs = 0;
     // v4.3.6 D-005 FIX: initialize ALL safety fields — previously omitted,
     // leaving stale values after factory reset if previously modified.
@@ -210,6 +210,30 @@ void ConfigStore::loadSchedule() {
         if (ht > 3600) ht = 3600;
         Core::channels[i].pirHoldTime = ht;
       }
+      // AUD-FW-CFG-001 FIX: Load safety-critical per-channel config from schedule.json.
+      // Previously these fields were reset to 0/BootOff by resetChannels() and never
+      // restored, making SafetySupervisor a no-op after every reboot.
+      if (ch.containsKey("wattage")) {
+        Core::channels[i].wattage = ch["wattage"].as<uint16_t>();
+      }
+      if (ch.containsKey("maxOnTimeSec")) {
+        Core::channels[i].maxOnTimeSec = ch["maxOnTimeSec"].as<uint32_t>();
+      }
+      if (ch.containsKey("minOnTimeSec")) {
+        Core::channels[i].minOnTimeSec = ch["minOnTimeSec"].as<uint32_t>();
+      }
+      if (ch.containsKey("minOffTimeSec")) {
+        Core::channels[i].minOffTimeSec = ch["minOffTimeSec"].as<uint32_t>();
+      }
+      if (ch.containsKey("minSwitchIntervalSec")) {
+        Core::channels[i].minSwitchIntervalSec = ch["minSwitchIntervalSec"].as<uint32_t>();
+      }
+      if (ch.containsKey("bootPolicy")) {
+        uint8_t bp = ch["bootPolicy"].as<uint8_t>();
+        if (bp <= (uint8_t)Core::BootPolicy::SafeState) {
+          Core::channels[i].bootPolicy = bp;
+        }
+      }
       if (ch.containsKey("schedules")) {
         JsonArray schedArr = ch["schedules"];
         int count = 0;
@@ -260,6 +284,12 @@ void ConfigStore::saveSchedule(bool force) {
     ch["manualState"] = Core::channels[i].manualState;
     ch["pirEnabled"] = Core::channels[i].pirEnabled;
     ch["pirHoldTime"] = Core::channels[i].pirHoldTime;
+    ch["wattage"] = Core::channels[i].wattage;
+    ch["maxOnTimeSec"] = Core::channels[i].maxOnTimeSec;
+    ch["minOnTimeSec"] = Core::channels[i].minOnTimeSec;
+    ch["minOffTimeSec"] = Core::channels[i].minOffTimeSec;
+    ch["minSwitchIntervalSec"] = Core::channels[i].minSwitchIntervalSec;
+    ch["bootPolicy"] = Core::channels[i].bootPolicy;
     JsonArray schedArr = ch.createNestedArray("schedules");
     for (int j = 0; j < Core::channels[i].schedCount; j++) {
       JsonObject entry = schedArr.createNestedObject();
@@ -295,6 +325,41 @@ void ConfigStore::clearDirty() {
   Core::scheduleDirty = false;
   Core::firstDirtySet = false;
   Core::lastSaveTime = millis();
+}
+
+// ============================================================================
+// AUD-FW-CFG-003 FIX: Energy accounting persistence via NVS
+// Previously energyWh was RAM-only — reset to 0 on every reboot, making
+// the PWA energy analytics view permanently wrong. Now persisted to NVS
+// via Preferences (namespace "t12_energy"), loaded on boot, saved periodically.
+// ============================================================================
+void ConfigStore::loadEnergyFromNVS() {
+  Preferences prefs;
+  if (!prefs.begin("t12_energy", true)) {  // read-only
+    Serial.println("[ConfigStore] NVS energy: open failed (read) — starting with 0");
+    return;
+  }
+  for (int i = 0; i < Core::NUM_CHANNELS; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "wh_%d", i);
+    Core::channels[i].energyWh = prefs.getULong(key, 0);
+  }
+  prefs.end();
+  Serial.println("[ConfigStore] Loaded energyWh from NVS");
+}
+
+void ConfigStore::saveEnergyToNVS() {
+  Preferences prefs;
+  if (!prefs.begin("t12_energy", false)) {
+    Serial.println("[ConfigStore] NVS energy: open failed (write) — skip");
+    return;
+  }
+  for (int i = 0; i < Core::NUM_CHANNELS; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "wh_%d", i);
+    prefs.putULong(key, Core::channels[i].energyWh);
+  }
+  prefs.end();
 }
 
 // ============================================================================
@@ -368,6 +433,12 @@ String ConfigStore::exportAll() {
     ch["manualState"] = Core::channels[i].manualState;
     ch["pirEnabled"] = Core::channels[i].pirEnabled;
     ch["pirHoldTime"] = Core::channels[i].pirHoldTime;
+    ch["wattage"] = Core::channels[i].wattage;
+    ch["maxOnTimeSec"] = Core::channels[i].maxOnTimeSec;
+    ch["minOnTimeSec"] = Core::channels[i].minOnTimeSec;
+    ch["minOffTimeSec"] = Core::channels[i].minOffTimeSec;
+    ch["minSwitchIntervalSec"] = Core::channels[i].minSwitchIntervalSec;
+    ch["bootPolicy"] = Core::channels[i].bootPolicy;
     JsonArray schedArr = ch.createNestedArray("schedules");
     for (int j = 0; j < Core::channels[i].schedCount; j++) {
       JsonObject entry = schedArr.createNestedObject();
@@ -399,7 +470,7 @@ bool ConfigStore::importAll(const String& json) {
     tempChannels[i].pirEnabled = false;
     tempChannels[i].pirHoldTime = 180;
     tempChannels[i].energyWh = 0;
-    tempChannels[i].wattage = 10;
+    tempChannels[i].wattage = 0;  // AUD-FW-REL-001 FIX: default 0 (unconfigured)
     tempChannels[i].lastOnMs = 0;
     for (int j = 0; j < Core::MAX_SCHEDULES; j++) {
       tempChannels[i].sched[j].onTime[0] = '\0';

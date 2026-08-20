@@ -71,6 +71,11 @@ inline const char* safetyDecisionStr(SafetyDecision d) {
 
 class SafetySupervisor {
 public:
+  // AUD-FW-CFG-002 FIX: Called once at boot — loads persisted lockout state
+  // from NVS. Without this, a TRIPPED channel would appear as NORMAL after
+  // reboot, allowing operator to bypass ACK→CLEAR→ARM by power-cycling.
+  void begin();
+
   // Called once at boot — applies boot policy per channel (brief §13).
   // Returns the desired boot state for each channel given its policy +
   // last-known state (for RESTORE_LAST).
@@ -115,13 +120,16 @@ private:
   // v4.3.1 D-007: per-channel safety lockout state
   SafetyLockoutState _lockoutState[Core::NUM_CHANNELS] = {};
   // v4.3.2 BLOCKER-02: EXPLICIT fault tracking — NOT inferred from relayState.
-  // Per ChatGPT: "Pisahkan secara eksplisit: faultActive, faultReason,
-  // safetyState, relayState"
   bool _faultActive[Core::NUM_CHANNELS] = {};       // true when fault condition exists
   char _faultReason[Core::NUM_CHANNELS][32] = {};  // human-readable fault reason
+
+  // AUD-FW-CFG-002 FIX: NVS persistence for lockout state + fault tracking.
+  // _persistLockoutToNVS() is called on every state transition.
+  // _loadLockoutFromNVS() is called from begin().
+  void _persistLockoutToNVS();
+  void _loadLockoutFromNVS();
+
   // clearFaultCondition() — called internally when the fault is resolved.
-  // For maxOnTime: fault resolves when relay goes OFF (no longer timing).
-  // Returns true if fault was active and is now resolved.
   bool _isFaultConditionResolved(uint8_t idx) const;
 };
 
