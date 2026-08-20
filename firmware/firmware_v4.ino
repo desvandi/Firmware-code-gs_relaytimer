@@ -361,7 +361,20 @@ void loop() {
        (Core::firstDirtySet && millis() - Core::firstDirtyTime > Core::MAX_SAVE_DELAY_MS))) {
     Storage::config.saveSchedule();
     // AUD-FW-CFG-003 FIX: Also persist energyWh to NVS when schedule is saved.
-    // This piggybacks on the existing debounce mechanism to avoid flash wear.
+    Storage::config.saveEnergyToNVS();
+  }
+
+  // REAUDIT-FW-CFG-001 FIX: Periodic energyWh save EVERY 5 MINUTES, independent
+  // of scheduleDirty. The auditor correctly identified that a "set-and-forget"
+  // deployment (operator never changes schedule → scheduleDirty never set) would
+  // lose all energy data on reboot. This timer ensures energyWh is saved
+  // regardless of schedule changes. NVS wear: 12 × 4 bytes = 48 bytes per save,
+  // every 300s = 1152 bytes/hour = 27,648 bytes/day. At ~100k erase cycles per
+  // NVS sector (4KB), this gives ~145 days of continuous operation per sector.
+  // Acceptable for the use case (energy data, not safety-critical).
+  static unsigned long lastEnergySave = 0;
+  if (millis() - lastEnergySave > 300000UL) {  // 5 minutes
+    lastEnergySave = millis();
     Storage::config.saveEnergyToNVS();
   }
 

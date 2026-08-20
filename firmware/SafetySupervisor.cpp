@@ -83,12 +83,32 @@ void SafetySupervisor::begin() {
   prefs.end();
   Serial.println("[Safety] Loaded lockout states from NVS");
 
-  // Log any restored non-normal states
+  // REAUDIT-FW-SAF-001 FIX (2026-08-20): Restore maxOnTimeForced enforcement flag.
+  // The auditor correctly identified that _lockoutState[] was persisted but
+  // maxOnTimeForced (the ACTUAL enforcement flag checked in evaluateTransition()
+  // at line 151: "if (ch.maxOnTimeForced && desired)") was NOT restored.
+  // Without this, a TRIPPED channel could be re-enabled after reboot despite
+  // _lockoutState showing Tripped — making the entire AUD-FW-CFG-002 fix cosmetic.
+  //
+  // For channels in TRIPPED or ACKNOWLEDGED state, maxOnTimeForced MUST be true
+  // because these states mean the channel was force-OFF'd by safety logic and
+  // has NOT yet been cleared by the operator (ACK → CLEAR → ARM → NORMAL).
+  // For CLEARED/ARMED/NORMAL states, maxOnTimeForced is false (fault resolved).
   for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
-    if (_lockoutState[i] != SafetyLockoutState::Normal) {
-      Serial.printf("[Safety] CH%d restored to %s state (faultActive=%d, reason='%s')\n",
+    if (_lockoutState[i] == SafetyLockoutState::Tripped ||
+        _lockoutState[i] == SafetyLockoutState::Acknowledged) {
+      Core::channels[i].maxOnTimeForced = true;
+      Serial.printf("[Safety] CH%d maxOnTimeForced RESTORED (lockout=%s, faultActive=%d, reason='%s')\n",
                     i + 1, safetyLockoutStateStr(_lockoutState[i]),
                     _faultActive[i] ? 1 : 0, _faultReason[i]);
+    } else {
+      // CLEARED / ARMED / NORMAL — fault resolved, maxOnTimeForced stays false
+      // (resetChannels() already cleared it, and the fault is no longer active)
+      if (_lockoutState[i] != SafetyLockoutState::Normal) {
+        Serial.printf("[Safety] CH%d restored to %s state (faultActive=%d, reason='%s')\n",
+                      i + 1, safetyLockoutStateStr(_lockoutState[i]),
+                      _faultActive[i] ? 1 : 0, _faultReason[i]);
+      }
     }
   }
 }
@@ -103,6 +123,14 @@ void SafetySupervisor::_persistLockoutToNVS() {
   prefs.putUChar(SAFETY_NVS_KEY_VERSION, SAFETY_SCHEMA_VERSION);
   prefs.putBytes(SAFETY_NVS_KEY_LOCKOUT, _lockoutState, Core::NUM_CHANNELS);
   prefs.putBytes(SAFETY_NVS_KEY_FAULT, _faultActive, Core::NUM_CHANNELS);
+  // REAUDIT-FW-SAF-001 FIX: Also persist maxOnTimeForced explicitly (redundant with
+  // _lockoutState derivation, but defense-in-depth — if restore logic changes,
+  // the explicit flag is still available).
+  bool forcedFlags[Core::NUM_CHANNELS] = {};
+  for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
+    forcedFlags[i] = Core::channels[i].maxOnTimeForced;
+  }
+  prefs.putBytes("forced", forcedFlags, Core::NUM_CHANNELS);
   for (uint8_t i = 0; i < Core::NUM_CHANNELS; i++) {
     char key[16];
     snprintf(key, sizeof(key), "%s%d", SAFETY_NVS_KEY_REASON, i);

@@ -189,8 +189,10 @@ void HttpServer::_registerRoutes() {
   http.on("/api/factory_reset/confirm", HTTP_POST, Web::Handlers::handleFactoryResetConfirm);
 
   // Collect headers we need
-  const char* headerKeys[] = {"Authorization", "X-CSRF-Token", "Content-Length", "Cookie", "Origin"};
-  http.collectHeaders(headerKeys, 5);
+  // REAUDIT-FW-OTA-002: Added X-Expected-SHA256 + X-Firmware-Version for REST OTA
+  const char* headerKeys[] = {"Authorization", "X-CSRF-Token", "Content-Length", "Cookie", "Origin",
+                              "X-Expected-SHA256", "X-Firmware-Version"};
+  http.collectHeaders(headerKeys, 7);
 }
 
 void HttpServer::begin() {

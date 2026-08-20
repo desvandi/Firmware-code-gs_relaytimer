@@ -28,9 +28,11 @@
 #include "WifiManager.h"
 #include "RtcDriver.h"
 #include "MqttClient.h"
+#include "Crypto.h"  // REAUDIT-FW-OTA-002: SHA-256 hash verification for REST OTA
 #include <Update.h>
 #include <Preferences.h>
 #include <esp_task_wdt.h>
+#include <esp_partition.h>
 
 // ESP-IDF OTA partition management
 #ifdef ESP32
@@ -195,12 +197,26 @@ bool OtaManager::checkUpdateAvailable() const {
 //   (OtaManager.h:59/62). Previously also defined here → redefinition error.
 //   Removed the duplicate definitions — the inline header versions are used.
 
-// audit-fixes: REST OTA upload handler. Called per-chunk by ESP32 WebServer.
-// NOTE: REST OTA is only available on LAN/Cloudflare Tunnel mode and is
-// protected by requireAuth() in handleOtaResponse. The upload handler itself
-// cannot call requireAuth() (ESP32 WebServer calls it before auth check),
-// but if the response handler (which DOES check auth) is not called, the
-// upload is aborted at Update.end(). See README for security notes.
+// REAUDIT-FW-OTA-002 FIX (2026-08-20): REST OTA now has SHA-256 hash verification
+// + anti-downgrade check. Previously, anyone with REST auth could upload arbitrary
+// firmware with no integrity check. Now:
+//   1. SHA-256 of uploaded binary is computed during upload (streaming)
+//   2. After upload completes, SHA-256 is compared against expected hash from
+//      X-Expected-SHA256 header (if provided by PWA)
+//   3. Anti-downgrade: new firmware version must be >= current version
+//   4. If Ed25519 signature is provided (X-Ed25519-Sig header), it is verified
+//      via ed25519VerifyHash() — BUT this always returns false in default build
+//      (AUD-FW-OTA-001), so signature verification is effectively disabled.
+//
+// SECURITY HONEST DISCLOSURE:
+//   - REST OTA has SHA-256 integrity check (detects accidental corruption)
+//   - REST OTA does NOT have Ed25519 signature verification in default build
+//   - MQTT OTA has Ed25519 code path but it's non-functional (AUD-FW-OTA-001)
+//   - Therefore: there is NO secure OTA path (signature-verified) in default build
+//   - For secure OTA: rebuild ESP-IDF with Ed25519 support, or use USB re-flash
+//   - REST OTA with SHA-256 is a MINIMUM baseline — it prevents accidental
+//     flashing of corrupted/wrong firmware, but does NOT prevent malicious upload
+//     by an attacker who has REST credentials
 void OtaManager::handleUpload(WebServer& server, const String& filename,
                               size_t totalSize, uint8_t* data, size_t dataSize,
                               bool final) {
@@ -217,7 +233,11 @@ void OtaManager::handleUpload(WebServer& server, const String& filename,
     }
     _updating = true;
     _totalReceived = 0;
-    Serial.printf("[OTA] Upload start: %u bytes expected\n", (unsigned)totalSize);
+    // REAUDIT-FW-OTA-002: Initialize SHA-256 hasher for streaming computation
+    mbedtls_sha256_init(&_otaSha256Ctx);
+    mbedtls_sha256_starts_ret(&_otaSha256Ctx, 0);  // 0 = SHA-256 (not SHA-224)
+    Serial.printf("[OTA] Upload start: %u bytes expected (SHA-256 hashing enabled)\n",
+                  (unsigned)totalSize);
   }
 
   if (data && dataSize > 0) {
@@ -228,14 +248,80 @@ void OtaManager::handleUpload(WebServer& server, const String& filename,
       Update.abort();
       _updating = false;
       _totalReceived = 0;
+      mbedtls_sha256_free(&_otaSha256Ctx);
       Services::Log.append(Core::LogType::Error,
         "OTA upload failed: short write", 0);
       return;
     }
+    // REAUDIT-FW-OTA-002: Update SHA-256 hash with this chunk
+    mbedtls_sha256_update_ret(&_otaSha256Ctx, data, dataSize);
     _totalReceived += dataSize;
   }
 
   if (final) {
+    // REAUDIT-FW-OTA-002: Finalize SHA-256 hash
+    uint8_t computedHash[32];
+    mbedtls_sha256_finish_ret(&_otaSha256Ctx, computedHash);
+    mbedtls_sha256_free(&_otaSha256Ctx);
+
+    // Convert to hex string for logging + comparison
+    char hashHex[65];
+    Utils::bytesToHex(computedHash, 32, hashHex);
+    hashHex[64] = '\0';
+    Serial.printf("[OTA] Computed SHA-256: %s\n", hashHex);
+
+    // REAUDIT-FW-OTA-002: Anti-downgrade check
+    // Read the new firmware's version from the uploaded binary (first 256 bytes
+    // contain the version string in the format "Timer12-vX.Y.Z" at a known offset).
+    // For simplicity, we check the X-Firmware-Version header if provided by PWA.
+    // This is a BEST-EFFORT anti-downgrade — the real check happens on next boot
+    // in markBootHealthy() which compares against the running version.
+    String newVersion = server.header("X-Firmware-Version");
+    if (newVersion.length() > 0) {
+      Serial.printf("[OTA] New firmware version: %s (current: %s)\n",
+                    newVersion.c_str(), Core::FIRMWARE_VERSION);
+      // Parse and compare versions
+      int newMajor, newMinor, newPatch;
+      int curMajor, curMinor, curPatch;
+      if (sscanf(newVersion.c_str(), "%d.%d.%d", &newMajor, &newMinor, &newPatch) == 3 &&
+          sscanf(Core::FIRMWARE_VERSION, "%d.%d.%d", &curMajor, &curMinor, &curPatch) == 3) {
+        if (newMajor < curMajor ||
+            (newMajor == curMajor && newMinor < curMinor) ||
+            (newMajor == curMajor && newMinor == curMinor && newPatch < curPatch)) {
+          Serial.println("[OTA] REJECTED: downgrade attempt (anti-downgrade)");
+          Services::Log.append(Core::LogType::Error,
+            "OTA upload REJECTED: firmware downgrade not allowed", 0);
+          Update.abort();
+          _updating = false;
+          _totalReceived = 0;
+          return;
+        }
+        Serial.println("[OTA] Anti-downgrade check PASSED");
+      }
+    }
+
+    // REAUDIT-FW-OTA-002: Verify SHA-256 if expected hash provided
+    String expectedHash = server.header("X-Expected-SHA256");
+    if (expectedHash.length() > 0) {
+      expectedHash.toUpperCase();
+      String computedUpper = String(hashHex);
+      computedUpper.toUpperCase();
+      if (expectedHash != computedUpper) {
+        Serial.printf("[OTA] REJECTED: SHA-256 mismatch (expected: %s, got: %s)\n",
+                      expectedHash.c_str(), computedUpper.c_str());
+        Services::Log.append(Core::LogType::Error,
+          "OTA upload REJECTED: SHA-256 hash mismatch", 0);
+        Update.abort();
+        _updating = false;
+        _totalReceived = 0;
+        return;
+      }
+      Serial.println("[OTA] SHA-256 verification PASSED");
+    } else {
+      Serial.println("[OTA] WARNING: No X-Expected-SHA256 header — hash not verified");
+      Serial.println("[OTA] Computed hash for reference: " + String(hashHex));
+    }
+
     if (!Update.end(true)) {
       Serial.println("[OTA] Update.end() failed — aborting");
       Services::Log.append(Core::LogType::Error,

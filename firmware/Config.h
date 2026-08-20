@@ -58,7 +58,10 @@ namespace Core {
   // NOT IMPLEMENTED IN SOFTWARE (require physical hardware — P1-012, P1-013,
   // P1-017): Ed25519 known-answer test, 12-case power-loss test, Secure Boot
   // provisioning. These remain NOT EXECUTED — HARDWARE REQUIRED per brief §107.
-  constexpr char FIRMWARE_VERSION[] = "4.3.8";
+  // REAUDIT-FW-VER-001 FIX (2026-08-20): Bumped from 4.3.8 to 4.3.9 to match
+  // git tag v4.3.9. Engineer forgot to bump version in prior commit —
+  // assert_version_contract.py correctly caught the mismatch.
+  constexpr char FIRMWARE_VERSION[] = "4.3.9";
   // Build timestamp — reproducible builds use the git commit timestamp.
   // For reproducibility, BUILD_DATE is now a fixed string set at release time.
   // Override via -DBUILD_DATE='"..."' in platformio.ini build_flags if needed.

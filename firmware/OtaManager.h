@@ -26,6 +26,7 @@
 
 #include <Arduino.h>
 #include <WebServer.h>
+#include <mbedtls/sha256.h>  // REAUDIT-FW-OTA-002: SHA-256 streaming hash for REST OTA
 
 namespace Services {
 
@@ -74,6 +75,8 @@ private:
   bool _firstBootAfterOta = false;
   bool _updating = false;
   size_t _totalReceived = 0;
+  // REAUDIT-FW-OTA-002: SHA-256 streaming hash context for REST OTA upload
+  mbedtls_sha256_context _otaSha256Ctx;
 
   bool _verifyHealth();
 };
