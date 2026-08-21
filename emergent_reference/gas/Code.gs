@@ -124,11 +124,16 @@ function routeRequest(req) {
     }
 
     switch (action) {
-      case "GET_STATUS":  return handleGetStatus(req);
-      case "SET_RELAY":   return handleSetRelay(req);
-      case "HEARTBEAT":   return handleHeartbeat(req);   // dipanggil ESP32
-      case "POLL":        return handlePoll(req);        // ESP32 ambil perintah
-      default:            return fail(400, "Action tidak dikenali: " + action);
+      case "GET_STATUS":      return handleGetStatus(req);
+      case "SET_RELAY":       return handleSetRelay(req);
+      case "GET_LOGS":        return handleGetLogs(req);
+      case "SCHEDULE_LIST":   return handleScheduleList(req);
+      case "SCHEDULE_ADD":    return handleScheduleAdd(req);
+      case "SCHEDULE_DELETE": return handleScheduleDelete(req);
+      case "SCHEDULE_TOGGLE": return handleScheduleToggle(req);
+      case "HEARTBEAT":       return handleHeartbeat(req);   // dipanggil ESP32
+      case "POLL":            return handlePoll(req);        // ESP32 ambil perintah
+      default:                return fail(400, "Action tidak dikenali: " + action);
     }
   } catch (err) {
     return fail(500, "Internal error: " + err.message);
@@ -219,6 +224,152 @@ function handlePoll(req) {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  ACTIVITY LOG READER (Riwayat Aktivitas)                                   */
+/* -------------------------------------------------------------------------- */
+
+function handleGetLogs(req) {
+  var sheet = getLogSheet();
+  var limit = parseInt(req.limit || 30, 10);
+  var last = sheet.getLastRow();
+  if (last < 2) return success({ logs: [] }, "Belum ada log.");
+  var count = Math.min(limit, last - 1);
+  var startRow = last - count + 1;
+  var values = sheet.getRange(startRow, 1, count, 3).getValues();
+  var logs = [];
+  for (var i = values.length - 1; i >= 0; i--) { // terbaru dulu
+    logs.push({ timestamp: values[i][0], type: values[i][1], message: values[i][2] });
+  }
+  return success({ logs: logs }, "Riwayat aktivitas.");
+}
+
+/* -------------------------------------------------------------------------- */
+/*  SCHEDULES (Jadwal Otomatis harian)                                        */
+/*  Struktur sheet "Schedules": id | relay | action | time(HH:MM) | days |    */
+/*  enabled | last_run(YYYY-MM-DD)                                            */
+/* -------------------------------------------------------------------------- */
+
+function getScheduleSheet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Schedules");
+  if (!sheet) {
+    sheet = ss.insertSheet("Schedules");
+    sheet.appendRow(["id", "relay", "action", "time", "days", "enabled", "last_run"]);
+  }
+  return sheet;
+}
+
+function handleScheduleList(req) {
+  var sheet = getScheduleSheet();
+  var data = sheet.getDataRange().getValues();
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    out.push({
+      id: data[i][0],
+      relay: data[i][1],
+      action: data[i][2],
+      time: data[i][3],
+      days: data[i][4],
+      enabled: data[i][5] === true || data[i][5] === "TRUE" || data[i][5] === "true",
+    });
+  }
+  return success({ schedules: out }, "Daftar jadwal.");
+}
+
+function handleScheduleAdd(req) {
+  var s = req.schedule || {};
+  if (s.relay === undefined || !s.time || !/^\d{2}:\d{2}$/.test(s.time)) {
+    return fail(400, "Data jadwal tidak valid (relay & time HH:MM wajib).");
+  }
+  var sheet = getScheduleSheet();
+  var id = "sch_" + Date.now();
+  sheet.appendRow([
+    id,
+    parseInt(s.relay, 10),
+    (s.action || "ON").toUpperCase() === "OFF" ? "OFF" : "ON",
+    s.time,
+    s.days || "daily",
+    s.enabled === false ? false : true,
+    "",
+  ]);
+  writeLog("SCHEDULE", "Tambah jadwal " + id + " relay " + s.relay + " " + s.action + " @ " + s.time);
+  ensureScheduleTrigger();
+  return success({ id: id }, "Jadwal ditambahkan.");
+}
+
+function handleScheduleDelete(req) {
+  var sheet = getScheduleSheet();
+  var data = sheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === req.id) {
+      sheet.deleteRow(i + 1);
+      writeLog("SCHEDULE", "Hapus jadwal " + req.id);
+      return success({ id: req.id }, "Jadwal dihapus.");
+    }
+  }
+  return fail(404, "Jadwal tidak ditemukan.");
+}
+
+function handleScheduleToggle(req) {
+  var sheet = getScheduleSheet();
+  var data = sheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === req.id) {
+      sheet.getRange(i + 1, 6).setValue(req.enabled === true || req.enabled === "true");
+      return success({ id: req.id, enabled: req.enabled }, "Status jadwal diperbarui.");
+    }
+  }
+  return fail(404, "Jadwal tidak ditemukan.");
+}
+
+/* Dijalankan oleh time-driven trigger tiap menit. Eksekusi jadwal yang match. */
+function runSchedules() {
+  var tz = Session.getScriptTimeZone();
+  var now = new Date();
+  var hhmm = Utilities.formatDate(now, tz, "HH:mm");
+  var today = Utilities.formatDate(now, tz, "yyyy-MM-dd");
+
+  var sheet = getScheduleSheet();
+  var data = sheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    var enabled = data[i][5] === true || data[i][5] === "TRUE" || data[i][5] === "true";
+    var time = data[i][3];
+    var lastRun = data[i][6];
+    if (enabled && time === hhmm && lastRun !== today) {
+      var idx = parseInt(data[i][1], 10);
+      var act = (data[i][2] || "ON").toUpperCase();
+      applyScheduleToState(idx, act);
+      sheet.getRange(i + 1, 7).setValue(today); // tandai sudah jalan hari ini
+      writeLog("SCHEDULE", "Eksekusi jadwal relay " + idx + " -> " + act + " @ " + hhmm);
+      notifyTelegram("Jadwal: Relay " + idx + " " + act + " @ " + hhmm);
+    }
+  }
+}
+
+function applyScheduleToState(idx, act) {
+  var state = act === "OFF" ? "OFF" : "ON";
+  var timer = state === "ON" ? parseInt(getConfigSafe("DEFAULT_RELAY_TIMEOUT_SEC", "3600"), 10) : 0;
+  var sheet = getStateSheet();
+  var data = sheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (parseInt(data[i][0], 10) === idx) {
+      sheet.getRange(i + 1, 3).setValue(state);
+      sheet.getRange(i + 1, 4).setValue(timer);
+      sheet.getRange(i + 1, 5).setValue(new Date().toISOString());
+      break;
+    }
+  }
+}
+
+/* Buat trigger runSchedules tiap menit bila belum ada. */
+function ensureScheduleTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "runSchedules") return;
+  }
+  ScriptApp.newTrigger("runSchedules").timeBased().everyMinutes(1).create();
+}
+
+/* -------------------------------------------------------------------------- */
 /*  LOGGING + ROTATION                                                        */
 /* -------------------------------------------------------------------------- */
 
@@ -295,6 +446,8 @@ function initMasterTemplate() {
   sheet.setFrozenRows(1);
   getStateSheet();
   getLogSheet();
+  getScheduleSheet();
+  ensureScheduleTrigger();
   clearConfigCache();
   SpreadsheetApp.getUi().alert("Master Template siap. Silakan deploy sebagai Web App (Anyone).");
 }

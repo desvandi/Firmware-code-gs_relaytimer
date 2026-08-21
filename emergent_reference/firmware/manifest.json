@@ -9,6 +9,7 @@
       "parts": [
         { "path": "bin/bootloader.bin", "offset": 4096 },
         { "path": "bin/partitions.bin", "offset": 32768 },
+        { "path": "bin/boot_app0.bin", "offset": 57344 },
         { "path": "bin/relay_timer_v1.0.0.bin", "offset": 65536 }
       ]
     }

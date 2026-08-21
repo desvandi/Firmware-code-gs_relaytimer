@@ -283,6 +283,7 @@ void applyRelayStates() {
 }
 
 // Kirim heartbeat + poll perintah relay. WAJIB http.end() untuk cegah leak.
+void pollRelayCommands(WiFiClientSecure& client); // forward decl (ref param)
 void heartbeatAndPoll() {
   if (WiFi.status() != WL_CONNECTED) return;
 
@@ -382,8 +383,13 @@ void setup() {
   delay(200);
   pinMode(LED_PIN, OUTPUT);
 
-  // Task Watchdog Timer
-  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  // Task Watchdog Timer (ESP32 Arduino core 3.x API)
+  esp_task_wdt_config_t wdt_cfg = {
+    .timeout_ms = WDT_TIMEOUT_S * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true,
+  };
+  esp_task_wdt_reconfigure(&wdt_cfg);
   esp_task_wdt_add(NULL);
 
   if (!LittleFS.begin(true)) {
@@ -423,7 +429,7 @@ void loop() {
   esp_task_wdt_reset();
 
   if (currentMode == MODE_AP) {
-    dnsServer.processNext();
+    dnsServer.processNextRequest();
 
     if (fallbackApActive) {
       // Coba reconnect WiFi utama tiap 60 detik di background
